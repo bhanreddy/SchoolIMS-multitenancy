@@ -2,6 +2,7 @@
  * Async Handler Wrapper
  * Eliminates try-catch boilerplate in route handlers
  */
+import config from '../config/env.js';
 export const asyncHandler = (fn) => (req, res, next) => {
     Promise.resolve(fn(req, res, next)).catch(next);
 };
@@ -41,6 +42,6 @@ export const errorHandler = (err, req, res, next) => {
     const status = err.status || err.statusCode || 500;
     res.status(status).json({
         error: err.message || 'Internal Server Error',
-        ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+        ...(config.nodeEnv === 'development' && { stack: err.stack })
     });
 };

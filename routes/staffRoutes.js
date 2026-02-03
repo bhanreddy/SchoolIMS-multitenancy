@@ -5,6 +5,25 @@ import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = express.Router();
 
+function normalizeStaffPayload(body) {
+    return {
+        first_name: body.first_name?.trim(),
+        middle_name: body.middle_name?.trim() || null,
+        last_name: body.last_name?.trim(),
+        dob: body.dob || null,
+        gender_id: body.gender_id || null, // Default to null if missing
+        staff_code: body.staff_code?.trim(),
+        joining_date: body.joining_date,
+        status_id: body.status_id || 1, // Default to Active (1)
+        designation_id: body.designation_id || null, // Default to null if missing
+        salary: body.salary || null,
+        email: body.email?.trim() || null,
+        phone: body.phone?.trim() || null,
+        password: body.password || null,
+        role_code: body.role_code || null
+    };
+}
+
 /**
  * GET /staff
  * List all staff members
@@ -75,19 +94,26 @@ router.get('/:id', requirePermission('staff.view'), asyncHandler(async (req, res
  * Create new staff member (and optionally user login)
  */
 router.post('/', requirePermission('staff.create'), asyncHandler(async (req, res) => {
+    const staffData = normalizeStaffPayload(req.body);
     const {
         first_name, middle_name, last_name, dob, gender_id,
         staff_code, joining_date, status_id, designation_id, salary,
-        email, phone, password, role_code // Added password and role_code
-    } = req.body;
+        email, phone, password, role_code
+    } = staffData;
 
     if (!first_name || !last_name || !staff_code || !joining_date) {
-        return res.status(400).json({ error: 'Missing required fields: first_name, last_name, staff_code, joining_date' });
+        return res.status(400).json({
+            error: 'VALIDATION_ERROR',
+            message: 'Missing required fields: first_name, last_name, staff_code, joining_date'
+        });
     }
 
     // Check if user creation is requested but password missing
     if (role_code && !password) {
-        return res.status(400).json({ error: 'Password is required when creating a login user' });
+        return res.status(400).json({
+            error: 'VALIDATION_ERROR',
+            message: 'Password is required when creating a login user'
+        });
     }
 
     try {
@@ -151,7 +177,7 @@ router.post('/', requirePermission('staff.create'), asyncHandler(async (req, res
                 if (role) {
                     await sql`
                         INSERT INTO user_roles (user_id, role_id, granted_by)
-                        VALUES (${user.id}, ${role.id}, ${req.user.internal_id})
+                        VALUES (${user.id}, ${role.id}, ${req.user?.internal_id || null})
                     `;
                 }
             }

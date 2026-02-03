@@ -2,6 +2,7 @@ import express from 'express';
 import { supabase } from '../db.js';
 import sql from '../db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import config from '../config/env.js';
 
 const router = express.Router();
 
@@ -30,16 +31,18 @@ router.post('/login', asyncHandler(async (req, res) => {
     SELECT 
       u.id, u.account_status,
       p.first_name, p.last_name, p.display_name, p.photo_url,
+      s.admission_no,
       array_agg(DISTINCT r.code) FILTER (WHERE r.code IS NOT NULL) as roles,
       array_agg(DISTINCT perm.code) FILTER (WHERE perm.code IS NOT NULL) as permissions
     FROM users u
     JOIN persons p ON u.person_id = p.id
+    LEFT JOIN students s ON p.id = s.person_id
     LEFT JOIN user_roles ur ON u.id = ur.user_id
     LEFT JOIN roles r ON ur.role_id = r.id
     LEFT JOIN role_permissions rp ON r.id = rp.role_id
     LEFT JOIN permissions perm ON rp.permission_id = perm.id
     WHERE u.id = ${data.user.id}
-    GROUP BY u.id, p.first_name, p.last_name, p.display_name, p.photo_url
+    GROUP BY u.id, p.first_name, p.last_name, p.display_name, p.photo_url, s.admission_no
   `;
 
     if (userInfo.length === 0) {
@@ -68,7 +71,8 @@ router.post('/login', asyncHandler(async (req, res) => {
             last_name: dbUser.last_name,
             photo_url: dbUser.photo_url,
             roles: dbUser.roles || [],
-            permissions: dbUser.permissions || []
+            permissions: dbUser.permissions || [],
+            admission_no: dbUser.admission_no
         }
     });
 }));
@@ -131,6 +135,7 @@ router.get('/me', asyncHandler(async (req, res) => {
       u.id, u.account_status, u.last_login_at, u.created_at,
       p.first_name, p.middle_name, p.last_name, p.display_name, p.dob, p.photo_url,
       g.name as gender,
+      s.admission_no,
       array_agg(DISTINCT r.code) FILTER (WHERE r.code IS NOT NULL) as roles,
       array_agg(DISTINCT perm.code) FILTER (WHERE perm.code IS NOT NULL) as permissions,
       -- Get contacts
@@ -138,13 +143,14 @@ router.get('/me', asyncHandler(async (req, res) => {
        FROM person_contacts pc WHERE pc.person_id = p.id AND pc.deleted_at IS NULL) as contacts
     FROM users u
     JOIN persons p ON u.person_id = p.id
+    LEFT JOIN students s ON p.id = s.person_id
     LEFT JOIN genders g ON p.gender_id = g.id
     LEFT JOIN user_roles ur ON u.id = ur.user_id
     LEFT JOIN roles r ON ur.role_id = r.id
     LEFT JOIN role_permissions rp ON r.id = rp.role_id
     LEFT JOIN permissions perm ON rp.permission_id = perm.id
     WHERE u.id = ${req.user.id}
-    GROUP BY u.id, p.id, g.name
+    GROUP BY u.id, p.id, g.name, s.admission_no
   `;
 
     if (userInfo.length === 0) {
@@ -166,7 +172,7 @@ router.post('/forgot-password', asyncHandler(async (req, res) => {
     }
 
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: process.env.PASSWORD_RESET_REDIRECT_URL || 'http://localhost:3000/reset-password'
+        redirectTo: config.auth.passwordResetRedirectUrl
     });
 
     if (error) {

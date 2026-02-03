@@ -179,6 +179,8 @@ router.get('/:id', requirePermission('students.view'), async (req, res) => {
 
 // Insert new Student with optional User and Enrollment
 router.post('/', requirePermission('students.create'), async (req, res) => {
+  let recalcParams = null;
+
   try {
     const {
       first_name, middle_name = null, last_name, dob = null, gender_id,
@@ -191,6 +193,8 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
 
     console.log('Creating student payload:', JSON.stringify(req.body, null, 2));
     import('fs').then(fs => fs.appendFileSync('server_debug.log', new Date().toISOString() + ' REQ: ' + JSON.stringify(req.body) + '\n'));
+
+    // recalcParams already declared above
 
     // Basic Validation
     if (!first_name || !last_name || !admission_no || !admission_date || !status_id || !gender_id) {
@@ -288,22 +292,57 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
       }
 
       // 5. Initial Enrollment (Optional)
-      if (class_id && section_id && academic_year_id) {
-        // Find Class Section
-        const [classSection] = await sql`
-            SELECT id FROM class_sections 
-            WHERE class_id = ${class_id} AND section_id = ${section_id}
-        `;
+      // 5. Auto-Enrollment (Enforced)
+      let targetClassSectionId = null;
+      let targetAcademicYearId = null;
 
-        if (classSection) {
-          await sql`
-                INSERT INTO student_enrollments (student_id, class_section_id, academic_year_id, status, start_date)
-                VALUES (${student.id}, ${classSection.id}, ${academic_year_id}, 'active', ${admission_date})
-             `;
+      // 5a. Resolve Academic Year
+      if (academic_year_id) {
+        targetAcademicYearId = academic_year_id;
+      } else {
+        const [ay] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
+        if (ay) targetAcademicYearId = ay.id;
+      }
 
-          // 🆕 Post-commit Recalculation Trigger
-          recalcParams = { classSectionId: classSection.id, academicYearId: academic_year_id };
-        }
+      // 5b. Resolve Class Section
+      if (class_id && section_id) {
+        const [cs] = await sql`SELECT id FROM class_sections WHERE class_id = ${class_id} AND section_id = ${section_id}`;
+        if (cs) targetClassSectionId = cs.id;
+      } else {
+        // Default to first available class (e.g. Class 1 - Section A) if not provided
+        const [cs] = await sql`
+            SELECT cs.id FROM class_sections cs 
+            JOIN classes c ON cs.class_id = c.id 
+            JOIN sections s ON cs.section_id = s.id
+            ORDER BY c.name ASC, s.name ASC
+            LIMIT 1
+         `;
+        if (cs) targetClassSectionId = cs.id;
+      }
+
+      // 5c. Insert Enrollment with Roll Number
+      if (targetClassSectionId && targetAcademicYearId) {
+        // Calculate Next Roll Number
+        const [rollData] = await sql`
+            SELECT COALESCE(MAX(roll_number), 0) + 1 as next_roll 
+            FROM student_enrollments 
+            WHERE class_section_id = ${targetClassSectionId} 
+            AND academic_year_id = ${targetAcademicYearId}
+            AND deleted_at IS NULL
+         `;
+
+        const nextRoll = rollData ? rollData.next_roll : 1;
+
+        console.log(`Auto-enrolling student in CS: ${targetClassSectionId}, AY: ${targetAcademicYearId}, Roll: ${nextRoll}`);
+
+        await sql`
+            INSERT INTO student_enrollments (student_id, class_section_id, academic_year_id, status, start_date, roll_number)
+            VALUES (${student.id}, ${targetClassSectionId}, ${targetAcademicYearId}, 'active', ${admission_date}, ${nextRoll})
+         `;
+
+        // No need for post-commit recalculation for this single insert as we handled it explicitly
+      } else {
+        console.warn("Could not auto-enroll student: Missing Academic Year or Class Section");
       }
 
       // 6. Create Parents (New Feature)
@@ -516,6 +555,13 @@ router.delete('/:id', requirePermission('students.delete'), async (req, res) => 
 router.get('/:id/enrollments', requirePermission('students.view'), async (req, res) => {
   try {
     const { id } = req.params;
+    let targetStudentId = id;
+
+    // Resolve Auth ID to Student ID if needed
+    if (req.user && (id === 'me' || id === req.user.internal_id)) {
+      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id}`;
+      if (s) targetStudentId = s.id;
+    }
 
     const enrollments = await sql`
       SELECT 
@@ -527,7 +573,7 @@ router.get('/:id/enrollments', requirePermission('students.view'), async (req, r
       JOIN classes c ON cs.class_id = c.id
       JOIN sections s ON cs.section_id = s.id
       JOIN academic_years ay ON se.academic_year_id = ay.id
-      WHERE se.student_id = ${id}
+      WHERE se.student_id = ${targetStudentId}
         AND se.deleted_at IS NULL
       ORDER BY se.start_date DESC
     `;
@@ -546,6 +592,13 @@ router.get('/:id/enrollments', requirePermission('students.view'), async (req, r
 router.get('/:id/attendance', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    let targetStudentId = id;
+
+    // Resolve Auth ID to Student ID if needed
+    if (id === 'me' || id === req.user.internal_id) {
+      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id}`;
+      if (s) targetStudentId = s.id;
+    }
 
     // Check access: Allow if user has 'students.view' OR if user is the student themselves
     const hasViewPermission = req.user.permissions?.includes('students.view') || req.user.roles?.includes('admin');
@@ -558,7 +611,7 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
             JOIN users u ON s.person_id = u.person_id
             WHERE u.id = ${req.user.internal_id}
         `;
-      if (student && student.id === id) {
+      if (student && student.id === targetStudentId) {
         isOwner = true;
       }
     }
@@ -579,7 +632,7 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
         JOIN class_sections cs ON se.class_section_id = cs.id
         JOIN classes c ON cs.class_id = c.id
         JOIN sections s ON cs.section_id = s.id
-        WHERE se.student_id = ${id}
+        WHERE se.student_id = ${targetStudentId}
           AND da.attendance_date BETWEEN ${from_date} AND ${to_date}
           AND da.deleted_at IS NULL
         ORDER BY da.attendance_date DESC
@@ -594,7 +647,7 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
         JOIN class_sections cs ON se.class_section_id = cs.id
         JOIN classes c ON cs.class_id = c.id
         JOIN sections s ON cs.section_id = s.id
-        WHERE se.student_id = ${id}
+        WHERE se.student_id = ${targetStudentId}
           AND da.deleted_at IS NULL
         ORDER BY da.attendance_date DESC
         LIMIT ${limit}
@@ -610,7 +663,7 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
         COUNT(*) as total
       FROM daily_attendance da
       JOIN student_enrollments se ON da.student_enrollment_id = se.id
-      WHERE se.student_id = ${id}
+      WHERE se.student_id = ${targetStudentId}
         AND da.deleted_at IS NULL
     `;
 
@@ -664,7 +717,9 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
         FROM student_fees sf
         JOIN fee_structures fs ON sf.fee_structure_id = fs.id
         JOIN fee_types ft ON fs.fee_type_id = ft.id
-        WHERE sf.student_id = ${id}
+        JOIN fee_structures fs ON sf.fee_structure_id = fs.id
+        JOIN fee_types ft ON fs.fee_type_id = ft.id
+        WHERE sf.student_id = ${targetStudentId}
           AND fs.academic_year_id = ${academic_year_id}
         ORDER BY sf.due_date DESC
       `;
@@ -677,7 +732,7 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
         JOIN fee_structures fs ON sf.fee_structure_id = fs.id
         JOIN fee_types ft ON fs.fee_type_id = ft.id
         JOIN academic_years ay ON fs.academic_year_id = ay.id
-        WHERE sf.student_id = ${id}
+        WHERE sf.student_id = ${targetStudentId}
         ORDER BY sf.due_date DESC
         LIMIT 20
       `;
@@ -690,11 +745,11 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
         COALESCE(SUM(amount_paid), 0) as total_paid,
         COALESCE(SUM(amount_due - discount - amount_paid), 0) as balance
       FROM student_fees
-      WHERE student_id = ${id}
+      WHERE student_id = ${targetStudentId}
     `;
 
     res.json({
-      student_id: id,
+      student_id: targetStudentId,
       summary: summary[0],
       fees
     });
@@ -746,7 +801,8 @@ router.get('/:id/results', requireAuth, async (req, res) => {
         JOIN subjects s ON es.subject_id = s.id
         JOIN exams e ON es.exam_id = e.id
         JOIN student_enrollments se ON m.student_enrollment_id = se.id
-        WHERE se.student_id = ${id}
+        JOIN student_enrollments se ON m.student_enrollment_id = se.id
+        WHERE se.student_id = ${targetStudentId}
           AND es.exam_id = ${exam_id}
         ORDER BY s.name
       `;
@@ -763,7 +819,7 @@ router.get('/:id/results', requireAuth, async (req, res) => {
         JOIN exams e ON es.exam_id = e.id
         JOIN academic_years ay ON e.academic_year_id = ay.id
         JOIN student_enrollments se ON m.student_enrollment_id = se.id
-        WHERE se.student_id = ${id}
+        WHERE se.student_id = ${targetStudentId}
           ${academic_year_id ? sql`AND e.academic_year_id = ${academic_year_id}` : sql``}
         GROUP BY e.id, e.name, e.exam_type, ay.code
         ORDER BY e.start_date DESC
@@ -772,7 +828,7 @@ router.get('/:id/results', requireAuth, async (req, res) => {
     }
 
     res.json({
-      student_id: id,
+      student_id: targetStudentId,
       results
     });
   } catch (error) {
@@ -788,6 +844,13 @@ router.get('/:id/results', requireAuth, async (req, res) => {
 router.get('/:id/parents', requirePermission('students.view'), async (req, res) => {
   try {
     const { id } = req.params;
+    let targetStudentId = id;
+
+    // Resolve Auth ID to Student ID if needed
+    if (req.user && (id === 'me' || id === req.user.internal_id)) {
+      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id}`;
+      if (s) targetStudentId = s.id;
+    }
 
     const parents = await sql`
       SELECT 

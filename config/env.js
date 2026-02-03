@@ -25,7 +25,8 @@ const config = {
     },
     auth: {
         passwordResetRedirectUrl: required('PASSWORD_RESET_REDIRECT_URL', 'http://localhost:3000/reset-password'),
-    }
+    },
+    geminiApiKey: process.env.GEMINI_API_KEY,
 };
 
 Object.freeze(config);

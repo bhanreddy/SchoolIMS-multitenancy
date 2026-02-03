@@ -40,6 +40,8 @@ import eventsRouter from './routes/eventsRoutes.js';
 import lmsRouter from './routes/lmsRoutes.js';
 import adminRouter from './routes/adminRoutes.js';
 import notificationRouter from './routes/notificationRoutes.js';
+import aiRouter from './routes/aiRoutes.js';
+import analyticsRouter from './routes/analyticsRoutes.js';
 
 // Root route
 app.get('/', (req, res) => {
@@ -90,6 +92,8 @@ app.use('/api/v1/events', eventsRouter);
 app.use('/api/v1/admin', adminRouter);
 app.use('/api/v1/lms', lmsRouter);
 app.use('/api/v1/notifications', notificationRouter);
+app.use('/api/v1/ai', aiRouter);
+app.use('/api/v1/analytics', analyticsRouter);
 
 // Legacy routes (for backward compatibility)
 app.use('/students', studentsRouter);

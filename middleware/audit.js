@@ -57,7 +57,7 @@ async function logAction(req, res, responseData, requestId) {
 
     try {
         await sql`
-            INSERT INTO audit_logs (
+            INSERT INTO public.audit_logs (
                 user_id, 
                 action, 
                 entity, 

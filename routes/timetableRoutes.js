@@ -1,246 +1,201 @@
 import express from 'express';
+import { supabase } from '../db.js';
 import sql from '../db.js';
-import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = express.Router();
 
-// ============== PERIODS ==============
-
 /**
- * GET /timetable/periods
- * List all periods
+ * GET /:classSectionId/slots
+ * Fetch slots for a specific class section (Admin View)
  */
-router.get('/periods', requirePermission('timetable.view'), asyncHandler(async (req, res) => {
-    const periods = await sql`
-    SELECT id, name, start_time, end_time, sort_order
-    FROM periods
-    ORDER BY sort_order
-  `;
-    res.json(periods);
-}));
+router.get('/:classSectionId/slots', asyncHandler(async (req, res) => {
+  const { classSectionId } = req.params;
+  const { academic_year_id } = req.query;
 
-/**
- * POST /timetable/periods
- * Create a period
- */
-router.post('/periods', requirePermission('timetable.manage'), asyncHandler(async (req, res) => {
-    const { name, start_time, end_time, sort_order } = req.body;
+  if (!classSectionId) return res.status(400).json({ error: 'Class Section ID required' });
 
-    if (!name || !start_time || !end_time) {
-        return res.status(400).json({ error: 'name, start_time, and end_time are required' });
-    }
+  // Default to current academic year if not provided
+  let yearId = academic_year_id;
+  if (!yearId) {
+    const currentYear = await sql`SELECT id FROM academic_years WHERE start_date <= current_date AND end_date >= current_date LIMIT 1`;
+    if (currentYear.length > 0) yearId = currentYear[0].id;
+    else return res.json([]); // No active year
+  }
 
-    const [period] = await sql`
-    INSERT INTO periods (name, start_time, end_time, sort_order)
-    VALUES (${name}, ${start_time}, ${end_time}, ${sort_order || 0})
-    RETURNING *
-  `;
-
-    res.status(201).json({ message: 'Period created', period });
-}));
-
-// ============== CLASS TIMETABLE ==============
-
-/**
- * GET /timetable/class/:classSectionId
- * Get timetable for a class
- */
-router.get('/class/:classSectionId', requirePermission('timetable.view'), asyncHandler(async (req, res) => {
-    const { classSectionId } = req.params;
-    const { day } = req.query;
-
-    // Get class info
-    const [classInfo] = await sql`
-    SELECT c.name as class_name, s.name as section_name
-    FROM class_sections cs
-    JOIN classes c ON cs.class_id = c.id
-    JOIN sections s ON cs.section_id = s.id
-    WHERE cs.id = ${classSectionId}
-  `;
-
-    let entries;
-    if (day) {
-        entries = await sql`
-      SELECT 
-        te.id, te.day_of_week, te.room,
-        p.name as period_name, p.start_time, p.end_time, p.sort_order,
-        sub.name as subject_name, sub.code as subject_code,
-        teacher.display_name as teacher_name
-      FROM timetable_entries te
-      JOIN periods p ON te.period_id = p.id
-      LEFT JOIN subjects sub ON te.subject_id = sub.id
-      LEFT JOIN staff st ON te.teacher_id = st.id
-      LEFT JOIN persons teacher ON st.person_id = teacher.id
-      WHERE te.class_section_id = ${classSectionId}
-        AND te.day_of_week = ${day}
-      ORDER BY p.sort_order
+  const slots = await sql`
+        SELECT 
+            ts.id,
+            ts.day_of_week,
+            ts.period_number,
+            ts.start_time,
+            ts.end_time,
+            sub.name as subject_name,
+            sub.id as subject_id,
+            p.display_name as teacher_name,
+            ts.teacher_id
+        FROM timetable_slots ts
+        JOIN subjects sub ON ts.subject_id = sub.id
+        LEFT JOIN staff st ON ts.teacher_id = st.id
+        LEFT JOIN persons p ON st.person_id = p.id
+        WHERE ts.class_section_id = ${classSectionId}
+          AND ts.academic_year_id = ${yearId}
+        ORDER BY ts.day_of_week, ts.period_number
     `;
-    } else {
-        entries = await sql`
-      SELECT 
-        te.id, te.day_of_week, te.room,
-        p.name as period_name, p.start_time, p.end_time, p.sort_order,
-        sub.name as subject_name,
-        teacher.display_name as teacher_name
-      FROM timetable_entries te
-      JOIN periods p ON te.period_id = p.id
-      LEFT JOIN subjects sub ON te.subject_id = sub.id
-      LEFT JOIN staff st ON te.teacher_id = st.id
-      LEFT JOIN persons teacher ON st.person_id = teacher.id
-      WHERE te.class_section_id = ${classSectionId}
-      ORDER BY 
-        CASE te.day_of_week 
-          WHEN 'monday' THEN 1 WHEN 'tuesday' THEN 2 
-          WHEN 'wednesday' THEN 3 WHEN 'thursday' THEN 4
-          WHEN 'friday' THEN 5 WHEN 'saturday' THEN 6 
-          ELSE 7 END,
-        p.sort_order
-    `;
-    }
 
-    // Group by day
-    const timetable = {};
-    const days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-    days.forEach(d => timetable[d] = []);
-
-    entries.forEach(e => {
-        if (timetable[e.day_of_week]) {
-            timetable[e.day_of_week].push(e);
-        }
-    });
-
-    res.json({
-        class_section_id: classSectionId,
-        class_name: classInfo?.class_name,
-        section_name: classInfo?.section_name,
-        timetable: day ? entries : timetable
-    });
+  res.json(slots);
 }));
 
 /**
- * GET /timetable/staff/:staffId
- * Get timetable for a staff member
+ * POST /
+ * Add a new timetable slot (Admin Only)
  */
-router.get('/staff/:staffId', requirePermission('timetable.view'), asyncHandler(async (req, res) => {
-    const { staffId } = req.params;
-    const { day } = req.query;
+router.post('/', asyncHandler(async (req, res) => {
+  const {
+    academic_year_id,
+    class_section_id,
+    day_of_week,
+    period_number,
+    subject_id,
+    teacher_id,
+    start_time,
+    end_time
+  } = req.body;
 
-    // Get staff info
-    const [staffInfo] = await sql`
-    SELECT p.display_name, sd.name as designation
-    FROM staff st
-    JOIN persons p ON st.person_id = p.id
-    LEFT JOIN staff_designations sd ON st.designation_id = sd.id
-    WHERE st.id = ${staffId}
-  `;
+  // Basic Validation
+  if (!academic_year_id || !class_section_id || !day_of_week || !period_number || !subject_id || !start_time || !end_time) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
 
-    let entries;
-    if (day) {
-        entries = await sql`
-      SELECT 
-        te.id, te.day_of_week, te.room,
-        p.name as period_name, p.start_time, p.end_time, p.sort_order,
-        sub.name as subject_name,
-        c.name as class_name, sec.name as section_name
-      FROM timetable_entries te
-      JOIN periods p ON te.period_id = p.id
-      LEFT JOIN subjects sub ON te.subject_id = sub.id
-      JOIN class_sections cs ON te.class_section_id = cs.id
-      JOIN classes c ON cs.class_id = c.id
-      JOIN sections sec ON cs.section_id = sec.id
-      WHERE te.teacher_id = ${staffId}
-        AND te.day_of_week = ${day}
-      ORDER BY p.sort_order
-    `;
-    } else {
-        entries = await sql`
-      SELECT 
-        te.id, te.day_of_week, te.room,
-        p.name as period_name, p.start_time, p.end_time, p.sort_order,
-        sub.name as subject_name,
-        c.name as class_name, sec.name as section_name
-      FROM timetable_entries te
-      JOIN periods p ON te.period_id = p.id
-      LEFT JOIN subjects sub ON te.subject_id = sub.id
-      JOIN class_sections cs ON te.class_section_id = cs.id
-      JOIN classes c ON cs.class_id = c.id
-      JOIN sections sec ON cs.section_id = sec.id
-      WHERE te.teacher_id = ${staffId}
-      ORDER BY 
-        CASE te.day_of_week 
-          WHEN 'monday' THEN 1 WHEN 'tuesday' THEN 2 
-          WHEN 'wednesday' THEN 3 WHEN 'thursday' THEN 4
-          WHEN 'friday' THEN 5 WHEN 'saturday' THEN 6 
-          ELSE 7 END,
-        p.sort_order
-    `;
+  // 1. Teacher Overlap Check (Manual since DB constraint is complex for Enums)
+  if (teacher_id) {
+    const overlap = await sql`
+            SELECT 1 FROM timetable_slots 
+            WHERE teacher_id = ${teacher_id} 
+              AND day_of_week = ${day_of_week}::day_of_week_enum
+              AND academic_year_id = ${academic_year_id}
+              AND start_time < ${end_time} 
+              AND end_time > ${start_time}
+        `;
+
+    if (overlap.length > 0) {
+      return res.status(409).json({ error: 'Teacher is already booked at this time in another class' });
     }
+  }
 
-    // Group by day
-    const timetable = {};
-    const days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-    days.forEach(d => timetable[d] = []);
+  // 2. Insert Slot
+  const result = await sql`
+        INSERT INTO timetable_slots (
+            academic_year_id, class_section_id, day_of_week, period_number, 
+            subject_id, teacher_id, start_time, end_time
+        ) VALUES (
+            ${academic_year_id}, ${class_section_id}, ${day_of_week}, ${period_number}, 
+            ${subject_id}, ${teacher_id}, ${start_time}, ${end_time}
+        )
+        RETURNING id
+    `;
 
-    entries.forEach(e => {
-        if (timetable[e.day_of_week]) {
-            timetable[e.day_of_week].push(e);
-        }
-    });
-
-    res.json({
-        staff_id: staffId,
-        teacher_name: staffInfo?.display_name,
-        designation: staffInfo?.designation,
-        timetable: day ? entries : timetable
-    });
+  res.status(201).json(result[0]);
 }));
 
 /**
- * POST /timetable
- * Create/update timetable entry
+ * DELETE /:id
+ * Delete a slot
  */
-router.post('/', requirePermission('timetable.manage'), asyncHandler(async (req, res) => {
-    const { class_section_id, subject_id, teacher_id, period_id, day_of_week, room } = req.body;
-
-    if (!class_section_id || !period_id || !day_of_week) {
-        return res.status(400).json({ error: 'class_section_id, period_id, and day_of_week are required' });
-    }
-
-    const validDays = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
-    if (!validDays.includes(day_of_week)) {
-        return res.status(400).json({ error: `day_of_week must be one of: ${validDays.join(', ')}` });
-    }
-
-    // Upsert (replace if exists)
-    const [entry] = await sql`
-    INSERT INTO timetable_entries (class_section_id, subject_id, teacher_id, period_id, day_of_week, room)
-    VALUES (${class_section_id}, ${subject_id}, ${teacher_id}, ${period_id}, ${day_of_week}, ${room})
-    ON CONFLICT (class_section_id, period_id, day_of_week)
-    DO UPDATE SET 
-      subject_id = EXCLUDED.subject_id,
-      teacher_id = EXCLUDED.teacher_id,
-      room = EXCLUDED.room
-    RETURNING *
-  `;
-
-    res.status(201).json({ message: 'Timetable entry saved', entry });
+router.delete('/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  await sql`DELETE FROM timetable_slots WHERE id = ${id}`;
+  res.json({ message: 'Slot deleted' });
 }));
 
 /**
- * DELETE /timetable/:id
- * Delete timetable entry
+ * GET /my-timetable
+ * For Students to see their own timetable
  */
-router.delete('/:id', requirePermission('timetable.manage'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+router.get('/my-timetable', asyncHandler(async (req, res) => {
+  const userId = req.user.id;
 
-    const [deleted] = await sql`DELETE FROM timetable_entries WHERE id = ${id} RETURNING id`;
+  // 1. Get Class Section ID for the student
+  // Join users -> persons -> students -> student_enrollments (active)
+  const enrollment = await sql`
+        SELECT se.class_section_id, se.academic_year_id
+        FROM student_enrollments se
+        JOIN students s ON se.student_id = s.id
+        JOIN persons p ON s.person_id = p.id
+        JOIN users u ON u.person_id = p.id
+        WHERE u.id = ${userId}
+          AND se.status = 'active'
+        LIMIT 1
+    `;
 
-    if (!deleted) {
-        return res.status(404).json({ error: 'Timetable entry not found' });
-    }
+  if (enrollment.length === 0) {
+    return res.json([]); // Not enrolled
+  }
 
-    res.json({ message: 'Timetable entry deleted' });
+  const { class_section_id, academic_year_id } = enrollment[0];
+
+  // 2. Fetch Timetable
+  const slots = await sql`
+        SELECT 
+            ts.day_of_week,
+            ts.period_number,
+            ts.start_time,
+            ts.end_time,
+            sub.name as subject_name,
+            p.display_name as teacher_name
+        FROM timetable_slots ts
+        JOIN subjects sub ON ts.subject_id = sub.id
+        LEFT JOIN staff st ON ts.teacher_id = st.id
+        LEFT JOIN persons p ON st.person_id = p.id
+        WHERE ts.class_section_id = ${class_section_id}
+          AND ts.academic_year_id = ${academic_year_id}
+        ORDER BY ts.day_of_week, ts.start_time
+    `;
+
+  res.json(slots);
+}));
+
+/**
+ * GET /teacher-timetable
+ * For Teachers to see their own schedule
+ */
+router.get('/teacher-timetable', asyncHandler(async (req, res) => {
+  const userId = req.user.id;
+  const { academic_year_id } = req.query;
+
+  // Resolve Year
+  let yearId = academic_year_id;
+  if (!yearId) {
+    const currentYear = await sql`SELECT id FROM academic_years WHERE start_date <= current_date AND end_date >= current_date LIMIT 1`;
+    if (currentYear.length > 0) yearId = currentYear[0].id;
+    else return res.json([]);
+  }
+
+  // Fetch Slots for this teacher
+  // Join users -> persons -> staff -> timetable_slots
+  const slots = await sql`
+        SELECT 
+            ts.day_of_week,
+            ts.period_number,
+            ts.start_time,
+            ts.end_time,
+            c.name as class_name,
+            sec.name as section_name,
+            sub.name as subject_name
+        FROM timetable_slots ts
+        JOIN staff st ON ts.teacher_id = st.id
+        JOIN persons p ON st.person_id = p.id
+        JOIN users u ON u.person_id = p.id
+        JOIN class_sections cs ON ts.class_section_id = cs.id
+        JOIN classes c ON cs.class_id = c.id
+        JOIN sections sec ON cs.section_id = sec.id
+        JOIN subjects sub ON ts.subject_id = sub.id
+        WHERE u.id = ${userId}
+          AND ts.academic_year_id = ${yearId}
+        ORDER BY ts.day_of_week, ts.start_time
+    `;
+
+  res.json(slots);
 }));
 
 export default router;

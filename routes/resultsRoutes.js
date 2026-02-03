@@ -66,7 +66,7 @@ router.delete('/subjects/:id', requirePermission('exams.manage'), asyncHandler(a
   }
 
   // 4. Check for Timetable Entries
-  const [hasTimetable] = await sql`SELECT 1 FROM timetable_entries WHERE subject_id = ${id} LIMIT 1`;
+  const [hasTimetable] = await sql`SELECT 1 FROM timetable_slots WHERE subject_id = ${id} LIMIT 1`;
   if (hasTimetable) {
     return res.status(400).json({ error: 'Cannot delete subject: Linked to timetable records' });
   }
