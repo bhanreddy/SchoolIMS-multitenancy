@@ -222,11 +222,34 @@ router.post('/collect', requirePermission('fees.collect'), asyncHandler(async (r
   // Create transaction (trigger will update student_fees.amount_paid)
   const [transaction] = await sql`
     INSERT INTO fee_transactions (student_fee_id, amount, payment_method, transaction_ref, received_by, remarks)
-    VALUES (${student_fee_id}, ${amount}, ${payment_method}, ${transaction_ref}, ${req.user?.internal_id}, ${remarks})
+    VALUES (
+      ${student_fee_id}, 
+      ${amount}, 
+      ${payment_method}, 
+      ${transaction_ref || null}, 
+      ${req.user?.internal_id || null}, 
+      ${remarks || null}
+    )
     RETURNING *
   `;
 
-  res.status(201).json({ message: 'Payment collected successfully', transaction });
+  // Fetch joined data for receipt
+  const [enrichedTransaction] = await sql`
+    SELECT 
+      t.*,
+      p.display_name as student_name,
+      s.admission_no,
+      ft.name as fee_type
+    FROM fee_transactions t
+    JOIN student_fees sf ON t.student_fee_id = sf.id
+    JOIN students s ON sf.student_id = s.id
+    JOIN persons p ON s.person_id = p.id
+    JOIN fee_structures fs ON sf.fee_structure_id = fs.id
+    JOIN fee_types ft ON fs.fee_type_id = ft.id
+    WHERE t.id = ${transaction.id}
+  `;
+
+  res.status(201).json({ message: 'Payment collected successfully', transaction: enrichedTransaction });
 }));
 
 /**
@@ -329,7 +352,9 @@ router.get('/receipts', requirePermission('fees.view'), asyncHandler(async (req,
     receipts = await sql`
       SELECT 
         r.id, r.receipt_no, r.total_amount, r.issued_at,
-        s.admission_no, p.display_name as student_name
+        s.admission_no, p.display_name as student_name,
+        (SELECT payment_method FROM fee_transactions t JOIN receipt_items ri ON t.id = ri.fee_transaction_id WHERE ri.receipt_id = r.id LIMIT 1) as payment_method,
+        (SELECT ft.name FROM fee_types ft JOIN fee_structures fs ON ft.id = fs.fee_type_id JOIN student_fees sf ON fs.id = sf.fee_structure_id JOIN fee_transactions t ON sf.id = t.student_fee_id JOIN receipt_items ri ON t.id = ri.fee_transaction_id WHERE ri.receipt_id = r.id LIMIT 1) as fee_type
       FROM receipts r
       JOIN students s ON r.student_id = s.id
       JOIN persons p ON s.person_id = p.id
@@ -432,7 +457,14 @@ router.post('/transactions', requirePermission('fees.collect'), asyncHandler(asy
 
   const [transaction] = await sql`
     INSERT INTO fee_transactions (student_fee_id, amount, payment_method, transaction_ref, received_by, remarks)
-    VALUES (${student_fee_id}, ${amount}, ${payment_method}, ${transaction_ref}, ${req.user?.internal_id}, ${remarks})
+    VALUES (
+      ${student_fee_id}, 
+      ${amount}, 
+      ${payment_method}, 
+      ${transaction_ref || null}, 
+      ${req.user?.internal_id || null}, 
+      ${remarks || null}
+    )
     RETURNING *
   `;
 
@@ -519,54 +551,76 @@ router.get('/collection-summary', requirePermission('fees.view'), asyncHandler(a
  * Get consolidated stats for dashboard
  */
 router.get('/dashboard-stats', asyncHandler(async (req, res) => {
-  // 1. Today's Collection
-  const todayStats = await sql`
+  console.log(`[DASHBOARD-STATS] Request received. User: ${req.user?.id || 'none'}`);
+
+  try {
+    // 1. Today's Collection
+    const todayStats = await sql`
         SELECT COALESCE(SUM(amount), 0) as total
         FROM fee_transactions
         WHERE paid_at::date = CURRENT_DATE
     `;
 
-  // 2. Monthly Collection
-  const monthlyStats = await sql`
+    // 2. Monthly Collection
+    const monthlyStats = await sql`
         SELECT COALESCE(SUM(amount), 0) as total
         FROM fee_transactions
         WHERE date_trunc('month', paid_at) = date_trunc('month', CURRENT_DATE)
     `;
 
-  // 3. Pending Dues (Total Outstanding)
-  const pendingStats = await sql`
+    // 3. Pending Dues (Total Outstanding)
+    const pendingStats = await sql`
         SELECT COALESCE(SUM(amount_due - amount_paid - discount), 0) as total
         FROM student_fees
         WHERE status IN ('pending', 'partial', 'overdue')
     `;
 
-  // 4. Recent Transactions (Last 5)
-  const recentTransactions = await sql`
-        SELECT 
-            ft.id,
-            ft.amount,
-            ft.paid_at as collected_at,
-            ft.payment_method,
-            p.display_name as student_name,
-            c.name as class_name,
-            ftype.name as fee_type
-        FROM fee_transactions ft
-        JOIN student_fees sf ON ft.student_fee_id = sf.id
-        JOIN students s ON sf.student_id = s.id
-        JOIN persons p ON s.person_id = p.id
-        LEFT JOIN fee_structures fs ON sf.fee_structure_id = fs.id
-        LEFT JOIN classes c ON fs.class_id = c.id
-        LEFT JOIN fee_types ftype ON fs.fee_type_id = ftype.id
-        ORDER BY ft.paid_at DESC
-        LIMIT 5
-    `;
+    // 4. Recent Transactions (Last 5)
+    // We wrap this in a try-catch to avoid failing the whole route if join fails
+    let recentTransactions = [];
+    try {
+      recentTransactions = await sql`
+          SELECT 
+              ft.id,
+              ft.amount,
+              ft.paid_at as collected_at,
+              ft.payment_method,
+              p.display_name as student_name,
+              c.name as class_name,
+              ftype.name as fee_type
+          FROM fee_transactions ft
+          JOIN student_fees sf ON ft.student_fee_id = sf.id
+          JOIN students s ON sf.student_id = s.id
+          JOIN persons p ON s.person_id = p.id
+          LEFT JOIN fee_structures fs ON sf.fee_structure_id = fs.id
+          LEFT JOIN classes c ON fs.class_id = c.id
+          LEFT JOIN fee_types ftype ON fs.fee_type_id = ftype.id
+          ORDER BY ft.paid_at DESC
+          LIMIT 5
+      `;
+    } catch (err) {
+      console.error('[DASHBOARD-STATS] Recent transactions fetch failed:', err);
+    }
 
-  res.json({
-    today_collection: Number(todayStats[0].total),
-    monthly_collection: Number(monthlyStats[0].total),
-    pending_dues: Number(pendingStats[0].total),
-    recent_transactions: recentTransactions
-  });
+    const result = {
+      today_collection: Number(todayStats[0]?.total || 0),
+      monthly_collection: Number(monthlyStats[0]?.total || 0),
+      pending_dues: Number(pendingStats[0]?.total || 0),
+      recent_transactions: recentTransactions || []
+    };
+
+    console.log('[DASHBOARD-STATS] Calculated stats:', JSON.stringify({
+      today: result.today_collection,
+      monthly: result.monthly_collection,
+      pending: result.pending_dues,
+      recent: result.recent_transactions.length
+    }));
+
+    res.json(result);
+  } catch (err) {
+    console.error('[DASHBOARD-STATS] Global error:', err);
+    res.status(500).json({ error: 'Failed to fetch dashboard stats', details: err.message });
+  }
 }));
 
 /**

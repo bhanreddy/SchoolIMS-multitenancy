@@ -1,107 +1,131 @@
 import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import config from '../config/env.js';
 import sql from '../db.js';
 
 const router = express.Router();
-let genAI;
-let model;
 
-if (config.geminiApiKey) {
-    genAI = new GoogleGenerativeAI(config.geminiApiKey);
-    // Use gemini-2.0-flash for latest model compatibility
-    model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-} else {
-    console.warn("⚠️ GEMINI_API_KEY is missing. AI features will fail.");
+// Helper: Initialize AI Client safely
+const getAIModel = () => {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return null;
+
+    const genAI = new GoogleGenerativeAI(apiKey);
+
+    // Using the model that worked for you
+    return genAI.getGenerativeModel({ model: "gemini-flash-latest" });
+};
+
+// Helper: Retry Logic (Kept as is - it's good)
+async function generateWithRetry(model, prompt, retries = 3, delay = 1000) {
+    try {
+        return await model.generateContent(prompt);
+    } catch (error) {
+        const isTransient = error.response?.status === 503 || error.response?.status === 429;
+        const isQuota = error.message?.includes('429') || error.message?.includes('quota');
+
+        if (isTransient && retries > 0) {
+            console.log(`⚠️ AI Busy. Retrying in ${delay}ms... (${retries} left)`);
+            await new Promise(res => setTimeout(res, delay));
+            return generateWithRetry(model, prompt, retries - 1, delay * 2);
+        }
+        throw error;
+    }
 }
 
 router.post('/doubt-assist', requireAuth, async (req, res) => {
     try {
         const { question, class_level, subject } = req.body;
 
-        if (!question) {
-            return res.status(400).json({ error: 'Question is required' });
-        }
+        if (!question) return res.status(400).json({ error: 'Question is required' });
 
-        // Check if API key is configured
+        // 1. Initialize Model
+        const model = getAIModel();
         if (!model) {
-            // Try to re-init if key was hot-loaded (though env usually requires restart)
-            if (process.env.GEMINI_API_KEY) {
-                genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-                model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-            } else {
-                return res.status(503).json({ error: 'AI Service Unavailable' });
+            return res.status(503).json({ error: 'AI Service Configuration Missing' });
+        }
+
+        // 2. Fetch User Class Context
+        // Priority: Manual Override (req.body) > Database (req.user) > Default
+        let studentClass = class_level || null;
+        let studentName = req.user?.name || "Student";
+
+        if (!studentClass && req.user && req.user.internal_id) {
+            try {
+                const enrollment = await sql`
+                    SELECT c.name as class_name 
+                    FROM student_enrollments se
+                    JOIN class_sections cs ON se.class_section_id = cs.id
+                    JOIN classes c ON cs.class_id = c.id
+                    WHERE se.student_id = ${req.user.internal_id} AND se.status = 'active'
+                    LIMIT 1
+                 `;
+                if (enrollment.length > 0) {
+                    studentClass = enrollment[0].class_name;
+                }
+            } catch (dbError) {
+                console.error("⚠️ Error fetching class context:", dbError.message);
             }
         }
 
-        // Determine Class Level from User Context if not provided
-        let studentClass = class_level || 'General';
+        // Default if nothing found
+        if (!studentClass) studentClass = 'General Learner';
 
-        // Auto-fetch class if student
-        if (req.user && req.user.internal_id) {
-            const enrollment = await sql`
-                SELECT c.name as class_name 
-                FROM student_enrollments se
-                JOIN class_sections cs ON se.class_section_id = cs.id
-                JOIN classes c ON cs.class_id = c.id
-                WHERE se.student_id = ${req.user.internal_id} 
-                AND se.status = 'active'
-                LIMIT 1
-             `;
-            if (enrollment.length > 0) {
-                studentClass = enrollment[0].class_name;
-            }
-        }
+        // LOGGING: Verify context is working
+        console.log(`🧠 AI Context Loaded: [Class: ${studentClass}] [Subject: ${subject || 'General'}]`);
 
+        // 3. Construct the "Strict Context" Prompt
+        const finalPrompt = `
+You are NexSyrus AI, a smart and friendly tutor.
+You are speaking to ${studentName}.
 
-        const systemPrompt = `You are NexSyrus IMS – AI Doubt Assist.
-Answer ONLY using the provided class level information.
-Avoid age restricted topics if the question is out of the student's age level.
-Start answering with "Hello, greetings from Nexsyrus! 👋"
-If the question is completely inappropriate for their age, respond exactly with:
-"⚠️ This question is outside your current class scope."
+🔴 **CRITICAL INSTRUCTIONS**:
+1. **CONTEXT IS KING**: The student is in **${studentClass}**. You MUST adjust your explanation complexity to match this grade level EXACTLY.
+   - If ${studentClass} is Grades 1-5: Use very simple words, fun analogies, and emojis.
+   - If ${studentClass} is Grades 6-10: Use clear, structured explanations with standard examples.
+   - If ${studentClass} is Grades 11-12/College: Use formal academic terminology and deep technical depth.
+   
+2. **SCOPE RESTRICTION**: Do NOT provide information that is confusingly advanced for a ${studentClass} student unless specifically asked.
 
-Context:
-- Class Level: ${studentClass}
-- Subject: ${subject || 'General'}
+3. **MANDATORY GREETING**: Start your answer EXACTLY with: "Hello from Nexsyrus AI! 👋"
 
-Question: ${question}
+4. **TASK**:
+   Subject: ${subject || 'General Knowledge'}
+   Question: "${question}"
+
+Answer the question now, adhering strictly to the rules above.
 `;
 
-        const result = await model.generateContent(systemPrompt);
+        // 4. Generate Content
+        const result = await generateWithRetry(model, finalPrompt);
         const responseText = result.response.text();
 
         res.json({
             answer: responseText,
+            context_used: studentClass, // Returning this helps you debug on frontend
             id: Date.now().toString()
         });
 
     } catch (error) {
-        console.error('Gemini AI Error (Full):', JSON.stringify(error, null, 2));
+        console.error('Gemini AI Error:', error.message);
 
-        // Handle Rate Limit (429)
-        if (error.status === 429 || error.message?.includes('429') || error.message?.includes('RESOURCE_EXHAUSTED') || error.message?.includes('quota')) {
-            return res.status(429).json({
-                error: 'AI Rate Limited',
-                details: 'Free tier quota exceeded. Please wait a minute and try again, or upgrade to a paid Gemini API plan.'
+        if (error.message?.includes('404') || error.message?.includes('not found')) {
+            return res.status(400).json({
+                error: 'Invalid AI Model',
+                details: 'The selected model is not accessible. Please check your API key permissions.'
             });
         }
 
-        if (error.message?.includes('404') || error.message?.includes('not found')) {
-            // Log available models for debugging
-            console.log('💡 TIP: Run "node scripts/list_available_models.js" to see supported models.');
-
-            return res.status(503).json({
-                error: 'AI Model Unavailable',
-                details: 'The configured model (gemini-2.0-flash) was not found or is not supported by your API key. Check Billing/Region.'
+        if (error.message?.includes('429') || error.message?.includes('quota')) {
+            return res.status(429).json({
+                error: 'AI Rate Limit',
+                details: 'Server is busy. Please try again in a moment.'
             });
         }
 
         res.status(502).json({
             error: 'AI Request Failed',
-            details: error.message || 'Unknown upstream error',
-            model: model?.model || 'unknown'
+            details: error.message || 'Unknown error'
         });
     }
 });

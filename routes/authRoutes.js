@@ -32,6 +32,8 @@ router.post('/login', asyncHandler(async (req, res) => {
       u.id, u.account_status,
       p.first_name, p.last_name, p.display_name, p.photo_url,
       s.admission_no,
+      (SELECT EXISTS(SELECT 1 FROM students st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_student_profile,
+      (SELECT EXISTS(SELECT 1 FROM staff st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_staff_profile,
       array_agg(DISTINCT r.code) FILTER (WHERE r.code IS NOT NULL) as roles,
       array_agg(DISTINCT perm.code) FILTER (WHERE perm.code IS NOT NULL) as permissions
     FROM users u
@@ -42,7 +44,7 @@ router.post('/login', asyncHandler(async (req, res) => {
     LEFT JOIN role_permissions rp ON r.id = rp.role_id
     LEFT JOIN permissions perm ON rp.permission_id = perm.id
     WHERE u.id = ${data.user.id}
-    GROUP BY u.id, p.first_name, p.last_name, p.display_name, p.photo_url, s.admission_no
+    GROUP BY u.id, p.id, s.admission_no
   `;
 
     if (userInfo.length === 0) {
@@ -72,7 +74,9 @@ router.post('/login', asyncHandler(async (req, res) => {
             photo_url: dbUser.photo_url,
             roles: dbUser.roles || [],
             permissions: dbUser.permissions || [],
-            admission_no: dbUser.admission_no
+            admission_no: dbUser.admission_no,
+            has_student_profile: dbUser.has_student_profile,
+            has_staff_profile: dbUser.has_staff_profile,
         }
     });
 }));
@@ -136,6 +140,8 @@ router.get('/me', asyncHandler(async (req, res) => {
       p.first_name, p.middle_name, p.last_name, p.display_name, p.dob, p.photo_url,
       g.name as gender,
       s.admission_no,
+      (SELECT EXISTS(SELECT 1 FROM students st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_student_profile,
+      (SELECT EXISTS(SELECT 1 FROM staff st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_staff_profile,
       array_agg(DISTINCT r.code) FILTER (WHERE r.code IS NOT NULL) as roles,
       array_agg(DISTINCT perm.code) FILTER (WHERE perm.code IS NOT NULL) as permissions,
       -- Get contacts

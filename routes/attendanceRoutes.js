@@ -11,15 +11,15 @@ const router = express.Router();
  * Query params: date, class_section_id, student_id, from_date, to_date
  */
 router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, res) => {
-    const { date, class_section_id, student_id, from_date, to_date, page = 1, limit = 50 } = req.query;
-    const offset = (page - 1) * limit;
+  const { date, class_section_id, student_id, from_date, to_date, page = 1, limit = 50 } = req.query;
+  const offset = (page - 1) * limit;
 
-    // Build dynamic query based on filters
-    let attendance;
+  // Build dynamic query based on filters
+  let attendance;
 
-    if (date && class_section_id) {
-        // Get attendance for a specific date and class
-        attendance = await sql`
+  if (date && class_section_id) {
+    // Get attendance for a specific date and class
+    attendance = await sql`
       SELECT 
         da.id, da.attendance_date, da.status, da.marked_at,
         s.id as student_id, s.admission_no,
@@ -36,9 +36,9 @@ router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, r
         AND da.deleted_at IS NULL
       ORDER BY p.display_name
     `;
-    } else if (student_id && from_date && to_date) {
-        // Get attendance history for a student
-        attendance = await sql`
+  } else if (student_id && from_date && to_date) {
+    // Get attendance history for a student
+    attendance = await sql`
       SELECT 
         da.id, da.attendance_date, da.status, da.marked_at,
         c.name as class_name, sec.name as section_name
@@ -53,9 +53,9 @@ router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, r
       ORDER BY da.attendance_date DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
-    } else if (date) {
-        // Get all attendance for a date
-        attendance = await sql`
+  } else if (date) {
+    // Get all attendance for a date
+    attendance = await sql`
       SELECT 
         da.id, da.attendance_date, da.status,
         s.id as student_id, s.admission_no,
@@ -73,13 +73,13 @@ router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, r
       ORDER BY c.name, sec.name, p.display_name
       LIMIT ${limit} OFFSET ${offset}
     `;
-    } else {
-        return res.status(400).json({
-            error: 'Please provide filters: date, or (student_id + from_date + to_date)'
-        });
-    }
+  } else {
+    return res.status(400).json({
+      error: 'Please provide filters: date, or (student_id + from_date + to_date)'
+    });
+  }
 
-    res.json(attendance);
+  res.json(attendance);
 }));
 
 /**
@@ -88,26 +88,26 @@ router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, r
  * Body: { class_section_id, date, attendance: [{ student_id, status }] }
  */
 router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, res) => {
-    const { class_section_id, date, attendance } = req.body;
+  const { class_section_id, date, attendance } = req.body;
 
-    if (!class_section_id || !date || !attendance || !Array.isArray(attendance)) {
-        return res.status(400).json({
-            error: 'class_section_id, date, and attendance array are required'
-        });
-    }
+  if (!class_section_id || !date || !attendance || !Array.isArray(attendance)) {
+    return res.status(400).json({
+      error: 'class_section_id, date, and attendance array are required'
+    });
+  }
 
-    const markedBy = req.user?.internal_id || null;
+  const markedBy = req.user?.internal_id || null;
 
-    const results = await sql.begin(async sql => {
-        const inserted = [];
+  const results = await sql.begin(async sql => {
+    const inserted = [];
 
-        for (const record of attendance) {
-            const { student_id, status } = record;
+    for (const record of attendance) {
+      const { student_id, status } = record;
 
-            if (!student_id || !status) continue;
+      if (!student_id || !status) continue;
 
-            // Get active enrollment for this student in this class
-            const [enrollment] = await sql`
+      // Get active enrollment for this student in this class
+      const [enrollment] = await sql`
         SELECT id FROM student_enrollments
         WHERE student_id = ${student_id}
           AND class_section_id = ${class_section_id}
@@ -116,13 +116,13 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
         LIMIT 1
       `;
 
-            if (!enrollment) {
-                console.warn(`No active enrollment for student ${student_id} in class ${class_section_id}`);
-                continue;
-            }
+      if (!enrollment) {
+        console.warn(`No active enrollment for student ${student_id} in class ${class_section_id}`);
+        continue;
+      }
 
-            // Upsert attendance (delete old if exists, then insert)
-            await sql`
+      // Upsert attendance (delete old if exists, then insert)
+      await sql`
         UPDATE daily_attendance 
         SET deleted_at = NOW() 
         WHERE student_enrollment_id = ${enrollment.id} 
@@ -130,23 +130,23 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
           AND deleted_at IS NULL
       `;
 
-            const [newRecord] = await sql`
+      const [newRecord] = await sql`
         INSERT INTO daily_attendance (student_enrollment_id, attendance_date, status, marked_by)
         VALUES (${enrollment.id}, ${date}, ${status}, ${markedBy})
         RETURNING id, status
       `;
 
-            inserted.push({ student_id, ...newRecord });
-        }
+      inserted.push({ student_id, ...newRecord });
+    }
 
-        return inserted;
-    });
+    return inserted;
+  });
 
-    res.status(201).json({
-        message: 'Attendance marked successfully',
-        count: results.length,
-        records: results
-    });
+  res.status(201).json({
+    message: 'Attendance marked successfully',
+    count: results.length,
+    records: results
+  });
 }));
 
 /**
@@ -154,30 +154,30 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
  * Update single attendance record
  */
 router.put('/:id', requirePermission('attendance.edit'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const { status } = req.body;
+  const { id } = req.params;
+  const { status } = req.body;
 
-    if (!status) {
-        return res.status(400).json({ error: 'Status is required' });
-    }
+  if (!status) {
+    return res.status(400).json({ error: 'Status is required' });
+  }
 
-    const validStatuses = ['present', 'absent', 'late', 'half_day'];
-    if (!validStatuses.includes(status)) {
-        return res.status(400).json({ error: `Status must be one of: ${validStatuses.join(', ')}` });
-    }
+  const validStatuses = ['present', 'absent', 'late', 'half_day'];
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ error: `Status must be one of: ${validStatuses.join(', ')}` });
+  }
 
-    const [updated] = await sql`
+  const [updated] = await sql`
     UPDATE daily_attendance
     SET status = ${status}, marked_by = ${req.user?.internal_id}
     WHERE id = ${id} AND deleted_at IS NULL
     RETURNING *
   `;
 
-    if (!updated) {
-        return res.status(404).json({ error: 'Attendance record not found' });
-    }
+  if (!updated) {
+    return res.status(404).json({ error: 'Attendance record not found' });
+  }
 
-    res.json({ message: 'Attendance updated', attendance: updated });
+  res.json({ message: 'Attendance updated', attendance: updated });
 }));
 
 /**
@@ -186,11 +186,11 @@ router.put('/:id', requirePermission('attendance.edit'), asyncHandler(async (req
  * Query: student_id, class_section_id, academic_year_id, from_date, to_date
  */
 router.get('/summary', requirePermission('attendance.view'), asyncHandler(async (req, res) => {
-    const { student_id, class_section_id, from_date, to_date } = req.query;
+  const { student_id, class_section_id, from_date, to_date } = req.query;
 
-    if (student_id) {
-        // Student attendance summary
-        const summary = await sql`
+  if (student_id) {
+    // Student attendance summary
+    const summary = await sql`
       SELECT 
         COUNT(*) FILTER (WHERE da.status = 'present') as present_days,
         COUNT(*) FILTER (WHERE da.status = 'absent') as absent_days,
@@ -209,10 +209,10 @@ router.get('/summary', requirePermission('attendance.view'), asyncHandler(async 
         ${to_date ? sql`AND da.attendance_date <= ${to_date}` : sql``}
     `;
 
-        res.json(summary[0]);
-    } else if (class_section_id) {
-        // Class attendance summary for a date range
-        const summary = await sql`
+    res.json(summary[0]);
+  } else if (class_section_id) {
+    // Class attendance summary for a date range
+    const summary = await sql`
       SELECT 
         da.attendance_date,
         COUNT(*) FILTER (WHERE da.status = 'present') as present,
@@ -229,12 +229,12 @@ router.get('/summary', requirePermission('attendance.view'), asyncHandler(async 
       ORDER BY da.attendance_date DESC
     `;
 
-        res.json(summary);
-    } else {
-        return res.status(400).json({
-            error: 'Please provide student_id or class_section_id'
-        });
-    }
+    res.json(summary);
+  } else {
+    return res.status(400).json({
+      error: 'Please provide student_id or class_section_id'
+    });
+  }
 }));
 
 /**
@@ -243,11 +243,11 @@ router.get('/summary', requirePermission('attendance.view'), asyncHandler(async 
  * Returns list of students with their attendance status
  */
 router.get('/class/:classSectionId', requirePermission('attendance.view'), asyncHandler(async (req, res) => {
-    const { classSectionId } = req.params;
-    const { date = new Date().toISOString().split('T')[0] } = req.query;
+  const { classSectionId } = req.params;
+  const { date = new Date().toISOString().split('T')[0] } = req.query;
 
-    // Get all students in the class with their attendance status for the date
-    const students = await sql`
+  // Get all students in the class with their attendance status for the date
+  const students = await sql`
     SELECT 
       s.id as student_id, s.admission_no,
       p.display_name as student_name, p.photo_url,
@@ -266,8 +266,8 @@ router.get('/class/:classSectionId', requirePermission('attendance.view'), async
     ORDER BY p.display_name
   `;
 
-    // Get class info
-    const [classInfo] = await sql`
+  // Get class info
+  const [classInfo] = await sql`
     SELECT c.name as class_name, s.name as section_name
     FROM class_sections cs
     JOIN classes c ON cs.class_id = c.id
@@ -275,15 +275,98 @@ router.get('/class/:classSectionId', requirePermission('attendance.view'), async
     WHERE cs.id = ${classSectionId}
   `;
 
-    res.json({
-        date,
-        class_section_id: classSectionId,
-        class_name: classInfo?.class_name,
-        section_name: classInfo?.section_name,
-        total_students: students.length,
-        marked_count: students.filter(s => s.status).length,
-        students
+  res.json({
+    date,
+    class_section_id: classSectionId,
+    class_name: classInfo?.class_name,
+    section_name: classInfo?.section_name,
+    total_students: students.length,
+    marked_count: students.filter(s => s.status).length,
+    students
+  });
+}));
+
+
+/**
+ * GET /attendance/staff
+ * Get staff attendance for a specific date
+ * Query: date
+ */
+router.get('/staff', requirePermission('attendance.view'), asyncHandler(async (req, res) => {
+  const { date } = req.query;
+
+  if (!date) {
+    return res.status(400).json({ error: 'Date is required' });
+  }
+
+  const attendance = await sql`
+        SELECT 
+            s.id as staff_id, s.staff_code,
+            p.display_name as staff_name, p.photo_url,
+            sd.name as designation,
+            sa.id as attendance_id, sa.attendance_date, sa.status, sa.marked_at
+        FROM staff s
+        JOIN persons p ON s.person_id = p.id
+        LEFT JOIN staff_designations sd ON s.designation_id = sd.id
+        LEFT JOIN staff_attendance sa ON s.id = sa.staff_id 
+            AND sa.attendance_date = ${date}
+            AND sa.deleted_at IS NULL
+        WHERE s.deleted_at IS NULL
+          AND s.status_id = 1 -- Only active staff
+        ORDER BY p.display_name
+    `;
+
+  res.json(attendance);
+}));
+
+/**
+ * POST /attendance/staff
+ * Mark staff attendance (bulk)
+ * Body: { date, attendance: [{ staff_id, status }] }
+ */
+router.post('/staff', requirePermission('attendance.mark'), asyncHandler(async (req, res) => {
+  const { date, attendance } = req.body;
+
+  if (!date || !attendance || !Array.isArray(attendance)) {
+    return res.status(400).json({
+      error: 'date and attendance array are required'
     });
+  }
+
+  const markedBy = req.user?.internal_id || null;
+
+  // Process attendance
+  const results = await sql.begin(async sql => {
+    const inserted = [];
+
+    for (const record of attendance) {
+      const { staff_id, status } = record;
+
+      if (!staff_id || !status) continue;
+
+      const [result] = await sql`
+                INSERT INTO staff_attendance (staff_id, attendance_date, status, marked_by)
+                VALUES (${staff_id}, ${date}, ${status}, ${markedBy})
+                ON CONFLICT (staff_id, attendance_date)
+                DO UPDATE SET 
+                    status = EXCLUDED.status,
+                    marked_by = EXCLUDED.marked_by,
+                    updated_at = NOW(),
+                    deleted_at = NULL
+                RETURNING id, status
+            `;
+
+      inserted.push({ staff_id, status: result.status });
+    }
+    return inserted;
+  });
+
+  res.status(201).json({
+    message: 'Staff attendance marked successfully',
+    count: results.length,
+    records: results
+  });
 }));
 
 export default router;
+

@@ -12,13 +12,15 @@ export const asyncHandler = (fn) => (req, res, next) => {
  * Centralizes error handling for all routes
  */
 export const errorHandler = (err, req, res, next) => {
-    console.error('Error:', err);
+    const requestId = req.requestId || 'no-id';
+    console.error(`[ERROR] [${requestId}] ${req.method} ${req.url}:`, err);
 
     // Handle known error types
     if (err.name === 'ValidationError') {
         return res.status(400).json({
             error: 'Validation Error',
-            details: err.errors || err.message
+            details: err.errors || err.message,
+            requestId
         });
     }
 
@@ -26,7 +28,8 @@ export const errorHandler = (err, req, res, next) => {
         // PostgreSQL unique violation
         return res.status(409).json({
             error: 'Duplicate Entry',
-            details: err.detail || 'A record with this value already exists'
+            details: err.detail || 'A record with this value already exists',
+            requestId
         });
     }
 
@@ -34,14 +37,18 @@ export const errorHandler = (err, req, res, next) => {
         // PostgreSQL foreign key violation
         return res.status(400).json({
             error: 'Invalid Reference',
-            details: err.detail || 'Referenced record does not exist'
+            details: err.detail || 'Referenced record does not exist',
+            requestId
         });
     }
 
     // Default to 500
     const status = err.status || err.statusCode || 500;
     res.status(status).json({
-        error: err.message || 'Internal Server Error',
+        error: config.nodeEnv === 'production' && status === 500
+            ? 'Internal Server Error'
+            : err.message || 'Internal Server Error',
+        requestId,
         ...(config.nodeEnv === 'development' && { stack: err.stack })
     });
 };

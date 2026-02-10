@@ -328,27 +328,37 @@ router.get('/:id/timetable', requirePermission('staff.view'), asyncHandler(async
  */
 router.get('/:id/payslip', requirePermission('staff.view'), asyncHandler(async (req, res) => {
     const { id } = req.params;
+    const { month, year } = req.query;
 
-    // Get basic salary info
-    const [staff] = await sql`
-    SELECT st.salary, p.display_name, sd.name as designation
-    FROM staff st
-    JOIN persons p ON st.person_id = p.id
-    LEFT JOIN staff_designations sd ON st.designation_id = sd.id
-    WHERE st.id = ${id} AND st.deleted_at IS NULL
-  `;
+    const targetDate = new Date();
+    const targetMonth = month ? parseInt(month) : targetDate.getMonth() + 1;
+    const targetYear = year ? parseInt(year) : targetDate.getFullYear();
 
-    if (!staff) {
-        return res.status(404).json({ error: 'Staff not found' });
+    // Ensure payroll exists/is up-to-date
+    // effectively "lazy load" the payroll calculation if it's missing or outdated
+    // (Though triggers handle updates, this ensures existence if never calculated)
+    await sql`SELECT recalculate_staff_payroll(${id}, ${targetMonth}, ${targetYear})`;
+
+    const [payroll] = await sql`
+        SELECT 
+            sp.*,
+            st.staff_code,
+            p.display_name as staff_name,
+            sd.name as designation
+        FROM staff_payroll sp
+        JOIN staff st ON sp.staff_id = st.id
+        JOIN persons p ON st.person_id = p.id
+        LEFT JOIN staff_designations sd ON st.designation_id = sd.id
+        WHERE sp.staff_id = ${id}
+          AND sp.payroll_month = ${targetMonth}
+          AND sp.payroll_year = ${targetYear}
+    `;
+
+    if (!payroll) {
+        return res.status(404).json({ error: 'Payroll record not found' });
     }
 
-    res.json({
-        staff_id: id,
-        name: staff.display_name,
-        designation: staff.designation,
-        basic_salary: staff.salary,
-        message: 'Full payroll system will be implemented in a future phase'
-    });
+    res.json(payroll);
 }));
 
 export default router;

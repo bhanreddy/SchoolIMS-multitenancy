@@ -589,4 +589,68 @@ router.get('/generate', requirePermission('results.generate'), asyncHandler(asyn
   });
 }));
 
+/**
+ * GET /results/summary/student/:studentId
+ * Get summary of exam results for a student, grouped by exam type
+ * Used for the main Results screen cards
+ */
+router.get('/summary/student/:studentId', requirePermission('results.view'), asyncHandler(async (req, res) => {
+  const { studentId } = req.params;
+  const { academic_year_id } = req.query;
+
+  // Query to get counts and latest info for each exam type
+  // Only includes exams where the student has at least one mark entry
+  const summary = await sql`
+    SELECT 
+      e.exam_type,
+      COUNT(DISTINCT e.id) as exam_count,
+      MAX(e.start_date) as last_exam_date
+    FROM marks m
+    JOIN exam_subjects es ON m.exam_subject_id = es.id
+    JOIN exams e ON es.exam_id = e.id
+    JOIN student_enrollments se ON m.student_enrollment_id = se.id
+    WHERE se.student_id = ${studentId}
+      ${academic_year_id ? sql`AND e.academic_year_id = ${academic_year_id}` : sql``}
+    GROUP BY e.exam_type
+    ORDER BY MAX(e.start_date) DESC
+  `;
+
+  res.json(summary);
+}));
+
+/**
+ * GET /results/list/student/:studentId
+ * Get list of exams for a specific type
+ */
+router.get('/list/student/:studentId', requirePermission('results.view'), asyncHandler(async (req, res) => {
+  const { studentId } = req.params;
+  const { exam_type, academic_year_id } = req.query;
+
+  if (!exam_type) {
+    return res.status(400).json({ error: 'exam_type is required' });
+  }
+
+  const exams = await sql`
+    SELECT 
+      e.id, e.name, e.exam_type, e.start_date, e.end_date, e.status, // Fixed: removed ay.code as it needs a join
+      ay.code as academic_year,
+      COUNT(DISTINCT es.subject_id) as subjects_count,
+      SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) as total_obtained,
+      SUM(es.max_marks) as total_max,
+      ROUND(SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END)::numeric / NULLIF(SUM(es.max_marks), 0) * 100, 2) as percentage
+    FROM marks m
+    JOIN exam_subjects es ON m.exam_subject_id = es.id
+    JOIN exams e ON es.exam_id = e.id
+    JOIN academic_years ay ON e.academic_year_id = ay.id
+    JOIN student_enrollments se ON m.student_enrollment_id = se.id
+    WHERE se.student_id = ${studentId}
+      AND e.exam_type = ${exam_type}
+      ${academic_year_id ? sql`AND e.academic_year_id = ${academic_year_id}` : sql``}
+    GROUP BY e.id, e.name, e.exam_type, e.start_date, e.end_date, e.status, ay.code
+    ORDER BY e.start_date DESC
+  `;
+
+  res.json(exams);
+}));
+
 export default router;

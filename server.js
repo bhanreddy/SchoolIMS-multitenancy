@@ -1,22 +1,51 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import morgan from 'morgan';
 import config from './config/env.js';
 // Forced restart to pick up route changes
 import { identifyUser } from './middleware/auth.js';
 import { auditLogger } from './middleware/audit.js';
 import { errorHandler } from './utils/asyncHandler.js';
+import sql from './db.js';
 
 const app = express();
 const port = config.port;
 
-// CORS - Allow all origins for mobile app
-app.use(cors());
+// Security Middleware
+app.use(helmet());
+
+// Rate Limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: config.nodeEnv === 'production' ? 100 : 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+  skip: (req) => req.path === '/api/v1/health' // Allow monitoring without rate limit
+});
+app.use('/api/', limiter);
+
+// Logging
+app.use(morgan(config.nodeEnv === 'production' ? 'combined' : 'dev'));
+
+// CORS - Allow all origins for mobile app (Restrict in production if possible)
+app.use(cors({
+  origin: config.nodeEnv === 'production' ? process.env.ALLOWED_ORIGINS?.split(',') || '*' : '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-request-id']
+}));
 
 // Middleware
 app.use(express.json());
 
 // Auth & Audit Middleware (Global)
 app.use(identifyUser);
+app.use((req, res, next) => {
+  console.log(`[REQUEST] ${req.method} ${req.url} - User: ${req.user?.id || 'none'}`);
+  next();
+});
 app.use(auditLogger);
 
 // Import routes
@@ -42,6 +71,28 @@ import adminRouter from './routes/adminRoutes.js';
 import notificationRouter from './routes/notificationRoutes.js';
 import aiRouter from './routes/aiRoutes.js';
 import analyticsRouter from './routes/analyticsRoutes.js';
+import adminNotificationRoutes from './routes/adminNotificationRoutes.js';
+import invoicesRouter from './routes/invoicesRoutes.js';
+
+// Health check endpoint
+app.get('/api/v1/health', async (req, res) => {
+  try {
+    // Check DB connectivity
+    await sql`SELECT 1`;
+    res.json({
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      database: 'connected'
+    });
+  } catch (error) {
+    res.status(503).json({
+      status: 'unhealthy',
+      timestamp: new Date().toISOString(),
+      error: 'Database connection failed'
+    });
+  }
+});
 
 // Root route
 app.get('/', (req, res) => {
@@ -66,7 +117,8 @@ app.get('/', (req, res) => {
       transport: '/api/v1/transport',
       hostel: '/api/v1/hostel',
       events: '/api/v1/events',
-      lms: '/api/v1/lms'
+      lms: '/api/v1/lms',
+      health: '/api/v1/health'
     }
   });
 });
@@ -94,6 +146,8 @@ app.use('/api/v1/lms', lmsRouter);
 app.use('/api/v1/notifications', notificationRouter);
 app.use('/api/v1/ai', aiRouter);
 app.use('/api/v1/analytics', analyticsRouter);
+app.use('/api/v1/admin/notifications', adminNotificationRoutes);
+app.use('/api/v1/invoices', invoicesRouter);
 
 // Legacy routes (for backward compatibility)
 app.use('/students', studentsRouter);

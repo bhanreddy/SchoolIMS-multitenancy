@@ -10,19 +10,20 @@ const router = express.Router();
  * List leave applications
  */
 router.get('/', requirePermission('leaves.view'), asyncHandler(async (req, res) => {
-    const { status, leave_type, from_date, to_date, page = 1, limit = 20 } = req.query;
-    const offset = (page - 1) * limit;
+  const { status, leave_type, from_date, to_date, page = 1, limit = 20 } = req.query;
+  const offset = (page - 1) * limit;
 
-    const isAdmin = req.user?.roles.includes('admin') || req.user?.permissions.includes('leaves.approve');
+  const isAdmin = req.user?.roles.includes('admin') || req.user?.permissions.includes('leaves.approve');
 
-    let leaves;
-    if (isAdmin) {
-        // Admin/approvers see all
-        leaves = await sql`
+  let leaves;
+  if (isAdmin) {
+    // Admin/approvers see all
+    leaves = await sql`
       SELECT 
         la.id, la.leave_type, la.start_date, la.end_date, la.reason, la.status,
         la.review_remarks, la.created_at,
         applicant.display_name as applicant_name,
+        (SELECT r.code FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = u.id LIMIT 1) as applicant_role,
         reviewer.display_name as reviewed_by_name,
         la.reviewed_at
       FROM leave_applications la
@@ -38,9 +39,9 @@ router.get('/', requirePermission('leaves.view'), asyncHandler(async (req, res) 
       ORDER BY la.created_at DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
-    } else {
-        // Regular users see only their leaves
-        leaves = await sql`
+  } else {
+    // Regular users see only their leaves
+    leaves = await sql`
       SELECT 
         la.id, la.leave_type, la.start_date, la.end_date, la.reason, la.status,
         la.review_remarks, la.created_at, la.reviewed_at
@@ -50,9 +51,9 @@ router.get('/', requirePermission('leaves.view'), asyncHandler(async (req, res) 
       ORDER BY la.created_at DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
-    }
+  }
 
-    res.json(leaves);
+  res.json(leaves);
 }));
 
 /**
@@ -60,9 +61,9 @@ router.get('/', requirePermission('leaves.view'), asyncHandler(async (req, res) 
  * Get leave application details
  */
 router.get('/:id', requirePermission('leaves.view'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    const [leave] = await sql`
+  const [leave] = await sql`
     SELECT 
       la.*,
       applicant.display_name as applicant_name,
@@ -75,17 +76,17 @@ router.get('/:id', requirePermission('leaves.view'), asyncHandler(async (req, re
     WHERE la.id = ${id}
   `;
 
-    if (!leave) {
-        return res.status(404).json({ error: 'Leave application not found' });
-    }
+  if (!leave) {
+    return res.status(404).json({ error: 'Leave application not found' });
+  }
 
-    // Check access
-    const isAdmin = req.user?.roles.includes('admin') || req.user?.permissions.includes('leaves.approve');
-    if (!isAdmin && leave.applicant_id !== req.user.internal_id) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
+  // Check access
+  const isAdmin = req.user?.roles.includes('admin') || req.user?.permissions.includes('leaves.approve');
+  if (!isAdmin && leave.applicant_id !== req.user.internal_id) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
 
-    res.json(leave);
+  res.json(leave);
 }));
 
 /**
@@ -93,36 +94,36 @@ router.get('/:id', requirePermission('leaves.view'), asyncHandler(async (req, re
  * Apply for leave
  */
 router.post('/', requirePermission('leaves.apply'), asyncHandler(async (req, res) => {
-    const { leave_type, start_date, end_date, reason } = req.body;
+  const { leave_type, start_date, end_date, reason } = req.body;
 
-    if (!leave_type || !start_date || !end_date || !reason) {
-        return res.status(400).json({ error: 'leave_type, start_date, end_date, and reason are required' });
-    }
+  if (!leave_type || !start_date || !end_date || !reason) {
+    return res.status(400).json({ error: 'leave_type, start_date, end_date, and reason are required' });
+  }
 
-    const validTypes = ['casual', 'sick', 'earned', 'maternity', 'paternity', 'unpaid', 'other'];
-    if (!validTypes.includes(leave_type)) {
-        return res.status(400).json({ error: `leave_type must be one of: ${validTypes.join(', ')}` });
-    }
+  const validTypes = ['casual', 'sick', 'earned', 'maternity', 'paternity', 'unpaid', 'other'];
+  if (!validTypes.includes(leave_type)) {
+    return res.status(400).json({ error: `leave_type must be one of: ${validTypes.join(', ')}` });
+  }
 
-    // Check for overlapping leaves
-    const overlapping = await sql`
+  // Check for overlapping leaves
+  const overlapping = await sql`
     SELECT id FROM leave_applications
     WHERE applicant_id = ${req.user.internal_id}
       AND status IN ('pending', 'approved')
       AND daterange(start_date, end_date, '[]') && daterange(${start_date}::date, ${end_date}::date, '[]')
   `;
 
-    if (overlapping.length > 0) {
-        return res.status(400).json({ error: 'You have overlapping leave applications' });
-    }
+  if (overlapping.length > 0) {
+    return res.status(400).json({ error: 'You have overlapping leave applications' });
+  }
 
-    const [leave] = await sql`
+  const [leave] = await sql`
     INSERT INTO leave_applications (applicant_id, leave_type, start_date, end_date, reason)
     VALUES (${req.user.internal_id}, ${leave_type}, ${start_date}, ${end_date}, ${reason})
     RETURNING *
   `;
 
-    res.status(201).json({ message: 'Leave application submitted', leave });
+  res.status(201).json({ message: 'Leave application submitted', leave });
 }));
 
 /**
@@ -130,44 +131,44 @@ router.post('/', requirePermission('leaves.apply'), asyncHandler(async (req, res
  * Approve/reject leave (admin) or update own pending leave
  */
 router.put('/:id', asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const { status, review_remarks, leave_type, start_date, end_date, reason } = req.body;
+  const { id } = req.params;
+  const { status, review_remarks, leave_type, start_date, end_date, reason } = req.body;
 
-    const [existing] = await sql`SELECT applicant_id, status FROM leave_applications WHERE id = ${id}`;
-    if (!existing) {
-        return res.status(404).json({ error: 'Leave application not found' });
+  const [existing] = await sql`SELECT applicant_id, status FROM leave_applications WHERE id = ${id}`;
+  if (!existing) {
+    return res.status(404).json({ error: 'Leave application not found' });
+  }
+
+  const isApprover = req.user?.roles.includes('admin') || req.user?.permissions.includes('leaves.approve');
+  const isOwner = existing.applicant_id === req.user.internal_id;
+
+  // Only approvers can approve/reject
+  if (status && (status === 'approved' || status === 'rejected')) {
+    if (!isApprover) {
+      return res.status(403).json({ error: 'Only authorized users can approve/reject leaves' });
     }
 
-    const isApprover = req.user?.roles.includes('admin') || req.user?.permissions.includes('leaves.approve');
-    const isOwner = existing.applicant_id === req.user.internal_id;
-
-    // Only approvers can approve/reject
-    if (status && (status === 'approved' || status === 'rejected')) {
-        if (!isApprover) {
-            return res.status(403).json({ error: 'Only authorized users can approve/reject leaves' });
-        }
-
-        const [updated] = await sql`
+    const [updated] = await sql`
       UPDATE leave_applications
       SET 
         status = ${status},
-        review_remarks = ${review_remarks},
+        review_remarks = ${review_remarks || null},
         reviewed_by = ${req.user.internal_id},
         reviewed_at = NOW()
       WHERE id = ${id}
       RETURNING *
     `;
 
-        return res.json({ message: `Leave ${status}`, leave: updated });
+    return res.json({ message: `Leave ${status}`, leave: updated });
+  }
+
+  // Owner can update pending leaves or cancel
+  if (isOwner) {
+    if (existing.status !== 'pending' && status !== 'cancelled') {
+      return res.status(400).json({ error: 'Can only update pending leaves' });
     }
 
-    // Owner can update pending leaves or cancel
-    if (isOwner) {
-        if (existing.status !== 'pending' && status !== 'cancelled') {
-            return res.status(400).json({ error: 'Can only update pending leaves' });
-        }
-
-        const [updated] = await sql`
+    const [updated] = await sql`
       UPDATE leave_applications
       SET 
         status = COALESCE(${status}, status),
@@ -179,10 +180,10 @@ router.put('/:id', asyncHandler(async (req, res) => {
       RETURNING *
     `;
 
-        return res.json({ message: 'Leave updated', leave: updated });
-    }
+    return res.json({ message: 'Leave updated', leave: updated });
+  }
 
-    return res.status(403).json({ error: 'Access denied' });
+  return res.status(403).json({ error: 'Access denied' });
 }));
 
 /**
@@ -190,24 +191,24 @@ router.put('/:id', asyncHandler(async (req, res) => {
  * Cancel/delete leave (owner only, pending status)
  */
 router.delete('/:id', asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    const [existing] = await sql`SELECT applicant_id, status FROM leave_applications WHERE id = ${id}`;
-    if (!existing) {
-        return res.status(404).json({ error: 'Leave application not found' });
-    }
+  const [existing] = await sql`SELECT applicant_id, status FROM leave_applications WHERE id = ${id}`;
+  if (!existing) {
+    return res.status(404).json({ error: 'Leave application not found' });
+  }
 
-    const isAdmin = req.user?.roles.includes('admin');
-    if (!isAdmin && existing.applicant_id !== req.user.internal_id) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
+  const isAdmin = req.user?.roles.includes('admin');
+  if (!isAdmin && existing.applicant_id !== req.user.internal_id) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
 
-    if (!isAdmin && existing.status !== 'pending') {
-        return res.status(400).json({ error: 'Can only delete pending leaves' });
-    }
+  if (!isAdmin && existing.status !== 'pending') {
+    return res.status(400).json({ error: 'Can only delete pending leaves' });
+  }
 
-    await sql`DELETE FROM leave_applications WHERE id = ${id}`;
-    res.json({ message: 'Leave application deleted' });
+  await sql`DELETE FROM leave_applications WHERE id = ${id}`;
+  res.json({ message: 'Leave application deleted' });
 }));
 
 export default router;

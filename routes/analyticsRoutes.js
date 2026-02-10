@@ -253,4 +253,65 @@ router.get('/talking-points/:id', requireAuth, asyncHandler(async (req, res) => 
     res.json(points);
 }));
 
+
+/**
+ * GET /admin/analytics/net-balance
+ * Get financial summary (Net Balance)
+ * Query Params: startDate, endDate (YYYY-MM-DD)
+ */
+router.get('/net-balance', requireAuth, asyncHandler(async (req, res) => {
+    const { startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+        return res.status(400).json({ error: 'startDate and endDate are required' });
+    }
+
+    // 1. Total Fee Collected (Paid only)
+    const [feeStats] = await sql`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM fee_transactions
+        WHERE paid_at BETWEEN ${startDate} AND ${endDate}::date + INTERVAL '1 day'
+    `;
+
+    // 2. Total Salary Paid (Paid only)
+    const [salaryStats] = await sql`
+        SELECT COALESCE(SUM(net_salary), 0) as total
+        FROM staff_payroll
+        WHERE status = 'paid'
+          AND payment_date BETWEEN ${startDate} AND ${endDate}
+    `;
+
+    // 3. Total Other Expenses (Paid only)
+    // Note: 'expenses' table has 'expense_date'. We use that.
+    // Filter by status='paid' as per requirement (though prompt said "Total Other Expenses -> all non-salary expenses", usually implies paid or incurred. Prompt clarification: "Data rules: ... Total Fee -> only paid ... Total Salary -> only paid ... Other Expenses -> all non-salary expenses". 
+    // Wait, for Expenses, it says "all non-salary expenses". It doesn't explicitly say "only paid". 
+    // However, for "Net Balance" (Cash flow context), usually we track actual outflow.
+    // Let's look at the constraints: "Net Balance = Total Fee Collected - Total Salary Paid - Total Other Expenses".
+    // "Total Fee Collected -> only paid fees".
+    // "Total Salary Paid -> only paid salaries".
+    // "Other Expenses -> all non-salary expenses". 
+    // If I include 'pending' expenses, it reduces the balance even if cash hasn't left. 
+    // Given usage of "Collected" and "Paid" for others, I will assume "Paid" for expenses too to keep it cash-based.
+    // ALSO: The prompt says "Keep logic cash-based". So definitely only 'paid'.
+
+    const [expenseStats] = await sql`
+        SELECT COALESCE(SUM(amount), 0) as total
+        FROM expenses
+        WHERE status = 'paid'
+          AND expense_date BETWEEN ${startDate} AND ${endDate}
+    `;
+
+    const totalFee = parseFloat(feeStats.total);
+    const totalSalary = parseFloat(salaryStats.total);
+    const totalExpenses = parseFloat(expenseStats.total);
+    const netBalance = totalFee - totalSalary - totalExpenses;
+
+    res.json({
+        totalFee,
+        totalSalary,
+        totalExpenses,
+        netBalance
+    });
+}));
+
 export default router;

@@ -1230,7 +1230,7 @@ ON CONFLICT (code) DO NOTHING;
 
 -- Views
 CREATE OR REPLACE VIEW active_students AS
-SELECT * FROM students WHERE deleted_at IS NULL;
+SELECT * FROM students WHERE deleted_at IS NULL AND status_id = 1;
 
 CREATE OR REPLACE VIEW active_persons AS
 SELECT * FROM persons WHERE deleted_at IS NULL;
@@ -2422,26 +2422,52 @@ SET search_path = public
 AS $$
 DECLARE
     v_total_collected DECIMAL(12,2) := 0;
-    v_target_collection DECIMAL(12,2) := 0;
+    v_total_collected_prev DECIMAL(12,2) := 0;
     v_total_outstanding DECIMAL(12,2) := 0;
+    v_total_outstanding_prev DECIMAL(12,2) := 0;
+    v_eff_current NUMERIC(5,2) := 0;
+    v_eff_prev NUMERIC(5,2) := 0;
+    v_duration INTEGER;
+    v_prev_from DATE;
+    v_prev_to DATE;
     v_trend_data JSONB;
 BEGIN
-    -- 1. Total Collected in Range (from fee_transactions)
+    v_duration := p_to_date - p_from_date;
+    v_prev_to := p_from_date - 1;
+    v_prev_from := v_prev_to - v_duration;
+
+    -- 1. Current Period Collection
     SELECT COALESCE(SUM(amount), 0) INTO v_total_collected
     FROM fee_transactions
     WHERE paid_at::DATE BETWEEN p_from_date AND p_to_date;
 
-    -- 2. Total Outstanding (Snapshot from student_fees)
-    -- This is a snapshot of current outstanding, not time-bound to the range (unless we track history).
+    -- 2. Previous Period Collection
+    SELECT COALESCE(SUM(amount), 0) INTO v_total_collected_prev
+    FROM fee_transactions
+    WHERE paid_at::DATE BETWEEN v_prev_from AND v_prev_to;
+
+    -- 3. Outstanding Calculation (Snapshots)
+    -- Current Outstanding
     SELECT COALESCE(SUM(amount_due - discount - amount_paid), 0) INTO v_total_outstanding
     FROM student_fees
-    WHERE deleted_at IS NULL 
-      AND status != 'waived';
+    WHERE deleted_at IS NULL AND status != 'waived';
     
+    -- Prev Outstanding (at start of current range)
+    -- Total Due before p_from - Total Paid before p_from
+    SELECT 
+        (SELECT COALESCE(SUM(amount_due - discount), 0) FROM student_fees WHERE created_at::DATE < p_from_date AND deleted_at IS NULL AND status != 'waived') -
+        (SELECT COALESCE(SUM(amount), 0) FROM fee_transactions WHERE paid_at::DATE < p_from_date)
+    INTO v_total_outstanding_prev;
+
     -- Ensure non-negative
     IF v_total_outstanding < 0 THEN v_total_outstanding := 0; END IF;
+    IF v_total_outstanding_prev < 0 THEN v_total_outstanding_prev := 0; END IF;
 
-    -- 3. Trend Data
+    -- 4. Efficiency
+    v_eff_current := ROUND(safe_div(v_total_collected * 100.0, v_total_collected + v_total_outstanding), 1);
+    v_eff_prev := ROUND(safe_div(v_total_collected_prev * 100.0, v_total_collected_prev + v_total_outstanding_prev), 1);
+
+    -- 5. Trend Data
     IF p_group_by = 'month' THEN
         SELECT jsonb_agg(dataset) INTO v_trend_data
         FROM (
@@ -2468,8 +2494,11 @@ BEGIN
 
     RETURN jsonb_build_object(
         'total_collected', v_total_collected,
+        'total_collected_prev', v_total_collected_prev,
         'outstanding_dues', v_total_outstanding,
-        'collection_efficiency', CASE WHEN (v_total_collected + v_total_outstanding) > 0 THEN ROUND((v_total_collected * 100.0 / (v_total_collected + v_total_outstanding)), 1) ELSE 0 END,
+        'outstanding_dues_prev', v_total_outstanding_prev,
+        'collection_efficiency', v_eff_current,
+        'collection_efficiency_prev', v_eff_prev,
         'trend', COALESCE(v_trend_data, '[]'::jsonb)
     );
 END;
@@ -2485,12 +2514,22 @@ SET search_path = public
 AS $$
 DECLARE
     v_avg_attendance NUMERIC(5,2);
+    v_avg_attendance_prev NUMERIC(5,2);
     v_total_records INTEGER;
     v_total_present INTEGER;
+    v_total_records_prev INTEGER;
+    v_total_present_prev INTEGER;
     v_chronic_absentees INTEGER;
+    v_duration INTEGER;
+    v_prev_from DATE;
+    v_prev_to DATE;
     v_trend_data JSONB;
 BEGIN
-    -- 1. Average Attendance % (Global)
+    v_duration := p_to_date - p_from_date;
+    v_prev_to := p_from_date - 1;
+    v_prev_from := v_prev_to - v_duration;
+
+    -- 1. Current Average Attendance %
     SELECT 
         COUNT(*),
         COUNT(*) FILTER (WHERE status IN ('present', 'late', 'half_day'))
@@ -2501,9 +2540,18 @@ BEGIN
 
     v_avg_attendance := safe_div(v_total_present * 100.0, v_total_records);
 
-    -- 2. Chronic Absenteeism (Student absent > 20% of days in range)
-    -- Simplified: Students with > 3 absences in range (if range is small) or percentage based.
-    -- Let's define chronic as < 80% attendance in this period.
+    -- 2. Previous Average Attendance %
+    SELECT 
+        COUNT(*),
+        COUNT(*) FILTER (WHERE status IN ('present', 'late', 'half_day'))
+    INTO v_total_records_prev, v_total_present_prev
+    FROM daily_attendance
+    WHERE attendance_date BETWEEN v_prev_from AND v_prev_to
+      AND deleted_at IS NULL;
+
+    v_avg_attendance_prev := safe_div(v_total_present_prev * 100.0, v_total_records_prev);
+
+    -- 3. Chronic Absenteeism (Current Period)
     WITH student_stats AS (
         SELECT 
             student_enrollment_id,
@@ -2518,7 +2566,7 @@ BEGIN
     FROM student_stats
     WHERE safe_div(present_days::NUMERIC, total_days::NUMERIC) < 0.8;
 
-    -- 3. Trend (Daily Avg)
+    -- 4. Trend (Daily Avg Current Period)
     SELECT jsonb_agg(dataset) INTO v_trend_data
     FROM (
         SELECT 
@@ -2533,6 +2581,7 @@ BEGIN
 
     RETURN jsonb_build_object(
         'avg_attendance', COALESCE(v_avg_attendance, 0),
+        'avg_attendance_prev', COALESCE(v_avg_attendance_prev, 0),
         'chronic_absentees', COALESCE(v_chronic_absentees, 0),
         'trend', COALESCE(v_trend_data, '[]'::jsonb)
     );
@@ -2594,4 +2643,553 @@ $$ LANGUAGE plpgsql;
 GRANT EXECUTE ON FUNCTION get_financial_analytics TO authenticated;
 GRANT EXECUTE ON FUNCTION get_attendance_analytics TO authenticated;
 GRANT EXECUTE ON FUNCTION get_dashboard_insights TO authenticated;
+
+  
+
+-- 18. ANALYTICS
+CREATE OR REPLACE FUNCTION get_financial_analytics(
+    p_from_date DATE,
+    p_to_date DATE,
+    p_group_by TEXT DEFAULT 'month'
+)
+RETURNS JSONB
+SET search_path = public
+AS $$
+DECLARE
+    v_total_collected DECIMAL(12,2) := 0;
+    v_total_outstanding DECIMAL(12,2) := 0;
+    v_trend_data JSONB;
+BEGIN
+    -- 1. Total Collected in Range (from fee_transactions)
+    SELECT COALESCE(SUM(amount), 0) INTO v_total_collected
+    FROM fee_transactions
+    WHERE paid_at::DATE BETWEEN p_from_date AND p_to_date;
+
+    -- 2. Total Outstanding (Snapshot from student_fees)
+    -- REMOVED: deleted_at check as column prevents loading
+    SELECT COALESCE(SUM(amount_due - discount - amount_paid), 0) INTO v_total_outstanding
+    FROM student_fees
+    WHERE status != 'waived';
+    
+    -- Ensure non-negative
+    IF v_total_outstanding < 0 THEN v_total_outstanding := 0; END IF;
+
+    -- 3. Trend Data
+    IF p_group_by = 'month' THEN
+        SELECT jsonb_agg(dataset) INTO v_trend_data
+        FROM (
+            SELECT 
+                TO_CHAR(date_trunc('month', paid_at), 'Mon') as label,
+                SUM(amount) as value
+            FROM fee_transactions
+            WHERE paid_at::DATE BETWEEN p_from_date AND p_to_date
+            GROUP BY date_trunc('month', paid_at)
+            ORDER BY date_trunc('month', paid_at)
+        ) dataset;
+    ELSE
+            SELECT jsonb_agg(dataset) INTO v_trend_data
+        FROM (
+            SELECT 
+                TO_CHAR(date_trunc('week', paid_at), 'DD Mon') as label,
+                SUM(amount) as value
+            FROM fee_transactions
+            WHERE paid_at::DATE BETWEEN p_from_date AND p_to_date
+            GROUP BY date_trunc('week', paid_at)
+            ORDER BY date_trunc('week', paid_at)
+        ) dataset;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'total_collected', v_total_collected,
+        'outstanding_dues', v_total_outstanding,
+        'collection_efficiency', CASE WHEN (v_total_collected + v_total_outstanding) > 0 THEN ROUND((v_total_collected * 100.0 / (v_total_collected + v_total_outstanding)), 1) ELSE 0 END,
+        'trend', COALESCE(v_trend_data, '[]'::jsonb)
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_attendance_analytics(
+    p_from_date DATE,
+    p_to_date DATE
+)
+RETURNS JSONB
+SET search_path = public
+AS $$
+DECLARE
+    v_avg_attendance DECIMAL(5,2) := 0;
+    v_chronic_absentees INTEGER := 0;
+    v_trend_data JSONB;
+BEGIN
+    -- 1. Avg Attendance
+    SELECT COALESCE(AVG(CASE WHEN status IN ('present', 'late', 'half_day') THEN 100.0 ELSE 0 END), 0)
+    INTO v_avg_attendance
+    FROM daily_attendance
+    WHERE attendance_date BETWEEN p_from_date AND p_to_date;
+
+    -- 2. Chronic Absentees (Students with < 75% attendance in period)
+    SELECT COUNT(*) INTO v_chronic_absentees
+    FROM (
+        SELECT student_enrollment_id
+        FROM daily_attendance
+        WHERE attendance_date BETWEEN p_from_date AND p_to_date
+        GROUP BY student_enrollment_id
+        HAVING AVG(CASE WHEN status IN ('present', 'late', 'half_day') THEN 100.0 ELSE 0 END) < 75
+    ) sub;
+
+    -- 3. Trend Data
+    SELECT jsonb_agg(dataset) INTO v_trend_data
+    FROM (
+        SELECT 
+            TO_CHAR(attendance_date, 'DD Mon') as label,
+            ROUND(AVG(CASE WHEN status IN ('present', 'late', 'half_day') THEN 100.0 ELSE 0 END), 1) as value
+        FROM daily_attendance
+        WHERE attendance_date BETWEEN p_from_date AND p_to_date
+        GROUP BY attendance_date
+        ORDER BY attendance_date
+    ) dataset;
+
+    RETURN jsonb_build_object(
+        'avg_attendance', ROUND(v_avg_attendance, 1),
+        'chronic_absentees', v_chronic_absentees,
+        'trend', COALESCE(v_trend_data, '[]'::jsonb)
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_dashboard_insights()
+RETURNS TABLE (
+    type TEXT,
+    message TEXT,
+    severity TEXT
+)
+SET search_path = public
+AS $$
+BEGIN
+    -- Insight 1: Low Attendance Alert (Last 7 Days)
+    RETURN QUERY
+    SELECT 
+        'ATTENDANCE_DROP'::TEXT,
+        format('Class %s attendance dropped to %s%% yesterday.', c.name, ROUND(AVG(CASE WHEN da.status IN ('present','late') THEN 100.0 ELSE 0 END), 0)),
+        'high'::TEXT
+    FROM daily_attendance da
+    JOIN student_enrollments se ON da.student_enrollment_id = se.id
+    JOIN class_sections cs ON se.class_section_id = cs.id
+    JOIN classes c ON cs.class_id = c.id
+    WHERE da.attendance_date = CURRENT_DATE - 1
+    GROUP BY c.name
+    HAVING AVG(CASE WHEN da.status IN ('present','late') THEN 100.0 ELSE 0 END) < 75;
+
+    -- Insight 2: Collection Spike
+    RETURN QUERY
+    SELECT 
+        'COLLECTION_SPIKE'::TEXT,
+        format('High collections detected on %s (₹%s)', TO_CHAR(paid_at, 'DD Mon'), SUM(amount)),
+        'info'::TEXT
+    FROM fee_transactions
+    WHERE paid_at >= CURRENT_DATE - 7
+    GROUP BY paid_at::DATE, paid_at
+    HAVING SUM(amount) > (SELECT AVG(amt) * 1.5 FROM (SELECT SUM(amount) as amt FROM fee_transactions WHERE paid_at >= CURRENT_DATE - 30 GROUP BY paid_at::DATE) sub);
+
+    -- Insight 3: Pending Dues Warning
+    IF EXISTS (
+        SELECT 1 
+        FROM student_fees sf
+        WHERE (sf.amount_due - sf.discount - sf.amount_paid) > 50000
+          AND sf.status != 'waived'
+    ) THEN
+        RETURN QUERY SELECT 'HIGH_DUES'::TEXT, 'Multiple students have outstanding dues > ₹50k', 'medium'::TEXT;
+    END IF;
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- 19. SALARY DEDUCTION LOGIC
+-- ============================================================
+-- SALARY DEDUCTION LOGIC SCHEMA (Added 2026-02-08)
+-- ============================================================
+
+-- 1. Create Staff Attendance Table
+CREATE TABLE IF NOT EXISTS staff_attendance (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    staff_id UUID NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+    attendance_date DATE NOT NULL,
+    status attendance_status_enum NOT NULL, -- reusing present, absent, late, half_day
+    marked_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    marked_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    UNIQUE(staff_id, attendance_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_staff_attendance_date ON staff_attendance(attendance_date);
+CREATE INDEX IF NOT EXISTS idx_staff_attendance_staff ON staff_attendance(staff_id);
+
+-- RLS for Staff Attendance
+ALTER TABLE staff_attendance ENABLE ROW LEVEL SECURITY;
+
+-- 2. Recalculate Payroll Function
+CREATE OR REPLACE FUNCTION recalculate_staff_payroll(
+    p_staff_id UUID, 
+    p_month INTEGER, 
+    p_year INTEGER
+)
+RETURNS VOID AS $$
+DECLARE
+    v_base_salary DECIMAL(12,2);
+    v_per_day_salary DECIMAL(12,2);
+    v_absent_days INTEGER := 0;
+    v_rejected_leave_days INTEGER := 0;
+    v_total_deduction_days INTEGER := 0;
+    v_deduction_amount DECIMAL(12,2);
+    v_start_date DATE;
+    v_end_date DATE;
+BEGIN
+    -- Get Base Salary
+    SELECT salary INTO v_base_salary FROM staff WHERE id = p_staff_id;
+    
+    IF v_base_salary IS NULL THEN 
+        v_base_salary := 0; 
+    END IF;
+
+    -- Calculate Per Day Salary (Fixed 30 days as per requirement)
+    v_per_day_salary := v_base_salary / 30.0;
+
+    -- Determine Month Start and End Date
+    v_start_date := make_date(p_year, p_month, 1);
+    v_end_date := (v_start_date + interval '1 month' - interval '1 day')::DATE;
+
+    -- Count Deductible Days (Union of Absent AND Rejected Leaves to avoid double counting)
+    -- Logic: Find all unique dates in this month for this staff that are either Absent OR Rejected Leave
+    
+    WITH deductible_dates AS (
+        -- 1. Dates marked as Absent
+        SELECT attendance_date AS d_date
+        FROM staff_attendance
+        WHERE staff_id = p_staff_id
+          AND attendance_date BETWEEN v_start_date AND v_end_date
+          AND status = 'absent'
+          AND deleted_at IS NULL
+        
+        UNION
+        
+        -- 2. Dates covered by Rejected Leaves
+        SELECT generate_series(
+            GREATEST(start_date, v_start_date), 
+            LEAST(end_date, v_end_date), 
+            interval '1 day'
+        )::DATE AS d_date
+        FROM leave_applications
+        WHERE applicant_id = (SELECT id FROM users WHERE person_id = (SELECT person_id FROM staff WHERE id = p_staff_id))
+          AND status = 'rejected'
+          AND leave_type != 'unpaid' -- Assuming 'unpaid' might be handled differently, but req says "leave requests that are rejected"
+          -- Note: If leave handling logic needs to change (e.g. 'unpaid' approved leave also deducts), modify here.
+          -- For now, strictly following: "salary deductions must apply for: days marked absent, leave requests that are rejected"
+          AND end_date >= v_start_date
+          AND start_date <= v_end_date
+    )
+    SELECT COUNT(DISTINCT d_date) INTO v_total_deduction_days FROM deductible_dates;
+
+    -- Calculate Deduction Amount
+    v_deduction_amount := v_total_deduction_days * v_per_day_salary;
+
+    -- Ensure Payroll Record Exists (Upsert)
+    INSERT INTO staff_payroll (staff_id, payroll_month, payroll_year, base_salary, deductions, net_salary, status)
+    VALUES (
+        p_staff_id, 
+        p_month, 
+        p_year, 
+        v_base_salary, 
+        v_deduction_amount, 
+        GREATEST(0, v_base_salary - v_deduction_amount), -- Prevent negative salary
+        'pending'
+    )
+    ON CONFLICT (staff_id, payroll_month, payroll_year) 
+    DO UPDATE SET 
+        base_salary = EXCLUDED.base_salary,
+        deductions = EXCLUDED.deductions,
+        net_salary = EXCLUDED.net_salary,
+        updated_at = now();
+        
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+-- 3. Triggers
+
+-- Trigger 1: On Staff Attendance Change
+CREATE OR REPLACE FUNCTION trg_recalc_payroll_on_attendance()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_staff_id UUID;
+    v_date DATE;
+BEGIN
+    IF (TG_OP = 'DELETE') THEN
+        v_staff_id := OLD.staff_id;
+        v_date := OLD.attendance_date;
+    ELSE
+        v_staff_id := NEW.staff_id;
+        v_date := NEW.attendance_date;
+    END IF;
+
+    -- Recalculate for the month of the attendance
+    PERFORM recalculate_staff_payroll(
+        v_staff_id, 
+        EXTRACT(MONTH FROM v_date)::INT, 
+        EXTRACT(YEAR FROM v_date)::INT
+    );
+    
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_staff_attendance_payroll ON staff_attendance;
+CREATE TRIGGER trg_staff_attendance_payroll
+AFTER INSERT OR UPDATE OR DELETE ON staff_attendance
+FOR EACH ROW EXECUTE FUNCTION trg_recalc_payroll_on_attendance();
+
+
+-- Trigger 2: On Leave Status Change (Rejected)
+CREATE OR REPLACE FUNCTION trg_recalc_payroll_on_leave()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_staff_id UUID;
+    v_start DATE;
+    v_end DATE;
+    v_d DATE;
+BEGIN
+    -- Only verify if status changed to/from 'rejected' or dates changed
+    IF (TG_OP = 'UPDATE' AND (OLD.status IS DISTINCT FROM NEW.status OR OLD.start_date IS DISTINCT FROM NEW.start_date OR OLD.end_date IS DISTINCT FROM NEW.end_date)) 
+       OR (TG_OP = 'INSERT') THEN
+       
+       -- Resolve Staff ID from User ID (Applicant)
+       SELECT id INTO v_staff_id FROM staff WHERE person_id = (SELECT person_id FROM users WHERE id = NEW.applicant_id);
+       
+       IF v_staff_id IS NOT NULL THEN
+           -- We need to recalculate for every month covered by the leave
+           -- Iterate through months
+           v_start := DATE_TRUNC('month', NEW.start_date);
+           v_end := DATE_TRUNC('month', NEW.end_date);
+           
+           v_d := v_start;
+           WHILE v_d <= v_end LOOP
+               PERFORM recalculate_staff_payroll(
+                   v_staff_id, 
+                   EXTRACT(MONTH FROM v_d)::INT, 
+                   EXTRACT(YEAR FROM v_d)::INT
+               );
+               v_d := v_d + interval '1 month';
+           END LOOP;
+       END IF;
+    END IF;
+    
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_leave_payroll ON leave_applications;
+CREATE TRIGGER trg_leave_payroll
+AFTER INSERT OR UPDATE ON leave_applications
+FOR EACH ROW EXECUTE FUNCTION trg_recalc_payroll_on_leave();
+
+-- 20. NOTIFICATION BATCHES
+-- Part 1: Fee Reminder Batch System Schema
+CREATE TABLE IF NOT EXISTS notification_batches (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    admin_id UUID REFERENCES users(id),
+    type TEXT NOT NULL CHECK (type IN ('FEES', 'GENERAL', 'EXAM', 'EMERGENCY')), -- Extendable
+    filters JSONB DEFAULT '{}',
+    status TEXT CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'aborted')) DEFAULT 'pending',
+    total_targets INTEGER DEFAULT 0,
+    sent_count INTEGER DEFAULT 0,
+    failure_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+-- Index for rate limiting (finding last batch by type/created_at)
+CREATE INDEX IF NOT EXISTS idx_notification_batches_type_created ON notification_batches(type, created_at);
+
+-- 21. NOTIFICATION HARDENING
+-- Part 1: Delivery Observability
+CREATE TABLE IF NOT EXISTS notification_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    role TEXT,
+    notification_type TEXT NOT NULL,
+    channel_id TEXT,
+    push_provider TEXT DEFAULT 'fcm',
+    provider_response JSONB,
+    status TEXT CHECK (status IN ('success', 'failed', 'partial')),
+    error_message TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+-- Part 3: Rate Limiting (Optional: can use Redis, but DB is fine for this scale)
+-- We will query notification_logs for rate limiting, so we need good indexes.
+CREATE INDEX IF NOT EXISTS idx_notification_logs_user_type_date ON notification_logs(user_id, notification_type, created_at);
+
+-- Part 6: Incident Kill Switch
+CREATE TABLE IF NOT EXISTS notification_config (
+    key TEXT PRIMARY KEY,
+    value JSONB,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+-- Seed default config if not exists
+INSERT INTO notification_config (key, value)
+VALUES 
+    ('kill_switch', '{"global": false, "types": {}}')
+ON CONFLICT (key) DO NOTHING;
+
+-- Trigger to propagate fee structure changes to student fees
+
+
+
+-- 1. Propagate changes from Fee Structure amount to ongoing student fees
+CREATE OR REPLACE FUNCTION propagate_fee_structure_updates()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.amount IS DISTINCT FROM OLD.amount THEN
+        UPDATE student_fees
+        SET 
+            amount_due = NEW.amount,
+            updated_at = now(),
+            status = CASE 
+                WHEN amount_paid >= (NEW.amount - discount) THEN 'paid'::fee_status_enum
+                WHEN amount_paid > 0 THEN 'partial'::fee_status_enum
+                WHEN due_date < CURRENT_DATE THEN 'overdue'::fee_status_enum
+                ELSE 'pending'::fee_status_enum
+            END
+        WHERE fee_structure_id = NEW.id
+          AND status IN ('pending', 'partial', 'overdue');
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_propagate_fee_updates ON fee_structures;
+CREATE TRIGGER trg_propagate_fee_updates
+AFTER UPDATE ON fee_structures
+FOR EACH ROW EXECUTE FUNCTION propagate_fee_structure_updates();
+
+-- 2. Auto-assign fees when a new Fee Structure is created for a class
+CREATE OR REPLACE FUNCTION auto_assign_fees_on_structure_creation()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO student_fees (student_id, fee_structure_id, amount_due, amount_paid, status, due_date)
+    SELECT 
+        se.student_id,
+        NEW.id,
+        NEW.amount,
+        0,
+        'pending',
+        NEW.due_date
+    FROM student_enrollments se
+    JOIN class_sections cs ON se.class_section_id = cs.id
+    WHERE cs.class_id = NEW.class_id
+      AND se.academic_year_id = NEW.academic_year_id
+      AND se.status = 'active'
+      AND NOT EXISTS (
+          SELECT 1 FROM student_fees sf 
+          WHERE sf.student_id = se.student_id 
+            AND sf.fee_structure_id = NEW.id
+      );
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_auto_assign_fees_structure ON fee_structures;
+CREATE TRIGGER trg_auto_assign_fees_structure
+AFTER INSERT ON fee_structures
+FOR EACH ROW EXECUTE FUNCTION auto_assign_fees_on_structure_creation();
+
+-- 3. Auto-assign fees when a Student is enrolled into a class
+CREATE OR REPLACE FUNCTION auto_assign_fees_on_enrollment()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_class_id UUID;
+BEGIN
+    IF NEW.status = 'active' AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM 'active') THEN
+        SELECT class_id INTO v_class_id FROM class_sections WHERE id = NEW.class_section_id;
+
+        INSERT INTO student_fees (student_id, fee_structure_id, amount_due, amount_paid, status, due_date)
+        SELECT 
+            NEW.student_id,
+            fs.id,
+            fs.amount,
+            0,
+            'pending',
+            fs.due_date
+        FROM fee_structures fs
+        WHERE fs.class_id = v_class_id
+          AND fs.academic_year_id = NEW.academic_year_id
+          AND NOT EXISTS (
+              SELECT 1 FROM student_fees sf 
+              WHERE sf.student_id = NEW.student_id 
+                AND sf.fee_structure_id = fs.id
+          );
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_auto_assign_fees_enrollment ON student_enrollments;
+CREATE TRIGGER trg_auto_assign_fees_enrollment
+AFTER INSERT OR UPDATE ON student_enrollments
+FOR EACH ROW EXECUTE FUNCTION auto_assign_fees_on_enrollment();
+
+-- ============================================================
+-- ADDITIONAL CONSTRAINTS & INDEXES
+-- ============================================================
+
+-- Prevent double fee assignment for the same structure to the same student
+CREATE UNIQUE INDEX IF NOT EXISTS idx_student_fees_unique_assignment 
+ON student_fees(student_id, fee_structure_id);
+
+-- Prevent accidental double entry of transaction references (checks, UPI IDs, etc)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_transactions_unique_ref 
+ON fee_transactions(transaction_ref) 
+WHERE transaction_ref IS NOT NULL AND transaction_ref <> '';
+
+-- SECTION 13: AUDIT & PERFORMANCE
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id),
+    action TEXT NOT NULL,
+    entity TEXT,
+    entity_id TEXT,
+    details JSONB,
+    ip_address TEXT,
+    user_agent TEXT,
+    request_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user_date ON audit_logs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_request_id ON audit_logs(request_id);
+
+-- Performance Indexes for Foreign Keys
+CREATE INDEX IF NOT EXISTS idx_person_contacts_person_id ON person_contacts(person_id);
+CREATE INDEX IF NOT EXISTS idx_student_fees_structure_id ON student_fees(fee_structure_id);
+CREATE INDEX IF NOT EXISTS idx_fee_transactions_student_fee_id ON fee_transactions(student_fee_id);
+CREATE INDEX IF NOT EXISTS idx_receipt_items_receipt_id ON receipt_items(receipt_id);
+CREATE INDEX IF NOT EXISTS idx_receipt_items_transaction_id ON receipt_items(fee_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_student_enrollments_class_section ON student_enrollments(class_section_id);
+CREATE INDEX IF NOT EXISTS idx_class_subjects_subject_id ON class_subjects(subject_id);
+CREATE INDEX IF NOT EXISTS idx_exam_subjects_subject_id ON exam_subjects(subject_id);
+CREATE INDEX IF NOT EXISTS idx_exam_subjects_class_id ON exam_subjects(class_id);
+
+-- Enable RLS on all core tables (Minimal default policy: deny all unless specific policies added)
+-- Note: This is a proactive hardening step.
+ALTER TABLE persons ENABLE ROW LEVEL SECURITY;
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE students ENABLE ROW LEVEL SECURITY;
+ALTER TABLE staff ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+
+COMMIT;
 

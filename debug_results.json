@@ -1,0 +1,104 @@
+{
+  "ay": {
+    "id": "3cb48372-2f39-48ff-b54d-7827a67455a9",
+    "code": "2025-2026"
+  },
+  "diagnostics": {
+    "total_students_all": "11",
+    "total_active_students": "11",
+    "pending_enrollments_count": "0",
+    "failed_enrollments_count": "0"
+  },
+  "unenrolled_list": [],
+  "deleted_sample": [],
+  "all_students": [
+    {
+      "id": "9782a541-4071-41c1-b1ad-a639520468a5",
+      "display_name": "AutoTest_1769884143276 User",
+      "student_status": "active",
+      "total_enrollments": "1",
+      "active_enrollments_this_year": "1",
+      "latest_enrollment_status": "active"
+    },
+    {
+      "id": "c7c1cb54-17ea-4a84-9be4-fb021083fe77",
+      "display_name": "Kiran  Chinna",
+      "student_status": "active",
+      "total_enrollments": "1",
+      "active_enrollments_this_year": "1",
+      "latest_enrollment_status": "active"
+    },
+    {
+      "id": "0b3b0e29-0cba-45e1-a324-eeec1ff7eb54",
+      "display_name": "Arjun  Reddy",
+      "student_status": "active",
+      "total_enrollments": "1",
+      "active_enrollments_this_year": "1",
+      "latest_enrollment_status": "active"
+    },
+    {
+      "id": "4433faa2-ef13-4b98-a68e-78a20083b1e6",
+      "display_name": "Sai  Kiran",
+      "student_status": "active",
+      "total_enrollments": "1",
+      "active_enrollments_this_year": "1",
+      "latest_enrollment_status": "active"
+    },
+    {
+      "id": "db9c625b-7176-4886-b679-fa954d5e5bc1",
+      "display_name": "Rahul  Sharma",
+      "student_status": "active",
+      "total_enrollments": "1",
+      "active_enrollments_this_year": "1",
+      "latest_enrollment_status": "active"
+    },
+    {
+      "id": "66cb94ed-8473-49ca-8e26-cbf4a80ec439",
+      "display_name": "Ayesha  Khan",
+      "student_status": "active",
+      "total_enrollments": "1",
+      "active_enrollments_this_year": "1",
+      "latest_enrollment_status": "active"
+    },
+    {
+      "id": "858fe3ab-bab8-4cec-ac47-fb3cf659ebbf",
+      "display_name": "Sneha  Patel",
+      "student_status": "active",
+      "total_enrollments": "1",
+      "active_enrollments_this_year": "1",
+      "latest_enrollment_status": "active"
+    },
+    {
+      "id": "bd790cfe-acb3-4a8d-ae19-c15fec3bf482",
+      "display_name": "Daniel  J",
+      "student_status": "active",
+      "total_enrollments": "1",
+      "active_enrollments_this_year": "1",
+      "latest_enrollment_status": "active"
+    },
+    {
+      "id": "810d70c2-f7c0-4dba-af93-6643a727bfea",
+      "display_name": "Kiran  Goud",
+      "student_status": "active",
+      "total_enrollments": "1",
+      "active_enrollments_this_year": "1",
+      "latest_enrollment_status": "active"
+    },
+    {
+      "id": "94a6b6a3-5e64-46cd-a93a-723747f7ce88",
+      "display_name": "Salaar  Prabha",
+      "student_status": "active",
+      "total_enrollments": "1",
+      "active_enrollments_this_year": "1",
+      "latest_enrollment_status": "active"
+    },
+    {
+      "id": "5420b4ef-df1e-40df-9d03-b4334be08f7a",
+      "display_name": "Brahmi  Bhai",
+      "student_status": "active",
+      "total_enrollments": "1",
+      "active_enrollments_this_year": "1",
+      "latest_enrollment_status": "active"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 
 import express from 'express';
-import { sendAttendanceNotification } from '../services/notificationService.js';
+import { sendTemplatedNotification } from '../services/notificationService.js';
+import { NotificationTypes } from '../services/notificationTemplateService.js';
 import sql from '../db.js';
 
 const router = express.Router();
@@ -19,13 +20,10 @@ router.post('/attendance', async (req, res, next) => {
         const parents = await sql`
       SELECT 
         u.id as user_id, 
-        u.preferred_language,
-        p.first_name,
-        p.last_name
+        u.preferred_language
       FROM student_parents sp
       JOIN parents par ON sp.parent_id = par.id
       JOIN users u ON par.person_id = u.person_id
-      JOIN persons p ON par.person_id = p.id
       WHERE sp.student_id = ${student_id}
       AND u.account_status = 'active'
     `;
@@ -36,6 +34,8 @@ router.post('/attendance', async (req, res, next) => {
         }
 
         const results = [];
+        const isAbsent = status.toLowerCase() === 'absent';
+        const notificationDate = date || new Date().toISOString().split('T')[0];
 
         // 2. Send notification to each parent
         for (const parent of parents) {
@@ -47,13 +47,34 @@ router.post('/attendance', async (req, res, next) => {
             const tokens = devices.map(d => d.fcm_token);
 
             if (tokens.length > 0) {
-                const response = await sendAttendanceNotification(
-                    tokens,
-                    parent.preferred_language || 'en',
-                    student_name || 'Your Child',
-                    status
-                );
-                results.push({ parent: parent.user_id, success: true, count: response.successCount });
+                let response;
+                // Create targetUsers array mirroring the tokens array for accurate logging
+                const targetUsers = tokens.map(() => ({ id: parent.user_id, role: 'parent' }));
+
+                if (isAbsent) {
+                    response = await sendTemplatedNotification(
+                        tokens,
+                        NotificationTypes.ATTENDANCE_ABSENT,
+                        { date: notificationDate },
+                        targetUsers
+                    );
+                } else {
+                    // Fallback for Present/Late using GENERAL template if needed
+                    // Using GENERAL as per request for "no specific category applies"
+                    response = await sendTemplatedNotification(
+                        tokens,
+                        NotificationTypes.GENERAL,
+                        { message: `${student_name} is marked ${status} today.` },
+                        targetUsers
+                    );
+                }
+
+                // Check if blocked by killswitch or rate limit
+                if (response.blocked) {
+                    results.push({ parent: parent.user_id, success: false, reason: 'Blocked by policy' });
+                } else {
+                    results.push({ parent: parent.user_id, success: true, count: response.successCount });
+                }
             } else {
                 results.push({ parent: parent.user_id, success: false, reason: 'No tokens' });
             }
@@ -94,6 +115,7 @@ router.post('/unregister', async (req, res, next) => {
         const user_id = req.user?.id;
 
         if (!user_id) return res.status(401).json({ error: 'Unauthorized' });
+        if (!fcm_token) return res.status(200).json({ message: 'No token to unregister' }); // idempotent
 
         await sql`
       DELETE FROM user_devices WHERE user_id = ${user_id} AND fcm_token = ${fcm_token}

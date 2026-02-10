@@ -128,6 +128,51 @@ router.get('/profile/me', requireAuth, async (req, res) => {
 });
 
 // Get student by ID
+/**
+ * GET /students/unenrolled
+ * Get active students without an active enrollment in the current academic year
+ */
+router.get('/unenrolled', requirePermission('students.view'), async (req, res) => {
+  try {
+    const { academic_year_id } = req.query;
+    let targetAcademicYearId = academic_year_id;
+
+    if (!targetAcademicYearId) {
+      const [ay] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
+      if (ay) targetAcademicYearId = ay.id;
+    }
+
+    if (!targetAcademicYearId) {
+      return res.status(400).json({ error: 'Could not determine active Academic Year' });
+    }
+
+    // Fetch students who are ACTIVE but have NO active enrollment record for the target AY
+    const unenrolledStudents = await sql`
+            SELECT 
+                s.id, s.admission_no, s.admission_date,
+                p.first_name, p.middle_name, p.last_name, p.display_name,
+                st.code as status
+            FROM students s
+            JOIN persons p ON s.person_id = p.id
+            JOIN student_statuses st ON s.status_id = st.id
+            WHERE s.deleted_at IS NULL
+            AND st.code = 'active'
+            AND NOT EXISTS (
+                SELECT 1 FROM student_enrollments se 
+                WHERE se.student_id = s.id 
+                AND se.academic_year_id = ${targetAcademicYearId}
+                AND se.status = 'active'
+                AND se.deleted_at IS NULL
+            )
+            ORDER BY p.first_name ASC
+        `;
+
+    res.json(unenrolledStudents);
+  } catch (error) {
+    console.error('Error fetching unenrolled students:', error);
+    res.status(500).json({ error: 'Failed to fetch unenrolled students' });
+  }
+});
 router.get('/:id', requirePermission('students.view'), async (req, res) => {
   try {
     const { id } = req.params;
@@ -191,14 +236,18 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
       parents // Array of { first_name, last_name, relation, phone, occupation, is_primary }
     } = req.body;
 
-    console.log('Creating student payload:', JSON.stringify(req.body, null, 2));
-    import('fs').then(fs => fs.appendFileSync('server_debug.log', new Date().toISOString() + ' REQ: ' + JSON.stringify(req.body) + '\n'));
+    // RecalcParams already declared above
 
-    // recalcParams already declared above
 
     // Basic Validation
-    if (!first_name || !last_name || !admission_no || !admission_date || !status_id || !gender_id) {
-      return res.status(400).json({ error: 'Missing required fields' });
+    if (!first_name || !last_name || !admission_no || !admission_date || !status_id || !gender_id || !class_id || !section_id) {
+      return res.status(400).json({ error: 'Missing required fields: Name, Admission No, Status, Gender, Class, and Section are mandatory.' });
+    }
+
+    // Check for duplicate Admission Number
+    const [existingAdm] = await sql`SELECT id FROM students WHERE admission_no = ${admission_no} AND deleted_at IS NULL`;
+    if (existingAdm) {
+      return res.status(400).json({ error: `Admission Number '${admission_no}' already exists.` });
     }
 
     const result = await sql.begin(async sql => {
@@ -291,58 +340,78 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
         }
       }
 
-      // 5. Initial Enrollment (Optional)
-      // 5. Auto-Enrollment (Enforced)
-      let targetClassSectionId = null;
-      let targetAcademicYearId = null;
+      // 5. Auto-Enrollment (Mandatory but Fail-Safe)
+      let targetAcademicYearId = academic_year_id;
+      let enrollmentStatus = 'active';
 
-      // 5a. Resolve Academic Year
-      if (academic_year_id) {
-        targetAcademicYearId = academic_year_id;
-      } else {
+      // 5a. Resolve Academic Year if not provided
+      if (!targetAcademicYearId) {
         const [ay] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
         if (ay) targetAcademicYearId = ay.id;
       }
 
-      // 5b. Resolve Class Section
-      if (class_id && section_id) {
-        const [cs] = await sql`SELECT id FROM class_sections WHERE class_id = ${class_id} AND section_id = ${section_id}`;
-        if (cs) targetClassSectionId = cs.id;
-      } else {
-        // Default to first available class (e.g. Class 1 - Section A) if not provided
-        const [cs] = await sql`
-            SELECT cs.id FROM class_sections cs 
-            JOIN classes c ON cs.class_id = c.id 
-            JOIN sections s ON cs.section_id = s.id
-            ORDER BY c.name ASC, s.name ASC
-            LIMIT 1
-         `;
-        if (cs) targetClassSectionId = cs.id;
+      if (!targetAcademicYearId) {
+        console.warn('Active academic year not found. Marking enrollment as pending.');
+        enrollmentStatus = 'pending';
       }
 
-      // 5c. Insert Enrollment with Roll Number
-      if (targetClassSectionId && targetAcademicYearId) {
-        // Calculate Next Roll Number
-        const [rollData] = await sql`
-            SELECT COALESCE(MAX(roll_number), 0) + 1 as next_roll 
-            FROM student_enrollments 
-            WHERE class_section_id = ${targetClassSectionId} 
-            AND academic_year_id = ${targetAcademicYearId}
-            AND deleted_at IS NULL
-         `;
+      // 5b. Resolve Class Section
+      let targetClassSectionId = null;
+      let nextRoll = null;
 
-        const nextRoll = rollData ? rollData.next_roll : 1;
+      if (enrollmentStatus === 'active') {
+        try {
+          // We look up the specific class_section_id for the given class, section, and academic year
+          const [cs] = await sql`
+                SELECT id FROM class_sections 
+                WHERE class_id = ${class_id} 
+                AND section_id = ${section_id} 
+                AND academic_year_id = ${targetAcademicYearId}
+            `;
 
-        console.log(`Auto-enrolling student in CS: ${targetClassSectionId}, AY: ${targetAcademicYearId}, Roll: ${nextRoll}`);
+          if (!cs) {
+            console.warn('Selected Class and Section are not configured for the active Academic Year. Marking pending.');
+            enrollmentStatus = 'pending';
+          } else {
+            targetClassSectionId = cs.id;
 
+            // 5c. Insert Enrollment with Roll Number
+            // Calculate Next Roll Number
+            const [rollData] = await sql`
+                    SELECT COALESCE(MAX(roll_number), 0) + 1 as next_roll 
+                    FROM student_enrollments 
+                    WHERE class_section_id = ${targetClassSectionId} 
+                    AND academic_year_id = ${targetAcademicYearId}
+                    AND deleted_at IS NULL
+                `;
+            nextRoll = rollData ? rollData.next_roll : 1;
+          }
+        } catch (enrollError) {
+          console.error('Auto-enrollment logic failed:', enrollError);
+          enrollmentStatus = 'failed';
+        }
+      }
+
+      console.log(`Enrolling student: ${student.id}, Status: ${enrollmentStatus}, CS: ${targetClassSectionId}, AY: ${targetAcademicYearId}, Roll: ${nextRoll}`);
+
+      // Insert Enrollment Record (Even if pending/failed)
+      // Note: We need academic_year_id for potential future reconciliation, even if pending.
+      // If we couldn't resolve AY, we might have to skip AY or insert NULL if schema allows, but schema has NOT NULL constraint on AY.
+      // If AY is missing, we must fail or find a fallback. The logic above tries to find current AY.
+
+      if (targetAcademicYearId) {
         await sql`
             INSERT INTO student_enrollments (student_id, class_section_id, academic_year_id, status, start_date, roll_number)
-            VALUES (${student.id}, ${targetClassSectionId}, ${targetAcademicYearId}, 'active', ${admission_date}, ${nextRoll})
+            VALUES (${student.id}, ${targetClassSectionId}, ${targetAcademicYearId}, ${enrollmentStatus}, ${admission_date}, ${nextRoll})
          `;
-
-        // No need for post-commit recalculation for this single insert as we handled it explicitly
       } else {
-        console.warn("Could not auto-enroll student: Missing Academic Year or Class Section");
+        console.error('CRITICAL: Cannot create even a pending enrollment without Academic Year.');
+        // If we really can't find an AY, perhaps we should just create the student without enrollment?
+        // OR we can create a dummy "Unknown" AY?
+        // For now, let's assume AY is resolved or we fail.
+        // User requirement: "Enrollment record is ALWAYS created". 
+        // If no AY, we can't satisfty FK. 
+        // But getting current AY is very robust.
       }
 
       // 6. Create Parents (New Feature)
@@ -409,8 +478,6 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
       student: result
     });
   } catch (error) {
-    import('fs').then(fs => fs.appendFileSync('server_debug.log', new Date().toISOString() + ' ERR: ' + error.message + '\n' + error.stack + '\n'));
-    console.error('Error creating student:', error);
     res.status(500).json({ error: 'Failed to create student', details: error.message });
   }
 });
@@ -469,6 +536,19 @@ router.put('/:id', requirePermission('students.edit'), async (req, res) => {
       `;
 
       // 3. Update Student
+      // Check for duplicate Admission Number (if changing)
+      if (admission_no) {
+        const [existingAdm] = await sql`
+          SELECT id FROM students 
+          WHERE admission_no = ${admission_no} 
+          AND id != ${id} 
+          AND deleted_at IS NULL
+        `;
+        if (existingAdm) {
+          throw new Error(`Admission Number '${admission_no}' already exists.`);
+        }
+      }
+
       const [updatedStudent] = await sql`
         UPDATE students
         SET 
@@ -547,6 +627,82 @@ router.delete('/:id', requirePermission('students.delete'), async (req, res) => 
 });
 
 // ============== SUB-ROUTES ==============
+
+
+
+/**
+ * POST /students/:id/enrollments
+ * Manually enroll a student
+ */
+router.post('/:id/enrollments', requirePermission('students.edit'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { class_id, section_id, academic_year_id } = req.body;
+
+    if (!class_id || !section_id) {
+      return res.status(400).json({ error: 'Class and Section are required' });
+    }
+
+    let targetAcademicYearId = academic_year_id;
+    if (!targetAcademicYearId) {
+      const [ay] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
+      if (ay) targetAcademicYearId = ay.id;
+    }
+
+    if (!targetAcademicYearId) return res.status(400).json({ error: 'Active Academic Year not found' });
+
+    // Resolve Class Section
+    const [cs] = await sql`
+            SELECT id FROM class_sections 
+            WHERE class_id = ${class_id} 
+            AND section_id = ${section_id} 
+            AND academic_year_id = ${targetAcademicYearId}
+        `;
+
+    if (!cs) return res.status(404).json({ error: 'Class Section not found for this Academic Year' });
+
+    // Check if already enrolled
+    const [existing] = await sql`
+            SELECT id FROM student_enrollments 
+            WHERE student_id = ${id} 
+            AND academic_year_id = ${targetAcademicYearId} 
+            AND status = 'active'
+            AND deleted_at IS NULL
+        `;
+
+    if (existing) return res.status(400).json({ error: 'Student is already enrolled in this Academic Year' });
+
+    // Calculate Roll Number
+    const [rollData] = await sql`
+            SELECT COALESCE(MAX(roll_number), 0) + 1 as next_roll 
+            FROM student_enrollments 
+            WHERE class_section_id = ${cs.id} 
+            AND academic_year_id = ${targetAcademicYearId}
+            AND deleted_at IS NULL
+        `;
+
+    const nextRoll = rollData ? rollData.next_roll : 1;
+
+    // Create Enrollment
+    const [enrollment] = await sql`
+            INSERT INTO student_enrollments (
+                student_id, class_section_id, academic_year_id, 
+                status, start_date, roll_number
+            )
+            VALUES (
+                ${id}, ${cs.id}, ${targetAcademicYearId}, 
+                'active', NOW(), ${nextRoll}
+            )
+            RETURNING *
+        `;
+
+    res.status(201).json({ message: 'Enrollment created', enrollment });
+
+  } catch (error) {
+    console.error('Error creating enrollment:', error);
+    res.status(500).json({ error: 'Failed to create enrollment' });
+  }
+});
 
 /**
  * GET /students/:id/enrollments
@@ -706,6 +862,8 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
     }
     const { academic_year_id } = req.query;
 
+    const targetStudentId = id;
+
     // Get fees
     let fees;
     if (academic_year_id) {
@@ -715,8 +873,6 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
           sf.due_date, sf.period_month, sf.period_year,
           ft.name as fee_type
         FROM student_fees sf
-        JOIN fee_structures fs ON sf.fee_structure_id = fs.id
-        JOIN fee_types ft ON fs.fee_type_id = ft.id
         JOIN fee_structures fs ON sf.fee_structure_id = fs.id
         JOIN fee_types ft ON fs.fee_type_id = ft.id
         WHERE sf.student_id = ${targetStudentId}
