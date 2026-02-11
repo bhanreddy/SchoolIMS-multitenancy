@@ -164,8 +164,14 @@ app.use((req, res) => {
 // Global Error Handler
 app.use(errorHandler);
 
-app.listen(port, () => {
+app.listen(port, async () => {
   console.log(`🚀 Server listening on port ${port}`);
   console.log(`📚 API Docs: http://localhost:${port}/`);
-});// Restart trigger
-// Restart debug
+
+  try {
+    await sql`SELECT 1`;
+    console.log('✅ Database connection successful');
+  } catch (error) {
+    console.error('❌ Database connection failed at startup:', error);
+  }
+});
