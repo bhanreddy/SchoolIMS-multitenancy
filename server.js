@@ -14,6 +14,7 @@ const app = express();
 const port = config.port;
 
 // Security Middleware
+app.set('trust proxy', 1); // Trust first proxy (Render/Heroku/etc)
 app.use(helmet());
 
 // Rate Limiting

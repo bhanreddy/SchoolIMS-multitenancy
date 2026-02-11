@@ -3191,5 +3191,29 @@ ALTER TABLE students ENABLE ROW LEVEL SECURITY;
 ALTER TABLE staff ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 
+-- SECTION 14: NOTIFICATIONS & DEVICES
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS user_devices (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    fcm_token TEXT NOT NULL,
+    platform TEXT CHECK (platform IN ('android', 'ios')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    last_used_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    UNIQUE(user_id, fcm_token)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_devices_token ON user_devices(fcm_token);
+
+ALTER TABLE user_devices ENABLE ROW LEVEL SECURITY;
+
+-- Allow users to manage their own devices
+DROP POLICY IF EXISTS "Users can manage own devices" ON user_devices;
+CREATE POLICY "Users can manage own devices" ON user_devices
+FOR ALL
+USING (user_id = auth.uid());
+
 COMMIT;
 
