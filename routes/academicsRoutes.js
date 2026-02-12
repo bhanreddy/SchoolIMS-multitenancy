@@ -229,11 +229,14 @@ router.get('/class-sections', requirePermission('academics.view'), asyncHandler(
     classSections = await sql`
       SELECT cs.id, c.name as class_name, c.id as class_id, 
              s.name as section_name, s.id as section_id,
-             ay.code as academic_year, ay.id as academic_year_id
+             ay.code as academic_year, ay.id as academic_year_id,
+             cs.class_teacher_id, p_teacher.display_name as class_teacher_name
       FROM class_sections cs
       JOIN classes c ON cs.class_id = c.id
       JOIN sections s ON cs.section_id = s.id
       JOIN academic_years ay ON cs.academic_year_id = ay.id
+      LEFT JOIN staff st ON cs.class_teacher_id = st.id
+      LEFT JOIN persons p_teacher ON st.person_id = p_teacher.id
       WHERE cs.academic_year_id = ${academic_year_id}
       ORDER BY c.name, s.name
     `;
@@ -241,11 +244,14 @@ router.get('/class-sections', requirePermission('academics.view'), asyncHandler(
     classSections = await sql`
       SELECT cs.id, c.name as class_name, c.id as class_id, 
              s.name as section_name, s.id as section_id,
-             ay.code as academic_year, ay.id as academic_year_id
+             ay.code as academic_year, ay.id as academic_year_id,
+             cs.class_teacher_id, p_teacher.display_name as class_teacher_name
       FROM class_sections cs
       JOIN classes c ON cs.class_id = c.id
       JOIN sections s ON cs.section_id = s.id
       JOIN academic_years ay ON cs.academic_year_id = ay.id
+      LEFT JOIN staff st ON cs.class_teacher_id = st.id
+      LEFT JOIN persons p_teacher ON st.person_id = p_teacher.id
       ORDER BY ay.start_date DESC, c.name, s.name
     `;
   }
@@ -258,15 +264,15 @@ router.get('/class-sections', requirePermission('academics.view'), asyncHandler(
  * Create a class-section mapping for an academic year
  */
 router.post('/class-sections', requirePermission('academics.manage'), asyncHandler(async (req, res) => {
-  const { class_id, section_id, academic_year_id } = req.body;
+  const { class_id, section_id, academic_year_id, class_teacher_id } = req.body;
 
   if (!class_id || !section_id || !academic_year_id) {
     return res.status(400).json({ error: 'class_id, section_id, and academic_year_id are required' });
   }
 
   const [newMapping] = await sql`
-    INSERT INTO class_sections (class_id, section_id, academic_year_id)
-    VALUES (${class_id}, ${section_id}, ${academic_year_id})
+    INSERT INTO class_sections (class_id, section_id, academic_year_id, class_teacher_id)
+    VALUES (${class_id}, ${section_id}, ${academic_year_id}, ${class_teacher_id || null})
     RETURNING *
   `;
 

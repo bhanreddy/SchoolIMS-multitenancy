@@ -31,6 +31,7 @@ export const identifyUser = async (req, res, next) => {
         SELECT 
             u.id, 
             u.account_status,
+            u.person_id,
             array_agg(DISTINCT r.code) as roles,
             array_agg(DISTINCT p.code) as permissions
         FROM users u
@@ -39,7 +40,7 @@ export const identifyUser = async (req, res, next) => {
         LEFT JOIN role_permissions rp ON r.id = rp.role_id
         LEFT JOIN permissions p ON rp.permission_id = p.id
         WHERE u.id = ${user.id}
-        GROUP BY u.id
+        GROUP BY u.id, u.person_id
     `;
 
         if (userInfo.length === 0) {
@@ -62,7 +63,8 @@ export const identifyUser = async (req, res, next) => {
             ...user,
             roles: dbUser.roles || [],
             permissions: dbUser.permissions || [],
-            internal_id: dbUser.id
+            internal_id: dbUser.id,
+            person_id: dbUser.person_id
         };
 
         next();

@@ -7,7 +7,7 @@ const router = express.Router();
 // Get all students
 router.get('/', requirePermission('students.view'), async (req, res) => {
   try {
-    const { search, limit } = req.query;
+    const { search, limit, class_section_id } = req.query;
 
     let query = sql`
       SELECT 
@@ -17,9 +17,20 @@ router.get('/', requirePermission('students.view'), async (req, res) => {
         (SELECT contact_value FROM person_contacts pc WHERE pc.person_id = p.id AND pc.contact_type = 'email' AND pc.is_primary = true LIMIT 1) as email,
         (SELECT contact_value FROM person_contacts pc WHERE pc.person_id = p.id AND pc.contact_type = 'phone' AND pc.is_primary = true LIMIT 1) as phone,
         json_build_object(
+            'id', p.id,
+            'first_name', p.first_name,
+            'middle_name', p.middle_name,
+            'last_name', p.last_name,
+            'display_name', p.display_name,
+            'dob', p.dob,
+            'gender_id', p.gender_id,
+            'photo_url', p.photo_url
+        ) as person,
+        json_build_object(
             'roll_number', se.roll_number,
             'class_code', c.code,
-            'section_name', sec.name
+            'section_name', sec.name,
+            'id', se.id -- Useful for enrollment mapping
         ) as current_enrollment
       FROM students s
       JOIN persons p ON s.person_id = p.id
@@ -30,6 +41,10 @@ router.get('/', requirePermission('students.view'), async (req, res) => {
       LEFT JOIN sections sec ON cs.section_id = sec.id
       WHERE s.deleted_at IS NULL
     `;
+
+    if (class_section_id) {
+      query = sql`${query} AND se.class_section_id = ${class_section_id}`;
+    }
 
     if (search) {
       query = sql`${query} AND (
@@ -43,7 +58,13 @@ router.get('/', requirePermission('students.view'), async (req, res) => {
     }
 
     const students = await query;
-    res.json(students);
+    res.json({
+      data: students,
+      meta: {
+        total: students.length,
+        limit: limit ? parseInt(limit) : students.length
+      }
+    });
   } catch (error) {
     console.error('Error fetching students:', error);
     res.status(500).json({ error: 'Failed to fetch students', details: error.message });
@@ -74,6 +95,16 @@ router.get('/profile/me', requireAuth, async (req, res) => {
         (SELECT contact_value FROM person_contacts pc WHERE pc.person_id = p.id AND pc.contact_type = 'email' AND pc.is_primary = true LIMIT 1) as email,
         -- Fetch Primary Phone
         (SELECT contact_value FROM person_contacts pc WHERE pc.person_id = p.id AND pc.contact_type = 'phone' AND pc.is_primary = true LIMIT 1) as phone,
+        json_build_object(
+            'id', p.id,
+            'first_name', p.first_name,
+            'middle_name', p.middle_name,
+            'last_name', p.last_name,
+            'display_name', p.display_name,
+            'dob', p.dob,
+            'gender_id', p.gender_id,
+            'photo_url', p.photo_url
+        ) as person,
         -- Current Enrollment
         (
             SELECT json_build_object(
@@ -85,7 +116,13 @@ router.get('/profile/me', requireAuth, async (req, res) => {
                 'section_id', sec.id,
                 'class_section_id', cs.id,
                 'academic_year', ay.code,
-                'academic_year_id', ay.id
+                'academic_year_id', ay.id,
+                'class_teacher', (
+                    SELECT p_t.display_name 
+                    FROM staff st_t
+                    JOIN persons p_t ON st_t.person_id = p_t.id
+                    WHERE st_t.id = cs.class_teacher_id
+                )
             )
             FROM student_enrollments se
             JOIN class_sections cs ON se.class_section_id = cs.id

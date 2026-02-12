@@ -115,6 +115,27 @@ router.post('/courses', requirePermission('lms.create'), asyncHandler(async (req
     WHERE u.id = ${req.user?.internal_id}
   `;
 
+  if (!staff) return res.status(403).json({ error: 'User is not a staff member' });
+
+  // Authorization: Verify Teacher is assigned to this Subject in this Class (any section)
+  // unless Admin
+  const isAdmin = req.user?.roles.includes('admin');
+  if (!isAdmin) {
+    const [assignment] = await sql`
+        SELECT 1 
+        FROM class_subjects cs
+        JOIN class_sections sec ON cs.class_section_id = sec.id
+        WHERE sec.class_id = ${class_id}
+          AND cs.subject_id = ${subject_id}
+          AND cs.teacher_id = ${staff.id}
+        LIMIT 1
+      `;
+
+    if (!assignment) {
+      return res.status(403).json({ error: 'You are not assigned to teach this subject in this class' });
+    }
+  }
+
   const [course] = await sql`
     INSERT INTO lms_courses (title, description, subject_id, class_id, instructor_id, is_published)
     VALUES (${title}, ${description}, ${subject_id}, ${class_id}, ${staff?.id}, ${is_published || false})
@@ -132,6 +153,17 @@ router.put('/:id', requirePermission('lms.create'), asyncHandler(async (req, res
   const { id } = req.params;
   const { title, description, subject_id, class_id, is_published } = req.body;
 
+  const [course] = await sql`SELECT instructor_id FROM lms_courses WHERE id = ${id}`;
+  if (!course) return res.status(404).json({ error: 'Course not found' });
+
+  // Authorization: Owner or Admin
+  const isAdmin = req.user?.roles.includes('admin');
+  const isOwner = course.instructor_id === (await getStaffId(req.user.internal_id));
+
+  if (!isAdmin && !isOwner) {
+    return res.status(403).json({ error: 'Only the instructor or admin can edit this course' });
+  }
+
   const [updated] = await sql`
     UPDATE lms_courses
     SET 
@@ -139,7 +171,8 @@ router.put('/:id', requirePermission('lms.create'), asyncHandler(async (req, res
       description = COALESCE(${description}, description),
       subject_id = COALESCE(${subject_id}, subject_id),
       class_id = COALESCE(${class_id}, class_id),
-      is_published = COALESCE(${is_published}, is_published)
+      is_published = COALESCE(${is_published}, is_published),
+      updated_at = NOW()
     WHERE id = ${id}
     RETURNING *
   `;
@@ -170,9 +203,19 @@ router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHand
     return res.status(400).json({ error: `material_type must be one of: ${validTypes.join(', ')}` });
   }
 
+  /*
+   * Handle optional parameters to prevent UNDEFINED_VALUE errors
+   * The postgres driver throws if direct parameters are undefined.
+   */
+  const safeTitle = title || '';
+  const safeDescription = description || '';
+  const safeContentUrl = content_url || '';
+  const safeFileSize = file_size ?? null; // Default to null if undefined
+  const safeDuration = duration ?? null;   // Default to null if undefined
+
   const [material] = await sql`
     INSERT INTO lms_materials (course_id, title, description, material_type, content_url, file_size, duration, sort_order)
-    VALUES (${id}, ${title}, ${description}, ${material_type}, ${content_url}, ${file_size}, ${duration}, ${sort_order || 0})
+    VALUES (${id}, ${safeTitle}, ${safeDescription}, ${material_type}, ${safeContentUrl}, ${safeFileSize}, ${safeDuration}, ${sort_order || 0})
     RETURNING *
   `;
 
@@ -186,6 +229,23 @@ router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHand
 router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { title, description, content_url, file_size, duration, sort_order, is_published } = req.body;
+
+  // Authorization: Check Course Owner
+  const [material] = await sql`
+    SELECT c.instructor_id 
+    FROM lms_materials m
+    JOIN lms_courses c ON m.course_id = c.id
+    WHERE m.id = ${id}
+  `;
+
+  if (!material) return res.status(404).json({ error: 'Material not found' });
+
+  const isAdmin = req.user?.roles.includes('admin');
+  const isOwner = material.instructor_id === (await getStaffId(req.user.internal_id));
+
+  if (!isAdmin && !isOwner) {
+    return res.status(403).json({ error: 'Only the course instructor or admin can edit this material' });
+  }
 
   const [updated] = await sql`
     UPDATE lms_materials
@@ -201,10 +261,6 @@ router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async
     RETURNING *
   `;
 
-  if (!updated) {
-    return res.status(404).json({ error: 'Material not found' });
-  }
-
   res.json({ message: 'Material updated', material: updated });
 }));
 
@@ -215,13 +271,37 @@ router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async
 router.delete('/materials/:id', requirePermission('lms.create'), asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  const [deleted] = await sql`DELETE FROM lms_materials WHERE id = ${id} RETURNING id`;
+  // Authorization: Check Course Owner
+  const [material] = await sql`
+    SELECT c.instructor_id 
+    FROM lms_materials m
+    JOIN lms_courses c ON m.course_id = c.id
+    WHERE m.id = ${id}
+  `;
 
-  if (!deleted) {
-    return res.status(404).json({ error: 'Material not found' });
+  if (!material) return res.status(404).json({ error: 'Material not found' });
+
+  const isAdmin = req.user?.roles.includes('admin');
+  const isOwner = material.instructor_id === (await getStaffId(req.user.internal_id));
+
+  if (!isAdmin && !isOwner) {
+    return res.status(403).json({ error: 'Only the course instructor or admin can delete this material' });
   }
+
+  await sql`DELETE FROM lms_materials WHERE id = ${id}`;
 
   res.json({ message: 'Material deleted' });
 }));
+
+
+// Helper to get staff ID from internal user ID
+async function getStaffId(internalId) {
+  const [res] = await sql`
+    SELECT s.id FROM staff s
+    JOIN users u ON s.person_id = u.person_id
+    WHERE u.id = ${internalId}
+  `;
+  return res?.id;
+}
 
 export default router;

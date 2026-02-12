@@ -29,9 +29,10 @@ router.post('/login', asyncHandler(async (req, res) => {
     // Fetch user roles and permissions
     const userInfo = await sql`
     SELECT 
-      u.id, u.account_status,
+      u.id, u.account_status, u.person_id,
       p.first_name, p.last_name, p.display_name, p.photo_url,
       s.admission_no,
+      st.id as staff_id,
       (SELECT EXISTS(SELECT 1 FROM students st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_student_profile,
       (SELECT EXISTS(SELECT 1 FROM staff st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_staff_profile,
       array_agg(DISTINCT r.code) FILTER (WHERE r.code IS NOT NULL) as roles,
@@ -39,12 +40,13 @@ router.post('/login', asyncHandler(async (req, res) => {
     FROM users u
     JOIN persons p ON u.person_id = p.id
     LEFT JOIN students s ON p.id = s.person_id
+    LEFT JOIN staff st ON p.id = st.person_id
     LEFT JOIN user_roles ur ON u.id = ur.user_id
     LEFT JOIN roles r ON ur.role_id = r.id
     LEFT JOIN role_permissions rp ON r.id = rp.role_id
     LEFT JOIN permissions perm ON rp.permission_id = perm.id
     WHERE u.id = ${data.user.id}
-    GROUP BY u.id, p.id, s.admission_no
+    GROUP BY u.id, p.id, s.admission_no, st.id
   `;
 
     if (userInfo.length === 0) {
@@ -55,6 +57,52 @@ router.post('/login', asyncHandler(async (req, res) => {
 
     if (dbUser.account_status !== 'active') {
         return res.status(403).json({ error: 'Account is not active' });
+    }
+
+    // Check for Class/Section Assignment
+    let classSectionId = null;
+    if (dbUser.has_staff_profile && dbUser.staff_id) {
+        // Get active academic year
+        const [currentYear] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
+
+        if (currentYear) {
+            // Priority 1: Timetable Period 1
+            const [timetableAuto] = await sql`
+                SELECT class_section_id FROM timetable_slots 
+                WHERE teacher_id = ${dbUser.staff_id} 
+                  AND academic_year_id = ${currentYear.id} 
+                  AND period_number = 1
+                LIMIT 1
+            `;
+            if (timetableAuto) {
+                classSectionId = timetableAuto.class_section_id;
+            } else {
+                // Priority 2: Static Class Teacher Assignment
+                const [staticAuto] = await sql`
+                    SELECT id FROM class_sections 
+                    WHERE class_teacher_id = ${dbUser.staff_id} 
+                      AND academic_year_id = ${currentYear.id}
+                    LIMIT 1
+                `;
+                if (staticAuto) {
+                    classSectionId = staticAuto.id;
+                }
+            }
+        }
+    } else if (dbUser.has_student_profile) {
+        // Get active enrollment for student
+        const [enrollment] = await sql`
+            SELECT se.class_section_id 
+            FROM student_enrollments se
+            JOIN students s ON se.student_id = s.id
+            WHERE s.person_id = ${dbUser.person_id}
+              AND se.status = 'active'
+              AND se.deleted_at IS NULL
+            LIMIT 1
+        `;
+        if (enrollment) {
+            classSectionId = enrollment.class_section_id;
+        }
     }
 
     // Update last login
@@ -77,6 +125,8 @@ router.post('/login', asyncHandler(async (req, res) => {
             admission_no: dbUser.admission_no,
             has_student_profile: dbUser.has_student_profile,
             has_staff_profile: dbUser.has_staff_profile,
+            class_section_id: classSectionId,
+            classId: classSectionId
         }
     });
 }));
@@ -136,10 +186,11 @@ router.get('/me', asyncHandler(async (req, res) => {
     // Fetch full profile
     const userInfo = await sql`
     SELECT 
-      u.id, u.account_status, u.last_login_at, u.created_at,
+      u.id, u.person_id, u.account_status, u.last_login_at, u.created_at,
       p.first_name, p.middle_name, p.last_name, p.display_name, p.dob, p.photo_url,
       g.name as gender,
       s.admission_no,
+      st.id as staff_id,
       (SELECT EXISTS(SELECT 1 FROM students st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_student_profile,
       (SELECT EXISTS(SELECT 1 FROM staff st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_staff_profile,
       array_agg(DISTINCT r.code) FILTER (WHERE r.code IS NOT NULL) as roles,
@@ -150,20 +201,58 @@ router.get('/me', asyncHandler(async (req, res) => {
     FROM users u
     JOIN persons p ON u.person_id = p.id
     LEFT JOIN students s ON p.id = s.person_id
+    LEFT JOIN staff st ON p.id = st.person_id
     LEFT JOIN genders g ON p.gender_id = g.id
     LEFT JOIN user_roles ur ON u.id = ur.user_id
     LEFT JOIN roles r ON ur.role_id = r.id
     LEFT JOIN role_permissions rp ON r.id = rp.role_id
     LEFT JOIN permissions perm ON rp.permission_id = perm.id
     WHERE u.id = ${req.user.id}
-    GROUP BY u.id, p.id, g.name, s.admission_no
+    GROUP BY u.id, p.id, g.name, s.admission_no, st.id
   `;
 
     if (userInfo.length === 0) {
         return res.status(404).json({ error: 'User not found' });
     }
 
-    res.json(userInfo[0]);
+    const dbUser = userInfo[0];
+
+    // Check for Class/Section Assignment (Re-detect for /me)
+    let classSectionId = null;
+    if (dbUser.has_staff_profile && dbUser.staff_id) {
+        const [currentYear] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
+        if (currentYear) {
+            const [timetableAuto] = await sql`
+                SELECT class_section_id FROM timetable_slots 
+                WHERE teacher_id = ${dbUser.staff_id} AND academic_year_id = ${currentYear.id} AND period_number = 1
+                LIMIT 1
+            `;
+            if (timetableAuto) {
+                classSectionId = timetableAuto.class_section_id;
+            } else {
+                const [staticAuto] = await sql`
+                    SELECT id FROM class_sections 
+                    WHERE class_teacher_id = ${dbUser.staff_id} AND academic_year_id = ${currentYear.id}
+                    LIMIT 1
+                `;
+                if (staticAuto) classSectionId = staticAuto.id;
+            }
+        }
+    } else if (dbUser.has_student_profile) {
+        const [enrollment] = await sql`
+            SELECT class_section_id FROM student_enrollments se 
+            JOIN students s ON se.student_id = s.id 
+            WHERE s.person_id = ${dbUser.person_id} AND se.status = 'active' AND se.deleted_at IS NULL 
+            LIMIT 1
+        `;
+        if (enrollment) classSectionId = enrollment.class_section_id;
+    }
+
+    res.json({
+        ...dbUser,
+        class_section_id: classSectionId,
+        classId: classSectionId
+    });
 }));
 
 /**

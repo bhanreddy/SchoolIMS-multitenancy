@@ -1,4 +1,11 @@
 import express from 'express';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const debugLogPath = path.join(__dirname, 'server_debug.log');
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
@@ -13,8 +20,17 @@ import sql from './db.js';
 const app = express();
 const port = config.port;
 
+// Debug Logger (Top-most for visibility)
+app.use((req, res, next) => {
+  const logMsg = `[${new Date().toISOString()}] [REQUEST] ${req.method} ${req.url} - Auth: ${req.headers.authorization ? 'Present' : 'None'}\n`;
+  try {
+    fs.appendFileSync(debugLogPath, logMsg);
+  } catch (err) { }
+  next();
+});
+
 // Security Middleware
-app.set('trust proxy', 1); // Trust first proxy (Render/Heroku/etc)
+app.set('trust proxy', 1);
 app.use(helmet());
 
 // Rate Limiting
@@ -44,7 +60,11 @@ app.use(express.json());
 // Auth & Audit Middleware (Global)
 app.use(identifyUser);
 app.use((req, res, next) => {
-  console.log(`[REQUEST] ${req.method} ${req.url} - User: ${req.user?.id || 'none'}`);
+  const logMsg = `[${new Date().toISOString()}] [USER_IDENTIFIED] ${req.method} ${req.url} - UserID: ${req.user?.id || 'none'} - PersonID: ${req.user?.person_id || 'none'}\n`;
+  console.log(logMsg.trim());
+  try {
+    fs.appendFileSync(debugLogPath, logMsg);
+  } catch (err) { }
   next();
 });
 app.use(auditLogger);
@@ -163,7 +183,15 @@ app.use((req, res) => {
 });
 
 // Global Error Handler
-app.use(errorHandler);
+app.use((err, req, res, next) => {
+  const errorMsg = `[${new Date().toISOString()}] [ERROR] ${req.method} ${req.url} - ${err.stack || err.message}\n`;
+  try {
+    fs.appendFileSync(debugLogPath, errorMsg);
+  } catch (logErr) { }
+
+  // Call the original errorHandler utility
+  errorHandler(err, req, res, next);
+});
 
 app.listen(port, async () => {
   console.log(`🚀 Server listening on port ${port}`);

@@ -30,6 +30,7 @@ router.get('/:classSectionId/slots', asyncHandler(async (req, res) => {
             ts.period_number,
             ts.start_time,
             ts.end_time,
+            ts.room_no,
             sub.name as subject_name,
             sub.id as subject_id,
             p.display_name as teacher_name,
@@ -43,7 +44,12 @@ router.get('/:classSectionId/slots', asyncHandler(async (req, res) => {
         ORDER BY ts.day_of_week, ts.period_number
     `;
 
-  res.json(slots);
+  const formattedSlots = slots.map(slot => ({
+    ...slot,
+    day_of_week: slot.day_of_week ? slot.day_of_week.substring(0, 3).toLowerCase() : null
+  }));
+
+  res.json(formattedSlots);
 }));
 
 /**
@@ -54,48 +60,104 @@ router.post('/', asyncHandler(async (req, res) => {
   const {
     academic_year_id,
     class_section_id,
-    day_of_week,
+    day_of_week, // Optional if all_days is true
     period_number,
     subject_id,
-    teacher_id,
-    start_time,
-    end_time
+    teacher_id: provided_teacher_id,
+    room_no,
+    all_days // Boolean flag
   } = req.body;
 
   // Basic Validation
-  if (!academic_year_id || !class_section_id || !day_of_week || !period_number || !subject_id || !start_time || !end_time) {
+  if (!academic_year_id || !class_section_id || !period_number || !subject_id) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  // 1. Teacher Overlap Check (Manual since DB constraint is complex for Enums)
-  if (teacher_id) {
-    const overlap = await sql`
+  if (!all_days && !day_of_week) {
+    return res.status(400).json({ error: 'day_of_week is required when all_days is false' });
+  }
+
+  // 1. Fetch Official Period Times
+  const periodDef = await sql`
+        SELECT start_time, end_time 
+        FROM periods 
+        WHERE sort_order = ${period_number}
+        LIMIT 1
+  `;
+
+  if (periodDef.length === 0) {
+    return res.status(400).json({ error: `Invalid Period Number: ${period_number}. Only configured periods are allowed.` });
+  }
+
+  const { start_time, end_time } = periodDef[0];
+
+  // Determine Teacher
+  const final_teacher_id = provided_teacher_id || null;
+  const final_room_no = room_no || null;
+
+
+  // Determine Days to process
+  const dayMap = {
+    'mon': 'monday', 'tue': 'tuesday', 'wed': 'wednesday', 'thu': 'thursday', 'fri': 'friday', 'sat': 'saturday', 'sun': 'sunday',
+    'Monday': 'monday', 'Tuesday': 'tuesday', 'Wednesday': 'wednesday', 'Thursday': 'thursday', 'Friday': 'friday', 'Saturday': 'saturday', 'Sunday': 'sunday'
+  };
+
+  const normalizeDay = (d) => {
+    if (!d) return null;
+    const cleanD = d.toString().trim().toLowerCase();
+    const mapped = dayMap[cleanD];
+    return mapped || cleanD;
+  };
+
+  const daysToProcess = (all_days && all_days !== 'false')
+    ? ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+    : [normalizeDay(day_of_week)];
+
+  // Process Logic within Transaction
+  await sql.begin(async sql => {
+    for (const day of daysToProcess) {
+      // 2. Teacher Overlap Check
+      if (final_teacher_id) {
+        const overlap = await sql`
             SELECT 1 FROM timetable_slots 
-            WHERE teacher_id = ${teacher_id} 
-              AND day_of_week = ${day_of_week}::day_of_week_enum
+            WHERE teacher_id = ${final_teacher_id} 
+              AND day_of_week = ${day}::day_of_week_enum
               AND academic_year_id = ${academic_year_id}
               AND start_time < ${end_time} 
               AND end_time > ${start_time}
+              AND class_section_id != ${class_section_id} -- Ignore self-overlap (e.g. updating same slot)
         `;
 
-    if (overlap.length > 0) {
-      return res.status(409).json({ error: 'Teacher is already booked at this time in another class' });
-    }
-  }
+        // strict check for single day, skip/warn for bulk
+        if (overlap.length > 0 && !all_days) {
+          throw new Error(`Teacher is already booked at this time on ${day}`);
+        } else if (overlap.length > 0) {
+          continue; // Skip collision
+        }
+      }
 
-  // 2. Insert Slot
-  const result = await sql`
+      // 3. Upsert Slot
+      await sql`
         INSERT INTO timetable_slots (
             academic_year_id, class_section_id, day_of_week, period_number, 
-            subject_id, teacher_id, start_time, end_time
+            subject_id, teacher_id, start_time, end_time, room_no
         ) VALUES (
-            ${academic_year_id}, ${class_section_id}, ${day_of_week}, ${period_number}, 
-            ${subject_id}, ${teacher_id}, ${start_time}, ${end_time}
+            ${academic_year_id}, ${class_section_id}, ${day}, ${period_number}, 
+            ${subject_id}, ${final_teacher_id}, ${start_time}, ${end_time}, ${final_room_no}
         )
-        RETURNING id
-    `;
+        ON CONFLICT (class_section_id, academic_year_id, day_of_week, period_number) WHERE deleted_at IS NULL
+        DO UPDATE SET
+            subject_id = EXCLUDED.subject_id,
+            teacher_id = EXCLUDED.teacher_id,
+            start_time = EXCLUDED.start_time,
+            end_time = EXCLUDED.end_time,
+            room_no = EXCLUDED.room_no,
+            updated_at = now()
+      `;
+    }
+  });
 
-  res.status(201).json(result[0]);
+  res.status(200).json({ message: 'Timetable updated successfully' });
 }));
 
 /**
@@ -141,6 +203,7 @@ router.get('/my-timetable', asyncHandler(async (req, res) => {
             ts.period_number,
             ts.start_time,
             ts.end_time,
+            ts.room_no,
             sub.name as subject_name,
             p.display_name as teacher_name
         FROM timetable_slots ts
@@ -152,7 +215,12 @@ router.get('/my-timetable', asyncHandler(async (req, res) => {
         ORDER BY ts.day_of_week, ts.start_time
     `;
 
-  res.json(slots);
+  const formattedSlots = slots.map(slot => ({
+    ...slot,
+    day_of_week: slot.day_of_week ? slot.day_of_week.substring(0, 3).toLowerCase() : null
+  }));
+
+  res.json(formattedSlots);
 }));
 
 /**
@@ -179,6 +247,7 @@ router.get('/teacher-timetable', asyncHandler(async (req, res) => {
             ts.period_number,
             ts.start_time,
             ts.end_time,
+            ts.room_no,
             c.name as class_name,
             sec.name as section_name,
             sub.name as subject_name
@@ -195,7 +264,70 @@ router.get('/teacher-timetable', asyncHandler(async (req, res) => {
         ORDER BY ts.day_of_week, ts.start_time
     `;
 
-  res.json(slots);
+  const formattedSlots = slots.map(slot => ({
+    ...slot,
+    day_of_week: slot.day_of_week ? slot.day_of_week.substring(0, 3).toLowerCase() : null
+  }));
+
+  res.json(formattedSlots);
+}));
+
+/**
+ * GET /periods
+ * Fetch all defined periods
+ */
+router.get('/periods/list', asyncHandler(async (req, res) => {
+  const periods = await sql`
+        SELECT * FROM periods 
+        ORDER BY sort_order ASC, start_time ASC
+    `;
+  res.json(periods);
+}));
+
+/**
+ * PUT /periods
+ * Batch update period timings
+ */
+router.put('/periods', asyncHandler(async (req, res) => {
+  const { periods } = req.body;
+
+  if (!periods || !Array.isArray(periods)) {
+    return res.status(400).json({ error: 'Invalid payload: periods array required' });
+  }
+
+  // Use a transaction for atomic updates
+  await sql.begin(async sql => {
+    for (const p of periods) {
+      if (p.id) {
+        // 1. Update Period Definition
+        await sql`
+            UPDATE periods 
+            SET 
+                name = ${p.name}, 
+                start_time = ${p.start_time}, 
+                end_time = ${p.end_time},
+                sort_order = ${p.sort_order || 0}
+            WHERE id = ${p.id}
+        `;
+
+        // 2. Cascade Time Changes to Timetable Slots
+        // We assume period_number in slots corresponds to sort_order
+        // This ensures student/teacher views (which read from slots) reflect the new times
+        // and collision detection uses the new times.
+        if (p.start_time && p.end_time && p.sort_order) {
+          await sql`
+                UPDATE timetable_slots
+                SET 
+                    start_time = ${p.start_time},
+                    end_time = ${p.end_time}
+                WHERE period_number = ${p.sort_order}
+            `;
+        }
+      }
+    }
+  });
+
+  res.json({ message: 'Periods updated successfully' });
 }));
 
 export default router;

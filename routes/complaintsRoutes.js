@@ -112,8 +112,36 @@ router.get('/:id', requirePermission('complaints.view'), asyncHandler(async (req
 router.post('/', requirePermission('complaints.create'), asyncHandler(async (req, res) => {
   const { title, description, category, priority, raised_for_student_id } = req.body;
 
-  if (!title || !description) {
-    return res.status(400).json({ error: 'Title and description are required' });
+  if (!title || !description || !raised_for_student_id) {
+    return res.status(400).json({ error: 'Title, description, and student ID are required' });
+  }
+
+  // Strict Authorization: Only the Class Teacher of the student's ACTIVE class can raise a complaint
+  const isAdmin = req.user?.roles.includes('admin');
+
+  if (!isAdmin) {
+    // 1. Get the current active class section of the student
+    const [enrollment] = await sql`
+        SELECT cs.class_teacher_id 
+        FROM student_enrollments se
+        JOIN class_sections cs ON se.class_section_id = cs.id
+        WHERE se.student_id = ${raised_for_student_id} 
+          AND se.status = 'active'
+          AND se.deleted_at IS NULL
+        LIMIT 1
+    `;
+
+    if (!enrollment) {
+      return res.status(400).json({ error: 'Student is not enrolled in any active class' });
+    }
+
+    // 2. Get the current user's Staff ID
+    const [staff] = await sql`SELECT id FROM staff WHERE person_id = ${req.user.person_id} LIMIT 1`;
+
+    // 3. Verify Match
+    if (!staff || enrollment.class_teacher_id !== staff.id) {
+      return res.status(403).json({ error: 'Only the Class Teacher can raise complaints for this student' });
+    }
   }
 
   const [complaint] = await sql`
@@ -179,21 +207,8 @@ router.put('/:id', asyncHandler(async (req, res) => {
  * DELETE /complaints/:id
  * Delete complaint (owner or admin only)
  */
-router.delete('/:id', asyncHandler(async (req, res) => {
-  const { id } = req.params;
+// DELETE endpoint removed as per audit requirements
+// router.delete('/:id', ...)
 
-  const [existing] = await sql`SELECT raised_by FROM complaints WHERE id = ${id}`;
-  if (!existing) {
-    return res.status(404).json({ error: 'Complaint not found' });
-  }
-
-  const isAdmin = req.user?.roles.includes('admin');
-  if (!isAdmin && existing.raised_by !== req.user.internal_id) {
-    return res.status(403).json({ error: 'Access denied' });
-  }
-
-  await sql`DELETE FROM complaints WHERE id = ${id}`;
-  res.json({ message: 'Complaint deleted' });
-}));
 
 export default router;

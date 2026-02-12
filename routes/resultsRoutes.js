@@ -482,12 +482,14 @@ router.get('/student/:studentId', requirePermission('results.view'), asyncHandle
         ) ORDER BY sub.name) as subjects,
         SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) as total_obtained,
         SUM(es.max_marks) as total_max,
-        ROUND(SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END)::numeric / NULLIF(SUM(es.max_marks), 0) * 100, 2) as percentage
+        ROUND(CAST(SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) AS NUMERIC) / NULLIF(SUM(es.max_marks), 0) * 100, 2) as percentage
       FROM exams e
       JOIN exam_subjects es ON e.id = es.exam_id
       JOIN subjects sub ON es.subject_id = sub.id
-      LEFT JOIN marks m ON m.exam_subject_id = es.id
-      LEFT JOIN student_enrollments se ON m.student_enrollment_id = se.id AND se.student_id = ${studentId}
+      LEFT JOIN marks m ON m.exam_subject_id = es.id 
+        AND m.student_enrollment_id IN (
+          SELECT id FROM student_enrollments WHERE student_id = ${studentId}
+        )
       WHERE e.id = ${exam_id}
       GROUP BY e.id, e.name, e.exam_type
     `;
@@ -499,7 +501,7 @@ router.get('/student/:studentId', requirePermission('results.view'), asyncHandle
         COUNT(DISTINCT es.subject_id) as subjects_count,
         SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) as total_obtained,
         SUM(es.max_marks) as total_max,
-        ROUND(SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END)::numeric / NULLIF(SUM(es.max_marks), 0) * 100, 2) as percentage
+        ROUND(CAST(SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) AS NUMERIC) / NULLIF(SUM(es.max_marks), 0) * 100, 2) as percentage
       FROM marks m
       JOIN exam_subjects es ON m.exam_subject_id = es.id
       JOIN exams e ON es.exam_id = e.id
@@ -632,12 +634,12 @@ router.get('/list/student/:studentId', requirePermission('results.view'), asyncH
 
   const exams = await sql`
     SELECT 
-      e.id, e.name, e.exam_type, e.start_date, e.end_date, e.status, // Fixed: removed ay.code as it needs a join
+      e.id, e.name, e.exam_type, e.start_date, e.end_date, e.status,
       ay.code as academic_year,
       COUNT(DISTINCT es.subject_id) as subjects_count,
       SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) as total_obtained,
       SUM(es.max_marks) as total_max,
-      ROUND(SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END)::numeric / NULLIF(SUM(es.max_marks), 0) * 100, 2) as percentage
+      ROUND(CAST(SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) AS NUMERIC) / NULLIF(SUM(es.max_marks), 0) * 100, 2) as percentage
     FROM marks m
     JOIN exam_subjects es ON m.exam_subject_id = es.id
     JOIN exams e ON es.exam_id = e.id
@@ -651,6 +653,217 @@ router.get('/list/student/:studentId', requirePermission('results.view'), asyncH
   `;
 
   res.json(exams);
+}));
+
+/**
+ * GET /results/marks
+ * Fetch existing marks for a specific exam/subject/class
+ * Used to pre-fill the marks entry form
+ */
+router.get('/marks', requirePermission('marks.view'), asyncHandler(async (req, res) => {
+  const { class_section_id, exam_category, sub_exam, subject_id } = req.query;
+
+  if (!class_section_id || !exam_category || !sub_exam || !subject_id) {
+    return res.status(400).json({
+      error: 'Missing required query params: class_section_id, exam_category, sub_exam, subject_id'
+    });
+  }
+
+  // 1. Resolve Class Section info
+  const [classSection] = await sql`
+    SELECT cs.class_id, cs.academic_year_id 
+    FROM class_sections cs 
+    WHERE cs.id = ${class_section_id}
+  `;
+
+  if (!classSection) {
+    return res.status(404).json({ error: 'Class section not found' });
+  }
+
+  const { class_id, academic_year_id } = classSection;
+
+  // 2. Find Exam
+  const [exam] = await sql`
+    SELECT id 
+    FROM exams 
+    WHERE academic_year_id = ${academic_year_id}
+      AND exam_type = ${exam_category}
+      AND name = ${sub_exam}
+    LIMIT 1
+  `;
+
+  if (!exam) {
+    return res.json({ marks: [], max_marks: 100 }); // Exam doesn't exist yet, return empty
+  }
+
+  // 3. Find Exam Subject
+  const [examSubject] = await sql`
+    SELECT id, max_marks
+    FROM exam_subjects
+    WHERE exam_id = ${exam.id}
+      AND subject_id = ${subject_id}
+      AND class_id = ${class_id}
+    LIMIT 1
+  `;
+
+  if (!examSubject) {
+    return res.json({ marks: [], max_marks: 100 }); // Exam exists but subject not linked, return empty
+  }
+
+  // 4. Fetch Marks for enrolled students
+  const marks = await sql`
+    SELECT 
+      se.student_id,
+      m.marks_obtained,
+      m.is_absent
+    FROM student_enrollments se
+    JOIN marks m ON m.student_enrollment_id = se.id
+    WHERE se.class_section_id = ${class_section_id}
+      AND m.exam_subject_id = ${examSubject.id}
+      AND se.status = 'active'
+  `;
+
+  res.json({
+    marks,
+    max_marks: examSubject.max_marks || 100
+  });
+}));
+
+/**
+ * POST /results/upload
+ * Dynamic Results Upload Endpoint
+ * Handles on-the-fly creation of exams and exam_subjects if they don't exist
+ */
+router.post('/upload', requirePermission('marks.enter'), asyncHandler(async (req, res) => {
+  const { class_section_id, exam_category, sub_exam, subject_id, results, max_marks } = req.body;
+
+  if (!class_section_id || !exam_category || !sub_exam || !subject_id || !results || !Array.isArray(results)) {
+    return res.status(400).json({
+      error: 'Missing required fields: class_section_id, exam_category, sub_exam, subject_id, results (array)'
+    });
+  }
+
+  // 1. Resolve Academic Year & Class ID
+  const [classSection] = await sql`
+    SELECT cs.class_id, cs.academic_year_id 
+    FROM class_sections cs 
+    WHERE cs.id = ${class_section_id}
+  `;
+
+  if (!classSection) {
+    return res.status(404).json({ error: 'Class section not found' });
+  }
+
+  const { class_id, academic_year_id } = classSection;
+
+  // 2. Find or Create Exam
+  // Check if an exam exists with this type and name for the current academic year
+  let [exam] = await sql`
+    SELECT id, name, exam_type 
+    FROM exams 
+    WHERE academic_year_id = ${academic_year_id}
+      AND exam_type = ${exam_category}
+      AND name = ${sub_exam}
+    LIMIT 1
+  `;
+
+  if (!exam) {
+    // Create new exam
+    // Defaulting status to 'ongoing' or 'completed' based on usage? Let's say 'ongoing'
+    // Defaulting start_date to today
+    [exam] = await sql`
+      INSERT INTO exams (name, academic_year_id, exam_type, start_date, status)
+      VALUES (${sub_exam}, ${academic_year_id}, ${exam_category}, CURRENT_DATE, 'ongoing')
+      RETURNING id, name, exam_type
+    `;
+  }
+
+  // 3. Find or Create Exam Subject
+  let [examSubject] = await sql`
+    SELECT id, max_marks
+    FROM exam_subjects
+    WHERE exam_id = ${exam.id}
+      AND subject_id = ${subject_id}
+      AND class_id = ${class_id}
+    LIMIT 1
+  `;
+
+  const targetMaxMarks = max_marks ? Number(max_marks) : 100;
+  const targetPassingMarks = Math.ceil(targetMaxMarks * 0.35); // 35% passing
+
+  if (!examSubject) {
+    // Create exam_subject with provided max_marks or default
+    [examSubject] = await sql`
+      INSERT INTO exam_subjects (exam_id, subject_id, class_id, max_marks, passing_marks)
+      VALUES (${exam.id}, ${subject_id}, ${class_id}, ${targetMaxMarks}, ${targetPassingMarks})
+      RETURNING id, max_marks
+    `;
+  } else if (examSubject.max_marks !== targetMaxMarks) {
+    // Update max_marks if different
+    [examSubject] = await sql`
+      UPDATE exam_subjects
+      SET max_marks = ${targetMaxMarks}, passing_marks = ${targetPassingMarks}
+      WHERE id = ${examSubject.id}
+      RETURNING id, max_marks
+    `;
+  }
+
+  // 4. Process Results (Bulk Upsert Marks)
+  const enteredBy = req.user?.internal_id;
+  const processedResults = [];
+
+  for (const r of results) {
+    const { student_id, marks } = r;
+
+    // We need student_enrollment_id, not student_id directly for the marks table
+    // But we have student_id and class_section_id
+    const [enrollment] = await sql`
+      SELECT id 
+      FROM student_enrollments 
+      WHERE student_id = ${student_id} 
+        AND class_section_id = ${class_section_id}
+        AND status = 'active'
+      LIMIT 1
+    `;
+
+    if (!enrollment) {
+      processedResults.push({ student_id, error: 'Active enrollment not found' });
+      continue;
+    }
+
+    try {
+      // Upsert Mark
+      const [markEntry] = await sql`
+        INSERT INTO marks (exam_subject_id, student_enrollment_id, marks_obtained, is_absent, entered_by)
+        VALUES (
+          ${examSubject.id}, 
+          ${enrollment.id}, 
+          ${marks}, 
+          ${marks === null}, -- if marks is null/undefined, treat as absent? Or handle explicit is_absent?
+                             -- The frontend sends marks: number. If absent, it might send 0 or -1? 
+                             -- The frontend code only allows numbers. Empty string is ignored.
+                             -- Let's assume if it's in the payload, it's present.
+          ${enteredBy}
+        )
+        ON CONFLICT (exam_subject_id, student_enrollment_id)
+        DO UPDATE SET
+          marks_obtained = EXCLUDED.marks_obtained,
+          entered_by = EXCLUDED.entered_by,
+          updated_at = NOW()
+        RETURNING id
+      `;
+      processedResults.push({ student_id, mark_id: markEntry.id, success: true });
+    } catch (err) {
+      processedResults.push({ student_id, error: err.message });
+    }
+  }
+
+  res.json({
+    message: 'Marks uploaded successfully',
+    exam_id: exam.id,
+    exam_subject_id: examSubject.id,
+    results: processedResults
+  });
 }));
 
 export default router;

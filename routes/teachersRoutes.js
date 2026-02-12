@@ -10,15 +10,55 @@ router.get('/', async (req, res) => {
       SELECT 
         t.id, t.employee_code, t.joining_date,
         p.first_name, p.middle_name, p.last_name, p.display_name, p.email, p.phone, p.gender_id
-        -- est.code as status
       FROM teachers t
       JOIN persons p ON t.person_id = p.id
-      -- LEFT JOIN employment_statuses est ON t.status_id = est.id
     `;
         res.json(teachers);
     } catch (error) {
         console.error('Error fetching teachers:', error);
         res.status(500).json({ error: 'Failed to fetch teachers', details: error.message });
+    }
+});
+
+// Get My Classes & Subjects
+router.get('/me/classes', async (req, res) => {
+    try {
+        const userId = req.user.id;
+        // 1. Get Staff ID from User ID
+        const [staff] = await sql`
+            SELECT s.id 
+            FROM staff s 
+            JOIN persons p ON s.person_id = p.id 
+            JOIN users u ON u.person_id = p.id 
+            WHERE u.id = ${userId}
+        `;
+
+        if (!staff) {
+            return res.status(404).json({ error: 'Staff profile not found' });
+        }
+
+        // 2. Fetch Assignments
+        const assignments = await sql`
+            SELECT 
+                cs.class_section_id,
+                c.id as class_id,
+                c.name as class_name,
+                sec.name as section_name,
+                s.id as subject_id,
+                s.name as subject_name,
+                cs.id as assignment_id
+            FROM class_subjects cs
+            JOIN class_sections csec ON cs.class_section_id = csec.id
+            JOIN classes c ON csec.class_id = c.id
+            JOIN sections sec ON csec.section_id = sec.id
+            JOIN subjects s ON cs.subject_id = s.id
+            WHERE cs.teacher_id = ${staff.id}
+        `;
+
+        res.json(assignments);
+    } catch (error) {
+        console.error('Error fetching teacher classes:', error);
+        res.status(500).json({ error: 'Failed to fetch classes' });
     }
 });
 

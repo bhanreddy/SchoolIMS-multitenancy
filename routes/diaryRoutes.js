@@ -10,13 +10,13 @@ const router = express.Router();
  * Get diary entries (filter by class, date)
  */
 router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) => {
-    const { class_section_id, date, from_date, to_date, subject_id, page = 1, limit = 20 } = req.query;
-    const offset = (page - 1) * limit;
+  const { class_section_id, date, from_date, to_date, subject_id, page = 1, limit = 20 } = req.query;
+  const offset = (page - 1) * limit;
 
-    let entries;
-    if (class_section_id && date) {
-        // Specific class and date
-        entries = await sql`
+  let entries;
+  if (class_section_id && date) {
+    // Specific class and date
+    entries = await sql`
       SELECT 
         d.id, d.entry_date, d.title, d.content, d.homework_due_date, d.attachments,
         s.name as subject_name,
@@ -31,9 +31,9 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
         ${subject_id ? sql`AND d.subject_id = ${subject_id}` : sql``}
       ORDER BY s.name NULLS LAST
     `;
-    } else if (class_section_id && from_date && to_date) {
-        // Date range
-        entries = await sql`
+  } else if (class_section_id && from_date && to_date) {
+    // Date range
+    entries = await sql`
       SELECT 
         d.id, d.entry_date, d.title, d.content, d.homework_due_date,
         s.name as subject_name,
@@ -47,11 +47,12 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
       ORDER BY d.entry_date DESC, s.name NULLS LAST
       LIMIT ${limit} OFFSET ${offset}
     `;
-    } else if (class_section_id) {
-        // All entries for a class
-        entries = await sql`
+  } else if (class_section_id) {
+    // All entries for a class
+    entries = await sql`
       SELECT 
-        d.id, d.entry_date, d.title, d.homework_due_date,
+        d.id, d.entry_date, d.title, d.content, d.homework_due_date, d.attachments,
+        d.subject_id, d.created_by, d.created_at, d.updated_at,
         s.name as subject_name
       FROM diary_entries d
       LEFT JOIN subjects s ON d.subject_id = s.id
@@ -59,11 +60,36 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
       ORDER BY d.entry_date DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
-    } else {
-        return res.status(400).json({ error: 'class_section_id is required' });
-    }
+  } else {
+    // Global history for the creator (teacher)
+    // Only return entries for classes/subjects currently assigned to the teacher
+    entries = await sql`
+            SELECT 
+                d.id, d.entry_date, d.title, d.content, d.homework_due_date,
+                s.name as subject_name,
+                c.name as class_name, sec.name as section_name,
+                d.class_section_id, d.subject_id,
+                d.created_at, d.updated_at
+            FROM diary_entries d
+            JOIN class_sections csec ON d.class_section_id = csec.id
+            JOIN classes c ON csec.class_id = c.id
+            JOIN sections sec ON csec.section_id = sec.id
+            LEFT JOIN subjects s ON d.subject_id = s.id
+            WHERE d.created_by = ${req.user.internal_id}
+            AND EXISTS (
+                SELECT 1 FROM class_subjects csub
+                JOIN staff st ON csub.teacher_id = st.id
+                JOIN users u ON st.person_id = u.person_id
+                WHERE u.id = ${req.user.id}
+                  AND csub.class_section_id = d.class_section_id
+                  AND csub.subject_id = d.subject_id
+            )
+            ORDER BY d.homework_due_date DESC NULLS LAST, d.created_at DESC
+            LIMIT ${limit} OFFSET ${offset}
+        `;
+  }
 
-    res.json(entries);
+  res.json(entries);
 }));
 
 /**
@@ -71,9 +97,9 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
  * Get single diary entry
  */
 router.get('/:id', requirePermission('diary.view'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    const [entry] = await sql`
+  const [entry] = await sql`
     SELECT 
       d.*,
       s.name as subject_name,
@@ -89,11 +115,11 @@ router.get('/:id', requirePermission('diary.view'), asyncHandler(async (req, res
     WHERE d.id = ${id}
   `;
 
-    if (!entry) {
-        return res.status(404).json({ error: 'Diary entry not found' });
-    }
+  if (!entry) {
+    return res.status(404).json({ error: 'Diary entry not found' });
+  }
 
-    res.json(entry);
+  res.json(entry);
 }));
 
 /**
@@ -101,20 +127,20 @@ router.get('/:id', requirePermission('diary.view'), asyncHandler(async (req, res
  * Create diary entry
  */
 router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res) => {
-    const { class_section_id, subject_id, entry_date, title, content, homework_due_date, attachments } = req.body;
+  const { class_section_id, subject_id, entry_date, title, content, homework_due_date, attachments } = req.body;
 
-    if (!class_section_id || !content || !entry_date) {
-        return res.status(400).json({ error: 'class_section_id, content, and entry_date are required' });
-    }
+  if (!class_section_id || !content || !entry_date) {
+    return res.status(400).json({ error: 'class_section_id, content, and entry_date are required' });
+  }
 
-    const [entry] = await sql`
+  const [entry] = await sql`
     INSERT INTO diary_entries (class_section_id, subject_id, entry_date, title, content, homework_due_date, attachments, created_by)
     VALUES (${class_section_id}, ${subject_id}, ${entry_date}, ${title}, ${content}, 
             ${homework_due_date}, ${attachments ? JSON.stringify(attachments) : null}, ${req.user.internal_id})
     RETURNING *
   `;
 
-    res.status(201).json({ message: 'Diary entry created', entry });
+  res.status(201).json({ message: 'Diary entry created', entry });
 }));
 
 /**
@@ -122,33 +148,34 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
  * Update diary entry
  */
 router.put('/:id', requirePermission('diary.create'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const { subject_id, title, content, homework_due_date, attachments } = req.body;
+  const { id } = req.params;
+  const { subject_id, title, content, homework_due_date, attachments } = req.body;
 
-    // Check ownership
-    const [existing] = await sql`SELECT created_by FROM diary_entries WHERE id = ${id}`;
-    if (!existing) {
-        return res.status(404).json({ error: 'Diary entry not found' });
-    }
+  // Check ownership
+  const [existing] = await sql`SELECT created_by FROM diary_entries WHERE id = ${id}`;
+  if (!existing) {
+    return res.status(404).json({ error: 'Diary entry not found' });
+  }
 
-    const isAdmin = req.user?.roles.includes('admin');
-    if (!isAdmin && existing.created_by !== req.user.internal_id) {
-        return res.status(403).json({ error: 'Can only update your own entries' });
-    }
+  const isAdmin = req.user?.roles.includes('admin');
+  if (!isAdmin && existing.created_by !== req.user.internal_id) {
+    return res.status(403).json({ error: 'Can only update your own entries' });
+  }
 
-    const [updated] = await sql`
+  const [updated] = await sql`
     UPDATE diary_entries
     SET 
       subject_id = COALESCE(${subject_id}, subject_id),
       title = COALESCE(${title}, title),
       content = COALESCE(${content}, content),
       homework_due_date = COALESCE(${homework_due_date}, homework_due_date),
-      attachments = COALESCE(${attachments ? JSON.stringify(attachments) : null}, attachments)
+      attachments = COALESCE(${attachments ? JSON.stringify(attachments) : null}, attachments),
+      updated_at = now()
     WHERE id = ${id}
     RETURNING *
   `;
 
-    res.json({ message: 'Diary entry updated', entry: updated });
+  res.json({ message: 'Diary entry updated', entry: updated });
 }));
 
 /**
@@ -156,20 +183,20 @@ router.put('/:id', requirePermission('diary.create'), asyncHandler(async (req, r
  * Delete diary entry
  */
 router.delete('/:id', requirePermission('diary.create'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    const [existing] = await sql`SELECT created_by FROM diary_entries WHERE id = ${id}`;
-    if (!existing) {
-        return res.status(404).json({ error: 'Diary entry not found' });
-    }
+  const [existing] = await sql`SELECT created_by FROM diary_entries WHERE id = ${id}`;
+  if (!existing) {
+    return res.status(404).json({ error: 'Diary entry not found' });
+  }
 
-    const isAdmin = req.user?.roles.includes('admin');
-    if (!isAdmin && existing.created_by !== req.user.internal_id) {
-        return res.status(403).json({ error: 'Can only delete your own entries' });
-    }
+  const isAdmin = req.user?.roles.includes('admin');
+  if (!isAdmin && existing.created_by !== req.user.internal_id) {
+    return res.status(403).json({ error: 'Can only delete your own entries' });
+  }
 
-    await sql`DELETE FROM diary_entries WHERE id = ${id}`;
-    res.json({ message: 'Diary entry deleted' });
+  await sql`DELETE FROM diary_entries WHERE id = ${id}`;
+  res.json({ message: 'Diary entry deleted' });
 }));
 
 export default router;
