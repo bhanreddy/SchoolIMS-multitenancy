@@ -1,55 +1,167 @@
-export const NotificationTypes = {
-    GENERAL: 'GENERAL',
-    EMERGENCY: 'EMERGENCY',
-    EXAM: 'EXAM',
-    FEES: 'FEES',
-    ATTENDANCE_ABSENT: 'ATTENDANCE_ABSENT'
-};
+/**
+ * Notification Template Service
+ * 
+ * Centralized template rendering for all notification types.
+ * channelId values MUST match the sound file name (without extension)
+ * because notificationService.js sets channelId = soundFile.replace('.wav', '').
+ */
 
 const TEMPLATES = {
-    [NotificationTypes.GENERAL]: {
-        channelId: 'default_voice',
-        titleTemplate: 'Notification',
-        bodyTemplate: '{{message}}',
-        deepLink: '/(tabs)/home',
-        requiredParams: ['message']
-    },
-    [NotificationTypes.EMERGENCY]: {
-        channelId: 'emergency',
-        titleTemplate: 'EMERGENCY ALERT',
-        bodyTemplate: '{{message}}',
-        deepLink: '/announcements',
-        requiredParams: ['message']
-    },
-    [NotificationTypes.EXAM]: {
-        channelId: 'exam',
-        titleTemplate: 'Exam: {{examName}}',
-        bodyTemplate: 'Scheduled on {{date}}.', // Kept simple as per "No full sentences" preference, but needed grammar.
-        deepLink: '/student/exams',
-        requiredParams: ['examName', 'date']
-    },
-    [NotificationTypes.FEES]: {
-        channelId: 'fees',
-        titleTemplate: 'Fee Reminder',
-        bodyTemplate: '₹{{amount}} due for {{month}}.',
-        deepLink: '/student/fees',
-        requiredParams: ['amount', 'month']
-    },
-    [NotificationTypes.ATTENDANCE_ABSENT]: {
-        channelId: 'attendance',
+    // ===== ATTENDANCE =====
+    'ATTENDANCE_ABSENT': {
+        channelId: 'attendance_absent_alert',
         titleTemplate: 'Attendance Alert',
         bodyTemplate: 'Absent on {{date}}.',
         deepLink: '/student/attendance',
         requiredParams: ['date']
+    },
+    'ATTENDANCE_PRESENT': {
+        channelId: 'voice_alert',
+        titleTemplate: 'Attendance Update',
+        bodyTemplate: '{{message}}',
+        deepLink: '/student/attendance',
+        requiredParams: ['message']
+    },
+
+    // ===== DIARY =====
+    'DIARY_UPDATED': {
+        channelId: 'voice_alert',
+        titleTemplate: 'Diary Update',
+        bodyTemplate: '{{message}}',
+        deepLink: '/student/diary',
+        requiredParams: ['message']
+    },
+
+    // ===== RESULTS =====
+    'RESULT_RELEASED': {
+        channelId: 'voice_alert',
+        titleTemplate: 'Results Announced',
+        bodyTemplate: '{{message}}',
+        deepLink: '/student/results',
+        requiredParams: ['message']
+    },
+
+    // ===== COMPLAINTS =====
+    'COMPLAINT_CREATED': {
+        channelId: 'emergency',
+        titleTemplate: 'New Complaint',
+        bodyTemplate: '{{message}}',
+        deepLink: '/student/complaints',
+        requiredParams: ['message']
+    },
+    'COMPLAINT_RESPONSE': {
+        channelId: 'emergency',
+        titleTemplate: 'Complaint Update',
+        bodyTemplate: '{{message}}',
+        deepLink: '/student/complaints',
+        requiredParams: ['message']
+    },
+
+    // ===== LMS =====
+    'LMS_CONTENT': {
+        channelId: 'voice_alert',
+        titleTemplate: 'New Study Material',
+        bodyTemplate: '{{message}}',
+        deepLink: '/student/lms',
+        requiredParams: ['message']
+    },
+
+    // ===== TIMETABLE =====
+    'TIMETABLE_UPDATED': {
+        channelId: 'voice_alert',
+        titleTemplate: 'Timetable Update',
+        bodyTemplate: '{{message}}',
+        deepLink: '/student/timetable',
+        requiredParams: ['message']
+    },
+
+    // ===== NOTICES =====
+    'NOTICE_ADMIN_STUDENT': {
+        channelId: 'voice_alert',
+        titleTemplate: 'Admin Notice',
+        bodyTemplate: '{{message}}',
+        deepLink: '/student/notices',
+        requiredParams: ['message']
+    },
+
+    // ===== FEES =====
+    'FEE_REMINDER': {
+        channelId: 'fee_reminder',
+        titleTemplate: 'Fee Reminder',
+        bodyTemplate: '{{message}}',
+        deepLink: '/student/fees',
+        requiredParams: ['message']
+    },
+    'FEE_COLLECTED': {
+        channelId: 'voice_alert',
+        titleTemplate: 'Fee Received',
+        bodyTemplate: '{{message}}',
+        deepLink: '/student/fees',
+        requiredParams: ['message']
+    },
+
+    // ===== LEAVES =====
+    'LEAVE_SUBMITTED': {
+        channelId: 'exam',
+        titleTemplate: 'Leave Request',
+        bodyTemplate: '{{message}}',
+        deepLink: '/admin/leaves',
+        requiredParams: ['message']
+    },
+    'LEAVE_APPROVED': {
+        channelId: 'exam',
+        titleTemplate: 'Leave Approved',
+        bodyTemplate: '{{message}}',
+        deepLink: '/staff/leaves',
+        requiredParams: ['message']
+    },
+    'LEAVE_REJECTED': {
+        channelId: 'exam',
+        titleTemplate: 'Leave Rejected',
+        bodyTemplate: '{{message}}',
+        deepLink: '/staff/leaves',
+        requiredParams: ['message']
+    },
+
+    // ===== EXPENSES =====
+    'EXPENSE_CREATED': {
+        channelId: 'exam',
+        titleTemplate: 'Expense Submitted',
+        bodyTemplate: '{{message}}',
+        deepLink: '/admin/expenses',
+        requiredParams: ['message']
+    },
+    'EXPENSE_APPROVED': {
+        channelId: 'exam',
+        titleTemplate: 'Expense Approved',
+        bodyTemplate: '{{message}}',
+        deepLink: '/accounts/expenses',
+        requiredParams: ['message']
+    },
+    'EXPENSE_REJECTED': {
+        channelId: 'exam',
+        titleTemplate: 'Expense Rejected',
+        bodyTemplate: '{{message}}',
+        deepLink: '/accounts/expenses',
+        requiredParams: ['message']
+    },
+
+    // ===== PAYROLL =====
+    'PAYROLL_SUCCESS': {
+        channelId: 'exam',
+        titleTemplate: 'Salary Credited',
+        bodyTemplate: '{{message}}',
+        deepLink: '/staff/payroll',
+        requiredParams: ['message']
     }
 };
 
 export const NotificationTemplateService = {
     /**
      * Renders a notification template.
-     * @param {string} type - One of NotificationTypes
+     * @param {string} type - One of the template keys above
      * @param {object} params - Dynamic parameters
-     * @returns {object} { title, body, android: { channelId } }
+     * @returns {object} { title, body, deepLink, android: { channelId } }
      * @throws {Error} If type is invalid or params are missing
      */
     render(type, params) {

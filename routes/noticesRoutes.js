@@ -2,6 +2,7 @@ import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { sendNotificationToUsers } from '../services/notificationService.js';
 
 const router = express.Router();
 
@@ -93,6 +94,69 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
                 ${safePriority}, ${is_pinned || false}, ${safePublishAt}, ${expires_at || null}, ${req.user.internal_id})
         RETURNING *
       `;
+
+    // Notification Logic (Async)
+    (async () => {
+      try {
+        let recips = [];
+        if (safeAudience === 'class' && safeTargetClassId) {
+          recips = await sql`
+             SELECT DISTINCT u.id
+             FROM users u
+             JOIN students s ON u.person_id = s.person_id
+             JOIN student_enrollments se ON s.id = se.student_id
+             JOIN class_sections cs ON se.class_section_id = cs.id
+             WHERE cs.class_id = ${safeTargetClassId}
+               AND se.status = 'active'
+               AND u.account_status = 'active'
+             
+             UNION
+             
+             SELECT DISTINCT u.id
+             FROM users u
+             JOIN parents p ON u.person_id = p.person_id
+             JOIN student_parents sp ON p.id = sp.parent_id
+             JOIN students s ON sp.student_id = s.id
+             JOIN student_enrollments se ON s.id = se.student_id
+             JOIN class_sections cs ON se.class_section_id = cs.id
+             WHERE cs.class_id = ${safeTargetClassId}
+               AND se.status = 'active'
+               AND u.account_status = 'active'
+           `;
+        } else if (safeAudience === 'all') {
+          recips = await sql`
+             SELECT DISTINCT u.id
+             FROM users u
+             JOIN students s ON u.person_id = s.person_id
+             JOIN student_enrollments se ON s.id = se.student_id
+             WHERE se.status = 'active'
+               AND u.account_status = 'active'
+             
+             UNION
+             
+             SELECT DISTINCT u.id
+             FROM users u
+             JOIN parents p ON u.person_id = p.person_id
+             JOIN student_parents sp ON p.id = sp.parent_id
+             JOIN students s ON sp.student_id = s.id
+             JOIN student_enrollments se ON s.id = se.student_id
+             WHERE se.status = 'active'
+               AND u.account_status = 'active'
+           `;
+        }
+
+        if (recips.length > 0) {
+          const userIds = [...new Set(recips.map(r => r.id))];
+          await sendNotificationToUsers(
+            userIds,
+            'NOTICE_ADMIN_STUDENT',
+            { message: `New notice: ${title}` }
+          );
+        }
+      } catch (notifyErr) {
+        console.error('[Notification] NOTICE_ADMIN_STUDENT failed:', notifyErr);
+      }
+    })();
 
     res.status(201).json({ message: 'Notice created', notice });
   } catch (err) {

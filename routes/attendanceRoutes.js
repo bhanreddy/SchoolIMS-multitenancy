@@ -4,6 +4,8 @@ import { requirePermission, requireAuth } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = express.Router();
+import { sendNotificationToUsers } from '../services/notificationService.js';
+
 
 /**
  * GET /attendance
@@ -202,6 +204,93 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
 
     return inserted;
   });
+
+  // ... (Database transaction successful)
+
+  // 3. Trigger Notifications (Async - Fire & Forget)
+  // We do not await this to return the response quickly, or we can await if we want to ensure log consistency.
+  // Given "stabilization", we should probably await inside a try/catch or just promise-chain it.
+  // The user requirement says "Trigger notification only after successful DB operation".
+  // We will run this *after* the response or asynchronously before sending response if fast enough.
+  // For reliability, let's await it but catch errors so we don't fail the request.
+
+  (async () => {
+    try {
+      const notificationDate = date; // YYYY-MM-DD
+
+      for (const record of results) {
+        const { student_id, status } = record;
+        // status is 'present', 'absent', 'late', 'half_day'
+
+        // Determine Notification Details
+        let type, templateParams;
+
+        if (status.toLowerCase() === 'absent') {
+          type = 'ATTENDANCE_ABSENT';
+          templateParams = { date: notificationDate };
+        } else if (status.toLowerCase() === 'present') {
+          type = 'ATTENDANCE_PRESENT';
+          templateParams = { message: `Attendance marked Present for ${notificationDate}.` };
+        } else {
+          // Late/Half-day mapped to ATTENDANCE_PRESENT channel
+          type = 'ATTENDANCE_PRESENT';
+          templateParams = { message: `Attendance marked ${status} for ${notificationDate}.` };
+        }
+
+        // Fetch Target Tokens
+        // Requirement: "Fetch FCM tokens from user_devices where user_id = student_id"
+        // AND we should probably notify parents too per existing audit findings.
+
+        // 1. Resolve Users (Student User + Parent Users)
+        const targetUsers = await sql`
+           SELECT u.id as user_id, u.role_id, 'student' as role
+           FROM students s
+           JOIN users u ON s.person_id = u.person_id
+           WHERE s.id = ${student_id}
+           AND u.account_status = 'active'
+           
+           UNION
+           
+           SELECT u.id as user_id, u.role_id, 'parent' as role
+           FROM student_parents sp
+           JOIN parents p ON sp.parent_id = p.id
+           JOIN users u ON p.person_id = u.person_id
+           WHERE sp.student_id = ${student_id}
+           AND u.account_status = 'active'
+        `;
+
+        if (targetUsers.length === 0) continue;
+
+        const userIds = targetUsers.map(u => u.user_id);
+
+        // 2. Fetch Tokens
+        const devices = await sql`
+           SELECT fcm_token, user_id FROM user_devices 
+           WHERE user_id IN ${sql(userIds)}
+        `;
+
+        if (devices.length === 0) continue;
+
+        const tokens = devices.map(d => d.fcm_token);
+
+        // Map back to targetUsers structure for logging completeness
+        const notificationTargets = devices.map(d => {
+          const info = targetUsers.find(u => u.user_id === d.user_id);
+          return { id: d.user_id, role: info?.role || 'unknown' };
+        });
+
+        // 3. Send
+        await sendNotificationToUsers(
+          userIds,
+          type,
+          templateParams
+        );
+      }
+    } catch (notificationError) {
+      console.error('[Notification Integration] Failed to send attendance notifications:', notificationError);
+      // Suppress error so we don't affect the HTTP response
+    }
+  })();
 
   res.status(201).json({
     message: 'Attendance marked successfully',

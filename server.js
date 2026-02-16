@@ -94,6 +94,8 @@ import aiRouter from './routes/aiRoutes.js';
 import analyticsRouter from './routes/analyticsRoutes.js';
 import adminNotificationRoutes from './routes/adminNotificationRoutes.js';
 import invoicesRouter from './routes/invoicesRoutes.js';
+import expensesRouter from './routes/expensesRoutes.js';
+import payrollRouter from './routes/payrollRoutes.js';
 
 // Health check endpoint
 app.get('/api/v1/health', async (req, res) => {
@@ -169,6 +171,8 @@ app.use('/api/v1/ai', aiRouter);
 app.use('/api/v1/analytics', analyticsRouter);
 app.use('/api/v1/admin/notifications', adminNotificationRoutes);
 app.use('/api/v1/invoices', invoicesRouter);
+app.use('/api/v1/expenses', expensesRouter);
+app.use('/api/v1/payroll', payrollRouter);
 
 // Legacy routes (for backward compatibility)
 app.use('/students', studentsRouter);

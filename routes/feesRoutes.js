@@ -2,6 +2,7 @@ import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { sendNotificationToUsers } from '../services/notificationService.js';
 
 const router = express.Router();
 
@@ -192,6 +193,10 @@ router.get('/students/:studentId', requirePermission('fees.view'), asyncHandler(
  * POST /fees/collect
  * Collect fee payment
  */
+/**
+ * POST /fees/collect
+ * Collect fee payment
+ */
 router.post('/collect', requirePermission('fees.collect'), asyncHandler(async (req, res) => {
   const { student_fee_id, amount, payment_method, transaction_ref, remarks } = req.body;
 
@@ -204,36 +209,167 @@ router.post('/collect', requirePermission('fees.collect'), asyncHandler(async (r
     return res.status(400).json({ error: `payment_method must be one of: ${validMethods.join(', ')}` });
   }
 
-  // Check if fee exists and amount is valid
-  const [fee] = await sql`
-    SELECT id, amount_due, amount_paid, discount 
-    FROM student_fees WHERE id = ${student_fee_id}
-  `;
+  try {
+    const transaction = await processFeeTransaction({
+      student_fee_id,
+      amount,
+      payment_method,
+      transaction_ref,
+      remarks,
+      user: req.user
+    });
+    res.status(201).json({ message: 'Payment collected successfully', transaction });
+  } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    throw error;
+  }
+}));
 
-  if (!fee) {
-    return res.status(404).json({ error: 'Student fee not found' });
+// ... [Skipping other routes] ...
+
+/**
+ * POST /transactions
+ * Record a transaction (alternative to /collect)
+ */
+router.post('/transactions', requirePermission('fees.collect'), asyncHandler(async (req, res) => {
+  const { student_fee_id, amount, payment_method, transaction_ref, remarks } = req.body;
+
+  if (!student_fee_id || !amount || !payment_method) {
+    return res.status(400).json({ error: 'student_fee_id, amount, and payment_method are required' });
   }
 
-  const remaining = fee.amount_due - fee.discount - fee.amount_paid;
-  if (amount > remaining) {
-    return res.status(400).json({ error: `Amount exceeds remaining balance of ${remaining}` });
+  const validMethods = ['cash', 'card', 'upi', 'bank_transfer', 'cheque', 'online'];
+  if (!validMethods.includes(payment_method)) {
+    return res.status(400).json({ error: `payment_method must be one of: ${validMethods.join(', ')}` });
   }
 
-  // Create transaction (trigger will update student_fees.amount_paid)
-  const [transaction] = await sql`
-    INSERT INTO fee_transactions (student_fee_id, amount, payment_method, transaction_ref, received_by, remarks)
-    VALUES (
-      ${student_fee_id}, 
-      ${amount}, 
-      ${payment_method}, 
-      ${transaction_ref || null}, 
-      ${req.user?.internal_id || null}, 
-      ${remarks || null}
-    )
-    RETURNING *
-  `;
+  try {
+    const transaction = await processFeeTransaction({
+      student_fee_id,
+      amount,
+      payment_method,
+      transaction_ref,
+      remarks,
+      user: req.user
+    });
+    res.status(201).json({ message: 'Transaction recorded', transaction });
+  } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    throw error;
+  }
+}));
 
-  // Fetch joined data for receipt
+// ... [Skipping to end] ... 
+
+/**
+ * Shared helper to process fee transactions
+ */
+async function processFeeTransaction({ student_fee_id, amount, payment_method, transaction_ref, remarks, user }) {
+  // Validate Amount
+  const parsedAmount = Number(amount);
+  if (isNaN(parsedAmount) || parsedAmount <= 0) {
+    const err = new Error('Amount must be a positive number');
+    err.status = 400;
+    throw err;
+  }
+
+  // Execute in a transaction to prevent race conditions
+  const { transaction, fee } = await sql.begin(async (tx) => {
+    // Idempotency Check: Prevent duplicate transaction refs
+    if (transaction_ref) {
+      const [existing] = await tx`
+        SELECT id FROM fee_transactions WHERE transaction_ref = ${transaction_ref}
+      `;
+      if (existing) {
+        const err = new Error(`Transaction reference '${transaction_ref}' already exists`);
+        err.status = 409;
+        throw err;
+      }
+    }
+
+    // Check if fee exists and get necessary fields for validation
+    // LOCK the row to prevent concurrent updates
+    const [fee] = await tx`
+      SELECT id, amount_due, amount_paid, discount, student_id
+      FROM student_fees 
+      WHERE id = ${student_fee_id}
+      FOR UPDATE
+    `;
+
+    if (!fee) {
+      const err = new Error('Student fee not found');
+      err.status = 404;
+      throw err;
+    }
+
+    const remaining = fee.amount_due - fee.discount - fee.amount_paid;
+    if (parsedAmount > remaining) {
+      const err = new Error(`Amount exceeds remaining balance of ${remaining}`);
+      err.status = 400;
+      throw err;
+    }
+
+    const [transaction] = await tx`
+      INSERT INTO fee_transactions (student_fee_id, amount, payment_method, transaction_ref, received_by, remarks)
+      VALUES (
+        ${student_fee_id}, 
+        ${parsedAmount}, 
+        ${payment_method}, 
+        ${transaction_ref || null}, 
+        ${user?.internal_id || null}, 
+        ${remarks || null}
+      )
+      RETURNING *
+    `;
+
+    // Update parent fee record (Ledger Consistency)
+    // We update amount_paid and recalculate status
+    await tx`
+      UPDATE student_fees
+      SET 
+        amount_paid = amount_paid + ${parsedAmount},
+        updated_at = NOW(),
+        status = CASE 
+          WHEN (amount_paid + ${parsedAmount}) >= (amount_due - discount) THEN 'paid'
+          ELSE 'partial'
+        END
+      WHERE id = ${student_fee_id}
+    `;
+
+    return { transaction, fee };
+  });
+
+  // Send Notification to Student + Parents (Async) - Outside transaction
+  (async () => {
+    try {
+      const recipients = await sql`
+        SELECT u.id as user_id FROM users u
+        JOIN students s ON u.person_id = s.person_id
+        WHERE s.id = ${fee.student_id} AND u.account_status = 'active'
+        UNION
+        SELECT u.id as user_id FROM users u
+        JOIN parents p ON u.person_id = p.person_id
+        JOIN student_parents sp ON p.id = sp.parent_id
+        WHERE sp.student_id = ${fee.student_id} AND u.account_status = 'active'
+      `;
+
+      if (recipients.length > 0) {
+        await sendNotificationToUsers(
+          recipients.map(r => r.user_id),
+          'FEE_COLLECTED',
+          { message: 'Your fee payment has been successfully recorded.' }
+        );
+      }
+    } catch (err) {
+      console.error('[Notification] Failed to trigger FEE_COLLECTED:', err);
+    }
+  })();
+
+  // Return enriched transaction
   const [enrichedTransaction] = await sql`
     SELECT 
       t.*,
@@ -249,8 +385,10 @@ router.post('/collect', requirePermission('fees.collect'), asyncHandler(async (r
     WHERE t.id = ${transaction.id}
   `;
 
-  res.status(201).json({ message: 'Payment collected successfully', transaction: enrichedTransaction });
-}));
+  return enrichedTransaction;
+}
+
+
 
 /**
  * GET /fees/summaries
@@ -448,27 +586,33 @@ router.get('/transactions', requirePermission('fees.view'), asyncHandler(async (
  * Record a transaction (alternative to /collect)
  */
 router.post('/transactions', requirePermission('fees.collect'), asyncHandler(async (req, res) => {
-  // Redirect to collect endpoint
   const { student_fee_id, amount, payment_method, transaction_ref, remarks } = req.body;
 
   if (!student_fee_id || !amount || !payment_method) {
     return res.status(400).json({ error: 'student_fee_id, amount, and payment_method are required' });
   }
 
-  const [transaction] = await sql`
-    INSERT INTO fee_transactions (student_fee_id, amount, payment_method, transaction_ref, received_by, remarks)
-    VALUES (
-      ${student_fee_id}, 
-      ${amount}, 
-      ${payment_method}, 
-      ${transaction_ref || null}, 
-      ${req.user?.internal_id || null}, 
-      ${remarks || null}
-    )
-    RETURNING *
-  `;
+  const validMethods = ['cash', 'card', 'upi', 'bank_transfer', 'cheque', 'online'];
+  if (!validMethods.includes(payment_method)) {
+    return res.status(400).json({ error: `payment_method must be one of: ${validMethods.join(', ')}` });
+  }
 
-  res.status(201).json({ message: 'Transaction recorded', transaction });
+  try {
+    const transaction = await processFeeTransaction({
+      student_fee_id,
+      amount,
+      payment_method,
+      transaction_ref,
+      remarks,
+      user: req.user
+    });
+    res.status(201).json({ message: 'Transaction recorded', transaction });
+  } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    throw error;
+  }
 }));
 
 /**
@@ -664,6 +808,73 @@ router.post('/adjust', requirePermission('fees.manage'), asyncHandler(async (req
   // We should also ideally store the reason somewhere.
 
   res.json({ message: 'Adjustment applied successfully', fee: updated });
+}));
+
+// ============== FEE REMINDERS ==============
+
+/**
+ * POST /fees/remind
+ * Send fee reminders to students with pending fees
+ */
+router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req, res) => {
+  const { target_group, class_id, message } = req.body;
+
+  if (!target_group || (target_group === 'class' && !class_id)) {
+    return res.status(400).json({ error: 'Valid target_group and class_id (if target is class) are required' });
+  }
+
+  // 1. Find students with pending fees
+  let students;
+  if (target_group === 'class') {
+    students = await sql`
+      SELECT DISTINCT s.id, s.person_id, p.display_name, u.id as user_id
+      FROM student_fees sf
+      JOIN students s ON sf.student_id = s.id
+      JOIN persons p ON s.person_id = p.id
+      JOIN student_enrollments se ON s.id = se.student_id AND se.status = 'active'
+      JOIN class_sections cs ON se.class_section_id = cs.id
+      JOIN users u ON u.person_id = p.id
+      WHERE sf.status IN ('pending', 'partial', 'overdue')
+        AND cs.class_id = ${class_id}
+        AND s.deleted_at IS NULL
+    `;
+  } else {
+    // All Pending
+    students = await sql`
+      SELECT DISTINCT s.id, s.person_id, p.display_name, u.id as user_id
+      FROM student_fees sf
+      JOIN students s ON sf.student_id = s.id
+      JOIN persons p ON s.person_id = p.id
+      JOIN users u ON u.person_id = p.id
+      WHERE sf.status IN ('pending', 'partial', 'overdue')
+        AND s.deleted_at IS NULL
+    `;
+  }
+
+  if (!students || students.length === 0) {
+    return res.json({ message: 'No students found with pending fees', count: 0 });
+  }
+
+  // 2. Send Notifications
+  try {
+    const userIds = [...new Set(students.map(s => s.user_id))];
+    const notificationMessage = message || "Your fee is pending. Please pay before the due date to avoid late fees.";
+
+    if (userIds.length > 0) {
+      await sendNotificationToUsers(
+        userIds,
+        'FEE_REMINDER',
+        { message: notificationMessage }
+      );
+    }
+
+    res.json({ message: 'Fee reminders queued', student_count: students.length });
+
+  } catch (err) {
+    console.error('[Notification] Failed to send fee reminders:', err);
+    // Return success to client as process was initiated, but log the error
+    res.json({ message: 'Identified students but failed to send notifications', error: err.message });
+  }
 }));
 
 export default router;

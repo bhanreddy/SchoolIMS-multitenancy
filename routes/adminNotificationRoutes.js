@@ -2,8 +2,8 @@ import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
-import { sendTemplatedNotification } from '../services/notificationService.js';
-import { NotificationTypes } from '../services/notificationTemplateService.js';
+import { sendNotificationToUsers } from '../services/notificationService.js';
+
 
 const router = express.Router();
 
@@ -176,38 +176,18 @@ async function processBatch(batchId, targetMap, month, adminId) {
                 const amountDue = parseFloat(dues.balance);
                 if (amountDue <= 0) return; // Skip if no dues (or handling "Upcoming"? Req says "Due for {{month}}")
 
-                const tokens = Array.from(student.tokens);
-                // Create user context for logging
-                const targetUsers = Array.from(student.parent_user_ids).map(uid => ({ id: uid, role: 'parent' }));
-                // Note: we're flattening tokens from potentially multiple parents. 
-                // logging needs to map token -> user. In this simplified batch, we pass all tokens. 
-                // Ideally we'd loop parents. But let's send multicast to all associated devices.
-                // For logging accuracy in `sendTemplatedNotification`, we need to match array lengths. 
-                // If we have mixed tokens from different users, the `targetUsers` array alignment in `notificationService` 
-                // might be tricky if we don't know which token belongs to whom.
-                // SAFETY: For this implementation, we will send separately per parent if needed, 
-                // OR typically we just send to list. 
-                // Let's iterate unique tokens and attempt to map them back? 
-                // For now, to suffice the logging requirement, we'll assume `sendTemplatedNotification` handles it.
-                // Actually, `notificationService` takes `targetUsers` array. 
-                // We should send individually per parent to ensure correct token-user mapping if we want strict logs.
-                // But for "Mass Send", grouping by student is efficient.
-                // Let's construct a target list of { token, user }.
+                const userIds = Array.from(student.parent_user_ids);
 
-                // Simpler: Just resolve tokens and send.
-                if (tokens.length > 0) {
-                    const response = await sendTemplatedNotification(
-                        tokens,
-                        NotificationTypes.FEES,
-                        { amount: amountDue.toFixed(2), month },
-                        // mapping user context is hard here without granular token ownership data.
-                        // We will pass empty targetUsers here and let the service skip strict per-user limits 
-                        // because we ALREADY checked batch rate limits.
-                        []
+                // Simpler: Just resolve users and send.
+                if (userIds.length > 0) {
+                    const response = await sendNotificationToUsers(
+                        userIds,
+                        'FEE_REMINDER',
+                        { message: `Fee Reminder: ₹${amountDue.toFixed(2)} due for ${month}.` }
                     );
 
-                    if (response.successCount > 0) sentCount += response.successCount;
-                    if (response.failureCount > 0) failureCount += response.failureCount;
+                    if (response && response.successCount > 0) sentCount += response.successCount;
+                    if (response && response.failureCount > 0) failureCount += response.failureCount;
                 }
 
             } catch (err) {

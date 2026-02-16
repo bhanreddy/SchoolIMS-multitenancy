@@ -2,6 +2,7 @@ import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { sendNotificationToUsers } from '../services/notificationService.js';
 
 const router = express.Router();
 
@@ -36,6 +37,11 @@ router.get('/', requirePermission('leaves.view'), asyncHandler(async (req, res) 
         ${leave_type ? sql`AND la.leave_type = ${leave_type}` : sql``}
         ${from_date ? sql`AND la.start_date >= ${from_date}` : sql``}
         ${to_date ? sql`AND la.end_date <= ${to_date}` : sql``}
+        ${req.query.role ? sql`AND EXISTS (
+          SELECT 1 FROM user_roles ur 
+          JOIN roles r ON ur.role_id = r.id 
+          WHERE ur.user_id = u.id AND r.code = ${req.query.role}
+        )` : sql``}
       ORDER BY la.created_at DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -123,6 +129,32 @@ router.post('/', requirePermission('leaves.apply'), asyncHandler(async (req, res
     RETURNING *
   `;
 
+  // Send Notification to Admins (Async)
+  (async () => {
+    try {
+      // Fetch Admin User IDs - assuming strict 'admin' role code or checking roles table
+      const admins = await sql`
+        SELECT u.id 
+        FROM users u
+        JOIN user_roles ur ON u.id = ur.user_id
+        JOIN roles r ON ur.role_id = r.id
+        WHERE r.code = 'admin' 
+          AND u.account_status = 'active'
+      `;
+
+      if (admins.length > 0) {
+        const adminIds = [...new Set(admins.map(a => a.id))];
+        await sendNotificationToUsers(
+          adminIds,
+          'LEAVE_SUBMITTED',
+          { message: 'New leave request submitted.' }
+        );
+      }
+    } catch (err) {
+      console.error('[Notification] Failed to trigger LEAVE_SUBMITTED:', err);
+    }
+  })();
+
   res.status(201).json({ message: 'Leave application submitted', leave });
 }));
 
@@ -158,6 +190,27 @@ router.put('/:id', asyncHandler(async (req, res) => {
       WHERE id = ${id}
       RETURNING *
     `;
+
+    // Send Notification to Applicant (Async)
+    (async () => {
+      try {
+        if (status && existing.status !== status) { // Only notify if status CHANGED
+          let eventType = null;
+          if (status === 'approved') eventType = 'LEAVE_APPROVED';
+          else if (status === 'rejected') eventType = 'LEAVE_REJECTED';
+
+          if (eventType) {
+            await sendNotificationToUsers(
+              [existing.applicant_id],
+              eventType,
+              { message: `Your leave application has been ${status}.` }
+            );
+          }
+        }
+      } catch (err) {
+        console.error(`[Notification] Failed to trigger LEAVE_${status.toUpperCase()}:`, err);
+      }
+    })();
 
     return res.json({ message: `Leave ${status}`, leave: updated });
   }

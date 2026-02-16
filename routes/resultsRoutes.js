@@ -281,6 +281,14 @@ router.post('/marks/upload', requirePermission('marks.enter'), asyncHandler(asyn
       continue;
     }
 
+    // Check if mark already exists to prevent duplicate notifications
+    const [existingMark] = await sql`
+        SELECT id FROM marks 
+        WHERE exam_subject_id = ${exam_subject_id} 
+          AND student_enrollment_id = ${student_enrollment_id}
+        LIMIT 1
+    `;
+
     try {
       // Upsert marks
       const [result] = await sql`
@@ -294,11 +302,79 @@ router.post('/marks/upload', requirePermission('marks.enter'), asyncHandler(asyn
           entered_by = EXCLUDED.entered_by
         RETURNING id
       `;
-      results.push({ student_enrollment_id, id: result.id, success: true });
+
+      // ONLY notify if this was a new insert (not an update)
+      const isNewInsert = !existingMark;
+
+      results.push({
+        student_enrollment_id,
+        id: result.id,
+        success: true,
+        isNew: isNewInsert
+      });
+
     } catch (err) {
       results.push({ student_enrollment_id, error: err.message });
     }
   }
+
+  // 3. Send Notification (Async)
+  (async () => {
+    try {
+      const { sendNotificationToUsers } = await import('../services/notificationService.js');
+
+      // a. Fetch Exam Status
+      const [exam] = await sql`
+        SELECT e.name, e.status
+        FROM exams e
+        JOIN exam_subjects es ON e.id = es.exam_id
+        WHERE es.id = ${exam_subject_id}
+      `;
+
+      if (!exam || exam.status !== 'published') return;
+
+      // b. Identify Affected Students (Only NEW inserts)
+      const successEnrollmentIds = results
+        .filter(r => r.success && r.isNew)
+        .map(r => r.student_enrollment_id);
+
+      if (successEnrollmentIds.length === 0) return;
+
+      // c. Resolve User IDs (Students & Parents)
+      const usersToNotify = await sql`
+        -- Student Users
+        SELECT u.id as user_id 
+        FROM users u
+        JOIN students s ON u.person_id = s.person_id
+        JOIN student_enrollments se ON s.id = se.student_id
+        WHERE se.id IN ${sql(successEnrollmentIds)}
+          AND u.account_status = 'active'
+        
+        UNION
+        
+        -- Parent Users
+        SELECT u.id as user_id
+        FROM users u
+        JOIN parents p ON u.person_id = p.person_id
+        JOIN student_parents sp ON p.id = sp.parent_id
+        JOIN students s ON sp.student_id = s.id
+        JOIN student_enrollments se ON s.id = se.student_id
+        WHERE se.id IN ${sql(successEnrollmentIds)}
+          AND u.account_status = 'active'
+      `;
+
+      const userIds = usersToNotify.map(u => u.user_id);
+
+      await sendNotificationToUsers(
+        userIds,
+        'RESULT_RELEASED',
+        { message: `Results for ${exam.name} are now available.` }
+      );
+
+    } catch (err) {
+      console.error('[Notification] Failed to trigger RESULT_RELEASED:', err);
+    }
+  })();
 
   res.json({ message: 'Marks uploaded', results });
 }));

@@ -2,6 +2,7 @@ import express from 'express';
 import { supabase } from '../db.js';
 import sql from '../db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { sendNotificationToUsers } from '../services/notificationService.js';
 
 const router = express.Router();
 
@@ -157,6 +158,15 @@ router.post('/', asyncHandler(async (req, res) => {
     }
   });
 
+  // Send Notification (Async)
+  (async () => {
+    try {
+      await notifyTimetableUpdate([class_section_id]);
+    } catch (err) {
+      console.error('[Notification] TIMETABLE_UPDATE failed:', err);
+    }
+  })();
+
   res.status(200).json({ message: 'Timetable updated successfully' });
 }));
 
@@ -295,6 +305,9 @@ router.put('/periods', asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Invalid payload: periods array required' });
   }
 
+  // Track updated periods for notification
+  const updatedPeriodNumbers = [];
+
   // Use a transaction for atomic updates
   await sql.begin(async sql => {
     for (const p of periods) {
@@ -322,12 +335,60 @@ router.put('/periods', asyncHandler(async (req, res) => {
                     end_time = ${p.end_time}
                 WHERE period_number = ${p.sort_order}
             `;
+          updatedPeriodNumbers.push(p.sort_order);
         }
       }
     }
   });
 
+  // Send Notification (Async)
+  (async () => {
+    if (updatedPeriodNumbers.length > 0) {
+      try {
+        const affected = await sql`
+          SELECT DISTINCT class_section_id 
+          FROM timetable_slots 
+          WHERE period_number IN ${sql(updatedPeriodNumbers)}
+        `;
+
+        if (affected.length > 0) {
+          const classSectionIds = affected.map(a => a.class_section_id);
+          await notifyTimetableUpdate(classSectionIds);
+        }
+      } catch (err) {
+        console.error('[Notification] TIMETABLE_UPDATE (Periods) failed:', err);
+      }
+    }
+  })();
+
   res.json({ message: 'Periods updated successfully' });
 }));
+
+// Helper to notify students of timetable updates
+async function notifyTimetableUpdate(classSectionIds) {
+  if (!classSectionIds || classSectionIds.length === 0) return;
+
+  // Deduplicate IDs just in case
+  const uniqueIds = [...new Set(classSectionIds)];
+
+  const recipients = await sql`
+    SELECT DISTINCT u.id
+    FROM users u
+    JOIN students s ON u.person_id = s.person_id
+    JOIN student_enrollments se ON s.id = se.student_id
+    WHERE se.class_section_id IN ${sql(uniqueIds)}
+      AND se.status = 'active'
+      AND u.account_status = 'active'
+  `;
+
+  if (recipients.length > 0) {
+    const userIds = recipients.map(r => r.id);
+    await sendNotificationToUsers(
+      userIds,
+      'TIMETABLE_UPDATED',
+      { message: 'Your class timetable has been updated.' }
+    );
+  }
+}
 
 export default router;

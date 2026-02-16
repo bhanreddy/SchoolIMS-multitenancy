@@ -2,6 +2,7 @@ import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { sendNotificationToUsers } from '../services/notificationService.js';
 
 const router = express.Router();
 
@@ -139,6 +140,44 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
             ${homework_due_date}, ${attachments ? JSON.stringify(attachments) : null}, ${req.user.internal_id})
     RETURNING *
   `;
+
+  // Notification: DIARY_UPDATED (Students in class section)
+  (async () => {
+    try {
+      const recipients = await sql`
+        SELECT DISTINCT u.id
+        FROM users u
+        JOIN students s ON u.person_id = s.person_id
+        JOIN student_enrollments se ON s.id = se.student_id
+        WHERE se.class_section_id = ${class_section_id}
+          AND se.status = 'active'
+          AND u.account_status = 'active'
+        
+        UNION
+        
+        SELECT DISTINCT u.id
+        FROM users u
+        JOIN parents p ON u.person_id = p.person_id
+        JOIN student_parents sp ON p.id = sp.parent_id
+        JOIN students s ON sp.student_id = s.id
+        JOIN student_enrollments se ON s.id = se.student_id
+        WHERE se.class_section_id = ${class_section_id}
+          AND se.status = 'active'
+          AND u.account_status = 'active'
+      `;
+
+      if (recipients.length > 0) {
+        const userIds = recipients.map(r => r.id);
+        await sendNotificationToUsers(
+          userIds,
+          'DIARY_UPDATED',
+          { message: title || 'New diary entry posted.' }
+        );
+      }
+    } catch (err) {
+      console.error('[Notification] Failed to trigger DIARY_UPDATED:', err);
+    }
+  })();
 
   res.status(201).json({ message: 'Diary entry created', entry });
 }));

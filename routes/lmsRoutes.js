@@ -2,6 +2,7 @@ import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { sendNotificationToUsers } from '../services/notificationService.js';
 
 const router = express.Router();
 
@@ -192,7 +193,7 @@ router.put('/:id', requirePermission('lms.create'), asyncHandler(async (req, res
  */
 router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { title, description, material_type, content_url, file_size, duration, sort_order } = req.body;
+  const { title, description, material_type, content_url, file_size, duration, sort_order, is_published } = req.body;
 
   if (!title || !material_type) {
     return res.status(400).json({ error: 'title and material_type are required' });
@@ -212,12 +213,49 @@ router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHand
   const safeContentUrl = content_url || '';
   const safeFileSize = file_size ?? null; // Default to null if undefined
   const safeDuration = duration ?? null;   // Default to null if undefined
+  const safeIsPublished = is_published === true; // Default to false if undefined or not true
 
   const [material] = await sql`
-    INSERT INTO lms_materials (course_id, title, description, material_type, content_url, file_size, duration, sort_order)
-    VALUES (${id}, ${safeTitle}, ${safeDescription}, ${material_type}, ${safeContentUrl}, ${safeFileSize}, ${safeDuration}, ${sort_order || 0})
+    INSERT INTO lms_materials (course_id, title, description, material_type, content_url, file_size, duration, sort_order, is_published)
+    VALUES (${id}, ${safeTitle}, ${safeDescription}, ${material_type}, ${safeContentUrl}, ${safeFileSize}, ${safeDuration}, ${sort_order || 0}, ${safeIsPublished})
     RETURNING *
   `;
+
+  // Notification Logic (Async)
+  (async () => {
+    try {
+      // Only notify if published
+      if (!safeIsPublished) return;
+
+      // Fetch Course Class ID
+      const [courseInfo] = await sql`SELECT class_id FROM lms_courses WHERE id = ${id}`;
+      const targetClassId = courseInfo?.class_id;
+
+      if (!targetClassId) return;
+
+      const recipients = await sql`
+        SELECT DISTINCT u.id
+        FROM users u
+        JOIN students s ON u.person_id = s.person_id
+        JOIN student_enrollments se ON s.id = se.student_id
+        JOIN class_sections cs ON se.class_section_id = cs.id
+        WHERE cs.class_id = ${targetClassId}
+          AND se.status = 'active'
+          AND u.account_status = 'active'
+      `;
+
+      if (recipients.length > 0) {
+        const userIds = recipients.map(r => r.id);
+        await sendNotificationToUsers(
+          userIds,
+          'LMS_CONTENT',
+          { message: `New study material uploaded: ${safeTitle}` }
+        );
+      }
+    } catch (notifyErr) {
+      console.error('[Notification] LMS_CONTENT failed:', notifyErr);
+    }
+  })();
 
   res.status(201).json({ message: 'Material added', material });
 }));

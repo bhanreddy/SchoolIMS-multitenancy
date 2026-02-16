@@ -4,7 +4,7 @@
 -- Use schema.sql instead.
 
 -- ============================================================
--- TIMETABLE & PROMOTION LOGIC (Antigravity Output)
+-- TIMETABLE & PROMOTION LOGIC (  Output)
 -- ============================================================
 
 -- 1. TIMETABLE VALIDATION

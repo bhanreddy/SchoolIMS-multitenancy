@@ -151,6 +151,40 @@ router.post('/', requirePermission('complaints.create'), asyncHandler(async (req
     RETURNING *
   `;
 
+  // Send Notification to Student + Parents (Async)
+  (async () => {
+    try {
+      const { sendNotificationToUsers } = await import('../services/notificationService.js');
+
+      const recipients = await sql`
+        SELECT u.id as user_id
+        FROM users u
+        JOIN parents p ON u.person_id = p.person_id
+        JOIN student_parents sp ON p.id = sp.parent_id
+        WHERE sp.student_id = ${raised_for_student_id}
+          AND u.account_status = 'active'
+        UNION
+        SELECT u.id as user_id
+        FROM users u
+        JOIN students s ON u.person_id = s.person_id
+        WHERE s.id = ${raised_for_student_id}
+          AND u.account_status = 'active'
+      `;
+
+      if (recipients.length > 0) {
+        const userIds = recipients.map(r => r.user_id);
+
+        await sendNotificationToUsers(
+          userIds,
+          'COMPLAINT_CREATED',
+          { message: title }
+        );
+      }
+    } catch (err) {
+      console.error('[Notification] Failed to trigger COMPLAINT_CREATED:', err);
+    }
+  })();
+
   res.status(201).json({ message: 'Complaint submitted', complaint });
 }));
 
@@ -199,6 +233,38 @@ router.put('/:id', asyncHandler(async (req, res) => {
     WHERE id = ${id}
     RETURNING *
   `;
+
+  // Send COMPLAINT_RESPONSE notification to student + parents when resolved/closed
+  if (status === 'resolved' || status === 'closed') {
+    (async () => {
+      try {
+        const { sendNotificationToUsers } = await import('../services/notificationService.js');
+
+        const recipients = await sql`
+          SELECT u.id as user_id FROM users u
+          JOIN students s ON u.person_id = s.person_id
+          WHERE s.id = ${updated.raised_for_student_id}
+            AND u.account_status = 'active'
+          UNION
+          SELECT u.id as user_id FROM users u
+          JOIN parents p ON u.person_id = p.person_id
+          JOIN student_parents sp ON p.id = sp.parent_id
+          WHERE sp.student_id = ${updated.raised_for_student_id}
+            AND u.account_status = 'active'
+        `;
+
+        if (recipients.length > 0) {
+          await sendNotificationToUsers(
+            recipients.map(r => r.user_id),
+            'COMPLAINT_RESPONSE',
+            { message: `Complaint "${updated.title}" has been ${status}.` }
+          );
+        }
+      } catch (err) {
+        console.error('[Notification] COMPLAINT_RESPONSE failed:', err);
+      }
+    })();
+  }
 
   res.json({ message: 'Complaint updated', complaint: updated });
 }));

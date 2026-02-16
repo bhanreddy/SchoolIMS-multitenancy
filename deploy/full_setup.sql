@@ -1277,7 +1277,7 @@ ADD CONSTRAINT chk_no_negative_paid CHECK (amount_paid >= 0);
 -- Already in schema, just ensuring it exists
 -- ALTER TABLE student_fees ADD CONSTRAINT chk_paid_not_exceed ...
 -- ============================================================
--- TIMETABLE & PROMOTION LOGIC (Antigravity Output)
+-- TIMETABLE & PROMOTION LOGIC (  Output)
 -- ============================================================
 
 -- 1. TIMETABLE VALIDATION
