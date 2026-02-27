@@ -85,6 +85,11 @@ router.post('/structure', requirePermission('fees.manage'), asyncHandler(async (
     return res.status(400).json({ error: 'academic_year_id, class_id, fee_type_id, and amount are required' });
   }
 
+  // Fix 6: Validate positive amount server-side (DB also has CHECK constraint)
+  if (Number(amount) <= 0) {
+    return res.status(400).json({ error: 'amount must be a positive number' });
+  }
+
   const [structure] = await sql`
     INSERT INTO fee_structures (academic_year_id, class_id, fee_type_id, amount, due_date, frequency)
     VALUES (${academic_year_id}, ${class_id}, ${fee_type_id}, ${amount}, ${due_date}, ${frequency || 'monthly'})
@@ -172,7 +177,7 @@ router.get('/students/:studentId', requirePermission('fees.view'), asyncHandler(
     `;
   }
 
-  // Calculate summary
+  // Calculate summary (Fix 5: filter deleted_at IS NULL for deterministic analytics)
   const summary = await sql`
     SELECT 
       COALESCE(SUM(amount_due - discount), 0) as total_due,
@@ -180,6 +185,7 @@ router.get('/students/:studentId', requirePermission('fees.view'), asyncHandler(
       COALESCE(SUM(amount_due - discount - amount_paid), 0) as balance
     FROM student_fees
     WHERE student_id = ${studentId}
+      AND deleted_at IS NULL
   `;
 
   res.json({
@@ -277,6 +283,13 @@ async function processFeeTransaction({ student_fee_id, amount, payment_method, t
     throw err;
   }
 
+  // Fix 3: Mandatory idempotency key
+  if (!transaction_ref) {
+    const err = new Error('transaction_ref is required. Generate a UUID for cash payments.');
+    err.status = 400;
+    throw err;
+  }
+
   // Execute in a transaction to prevent race conditions
   const { transaction, fee } = await sql.begin(async (tx) => {
     // Idempotency Check: Prevent duplicate transaction refs
@@ -327,18 +340,20 @@ async function processFeeTransaction({ student_fee_id, amount, payment_method, t
     `;
 
     // Update parent fee record (Ledger Consistency)
-    // We update amount_paid and recalculate status
+    // REMOVED: Redundant update. Trigger `trg_update_paid_on_transaction` handles this automatically.
+    /*
     await tx`
       UPDATE student_fees
       SET 
         amount_paid = amount_paid + ${parsedAmount},
         updated_at = NOW(),
         status = CASE 
-          WHEN (amount_paid + ${parsedAmount}) >= (amount_due - discount) THEN 'paid'
-          ELSE 'partial'
+          WHEN (amount_paid + ${parsedAmount}) >= (amount_due - discount) THEN 'paid'::fee_status_enum
+          ELSE 'partial'::fee_status_enum
         END
       WHERE id = ${student_fee_id}
     `;
+    */
 
     return { transaction, fee };
   });
@@ -478,8 +493,11 @@ router.get('/receipts', requirePermission('fees.view'), asyncHandler(async (req,
     receipts = await sql`
       SELECT 
         r.id, r.receipt_no, r.total_amount, r.issued_at, r.remarks,
-        issuer.display_name as issued_by
+        s.admission_no, p.display_name as student_name,
+        issuer.display_name as issued_by_name
       FROM receipts r
+      JOIN students s ON r.student_id = s.id
+      JOIN persons p ON s.person_id = p.id
       LEFT JOIN users u ON r.issued_by = u.id
       LEFT JOIN persons issuer ON u.person_id = issuer.id
       WHERE r.student_id = ${student_id}
@@ -581,39 +599,7 @@ router.get('/transactions', requirePermission('fees.view'), asyncHandler(async (
   res.json(transactions);
 }));
 
-/**
- * POST /fees/transactions
- * Record a transaction (alternative to /collect)
- */
-router.post('/transactions', requirePermission('fees.collect'), asyncHandler(async (req, res) => {
-  const { student_fee_id, amount, payment_method, transaction_ref, remarks } = req.body;
-
-  if (!student_fee_id || !amount || !payment_method) {
-    return res.status(400).json({ error: 'student_fee_id, amount, and payment_method are required' });
-  }
-
-  const validMethods = ['cash', 'card', 'upi', 'bank_transfer', 'cheque', 'online'];
-  if (!validMethods.includes(payment_method)) {
-    return res.status(400).json({ error: `payment_method must be one of: ${validMethods.join(', ')}` });
-  }
-
-  try {
-    const transaction = await processFeeTransaction({
-      student_fee_id,
-      amount,
-      payment_method,
-      transaction_ref,
-      remarks,
-      user: req.user
-    });
-    res.status(201).json({ message: 'Transaction recorded', transaction });
-  } catch (error) {
-    if (error.status) {
-      return res.status(error.status).json({ error: error.message });
-    }
-    throw error;
-  }
-}));
+// (Fix 7: Duplicate POST /transactions route removed — single handler at L236)
 
 /**
  * GET /fees/collection-summary
@@ -694,83 +680,85 @@ router.get('/collection-summary', requirePermission('fees.view'), asyncHandler(a
  * GET /fees/dashboard-stats
  * Get consolidated stats for dashboard
  */
-router.get('/dashboard-stats', asyncHandler(async (req, res) => {
+// Fix 4: Protected with requirePermission
+router.get('/dashboard-stats', requirePermission('fees.view'), asyncHandler(async (req, res) => {
   console.log(`[DASHBOARD-STATS] Request received. User: ${req.user?.id || 'none'}`);
 
-  try {
-    // 1. Today's Collection
-    const todayStats = await sql`
-        SELECT COALESCE(SUM(amount), 0) as total
-        FROM fee_transactions
-        WHERE paid_at::date = CURRENT_DATE
-    `;
+  // 1. Today's Collection
+  const todayStats = await sql`
+      SELECT COALESCE(SUM(amount), 0) as total
+      FROM fee_transactions
+      WHERE paid_at::date = CURRENT_DATE
+  `;
 
-    // 2. Monthly Collection
-    const monthlyStats = await sql`
-        SELECT COALESCE(SUM(amount), 0) as total
-        FROM fee_transactions
-        WHERE date_trunc('month', paid_at) = date_trunc('month', CURRENT_DATE)
-    `;
+  // 2. Monthly Collection
+  const monthlyStats = await sql`
+      SELECT COALESCE(SUM(amount), 0) as total
+      FROM fee_transactions
+      WHERE date_trunc('month', paid_at) = date_trunc('month', CURRENT_DATE)
+  `;
 
-    // 3. Pending Dues (Total Outstanding)
-    const pendingStats = await sql`
-        SELECT COALESCE(SUM(amount_due - amount_paid - discount), 0) as total
-        FROM student_fees
-        WHERE status IN ('pending', 'partial', 'overdue')
-    `;
+  // 3. Pending Dues (Total Outstanding)
+  const pendingStats = await sql`
+      SELECT COALESCE(SUM(amount_due - amount_paid - discount), 0) as total
+      FROM student_fees
+      WHERE status IN ('pending', 'partial', 'overdue')
+        AND deleted_at IS NULL
+  `;
 
-    // 4. Recent Transactions (Last 5)
-    // We wrap this in a try-catch to avoid failing the whole route if join fails
-    let recentTransactions = [];
-    try {
-      recentTransactions = await sql`
-          SELECT 
-              ft.id,
-              ft.amount,
-              ft.paid_at as collected_at,
-              ft.payment_method,
-              p.display_name as student_name,
-              c.name as class_name,
-              ftype.name as fee_type
-          FROM fee_transactions ft
-          JOIN student_fees sf ON ft.student_fee_id = sf.id
-          JOIN students s ON sf.student_id = s.id
-          JOIN persons p ON s.person_id = p.id
-          LEFT JOIN fee_structures fs ON sf.fee_structure_id = fs.id
-          LEFT JOIN classes c ON fs.class_id = c.id
-          LEFT JOIN fee_types ftype ON fs.fee_type_id = ftype.id
-          ORDER BY ft.paid_at DESC
-          LIMIT 5
-      `;
-    } catch (err) {
-      console.error('[DASHBOARD-STATS] Recent transactions fetch failed:', err);
-    }
+  // 4. Defaulters Count
+  const defaulterCount = await sql`
+      SELECT COUNT(DISTINCT student_id) as count
+      FROM student_fees
+      WHERE status IN ('pending', 'partial', 'overdue')
+        AND due_date < CURRENT_DATE
+        AND deleted_at IS NULL
+  `;
 
-    const result = {
-      today_collection: Number(todayStats[0]?.total || 0),
-      monthly_collection: Number(monthlyStats[0]?.total || 0),
-      pending_dues: Number(pendingStats[0]?.total || 0),
-      recent_transactions: recentTransactions || []
-    };
+  // 5. Total Collected (all time or academic year)
+  const totalCollected = await sql`
+      SELECT COALESCE(SUM(amount), 0) as total
+      FROM fee_transactions
+  `;
 
-    console.log('[DASHBOARD-STATS] Calculated stats:', JSON.stringify({
-      today: result.today_collection,
-      monthly: result.monthly_collection,
-      pending: result.pending_dues,
-      recent: result.recent_transactions.length
-    }));
+  // 6. Recent Transactions (Last 5) — Fix 4: no error swallowing
+  const recentTransactions = await sql`
+      SELECT 
+          ft.id,
+          ft.amount,
+          ft.paid_at as collected_at,
+          ft.payment_method,
+          p.display_name as student_name,
+          c.name as class_name,
+          ftype.name as fee_type
+      FROM fee_transactions ft
+      JOIN student_fees sf ON ft.student_fee_id = sf.id
+      JOIN students s ON sf.student_id = s.id
+      JOIN persons p ON s.person_id = p.id
+      LEFT JOIN fee_structures fs ON sf.fee_structure_id = fs.id
+      LEFT JOIN classes c ON fs.class_id = c.id
+      LEFT JOIN fee_types ftype ON fs.fee_type_id = ftype.id
+      ORDER BY ft.paid_at DESC
+      LIMIT 5
+  `;
 
-    res.json(result);
-  } catch (err) {
-    console.error('[DASHBOARD-STATS] Global error:', err);
-    res.status(500).json({ error: 'Failed to fetch dashboard stats', details: err.message });
-  }
+  const result = {
+    today_collection: Number(todayStats[0]?.total || 0),
+    monthly_collection: Number(monthlyStats[0]?.total || 0),
+    collected_total: Number(totalCollected[0]?.total || 0),
+    pending_dues: Number(pendingStats[0]?.total || 0),
+    defaulter_count: Number(defaulterCount[0]?.count || 0),
+    recent_transactions: recentTransactions || []
+  };
+
+  res.json(result);
 }));
 
 /**
  * POST /fees/adjust
  * Apply an adjustment (waiver/discount) to a student fee
  */
+// Fix 1: Atomic /adjust with transaction + row lock
 router.post('/adjust', requirePermission('fees.manage'), asyncHandler(async (req, res) => {
   const { student_fee_id, amount, reason } = req.body;
 
@@ -778,34 +766,44 @@ router.post('/adjust', requirePermission('fees.manage'), asyncHandler(async (req
     return res.status(400).json({ error: 'student_fee_id, amount, and reason are required' });
   }
 
-  // Check if fee exists
-  const [fee] = await sql`
-    SELECT id, amount_due, amount_paid, discount 
-    FROM student_fees WHERE id = ${student_fee_id}
-  `;
-
-  if (!fee) {
-    return res.status(404).json({ error: 'Student fee not found' });
+  const parsedAmount = Number(amount);
+  if (isNaN(parsedAmount) || parsedAmount <= 0) {
+    return res.status(400).json({ error: 'amount must be a positive number' });
   }
 
-  // Validate that discount doesn't exceed amount due
-  const newTotalDiscount = Number(fee.discount) + Number(amount);
-  if (newTotalDiscount > Number(fee.amount_due)) {
-    return res.status(400).json({ error: 'Total discount cannot exceed the amount due' });
-  }
+  const updated = await sql.begin(async (tx) => {
+    // Lock the row to prevent concurrent discount race
+    const [fee] = await tx`
+      SELECT id, amount_due, amount_paid, discount
+      FROM student_fees
+      WHERE id = ${student_fee_id}
+      FOR UPDATE
+    `;
 
-  // Update discount (trigger will update status)
-  const [updated] = await sql`
-    UPDATE student_fees
-    SET discount = discount + ${amount},
-        updated_at = NOW()
-    WHERE id = ${student_fee_id}
-    RETURNING *
-  `;
+    if (!fee) {
+      const err = new Error('Student fee not found');
+      err.status = 404;
+      throw err;
+    }
 
-  // Log the adjustment in a new audit log or remarks of a virtual transaction?
-  // For now, let's assume we might want to record this in an audit log later.
-  // We should also ideally store the reason somewhere.
+    // Validate using locked (fresh) values
+    const newTotalDiscount = Number(fee.discount) + parsedAmount;
+    if (newTotalDiscount > Number(fee.amount_due)) {
+      const err = new Error(`Total discount (${newTotalDiscount}) cannot exceed amount due (${fee.amount_due})`);
+      err.status = 400;
+      throw err;
+    }
+
+    const [result] = await tx`
+      UPDATE student_fees
+      SET discount = discount + ${parsedAmount},
+          updated_at = NOW()
+      WHERE id = ${student_fee_id}
+      RETURNING *
+    `;
+
+    return result;
+  });
 
   res.json({ message: 'Adjustment applied successfully', fee: updated });
 }));
@@ -855,9 +853,25 @@ router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req
     return res.json({ message: 'No students found with pending fees', count: 0 });
   }
 
-  // 2. Send Notifications
+  // 2. Also fetch parent user IDs for the same students
+  const studentIds = [...new Set(students.map(s => s.id))];
+  let parentUserIds = [];
+  if (studentIds.length > 0) {
+    const parentUsers = await sql`
+      SELECT DISTINCT u.id as user_id
+      FROM users u
+      JOIN parents p ON u.person_id = p.person_id
+      JOIN student_parents sp ON p.id = sp.parent_id
+      WHERE sp.student_id IN ${sql(studentIds)}
+        AND u.account_status = 'active'
+    `;
+    parentUserIds = parentUsers.map(p => p.user_id);
+  }
+
+  // 3. Send Notifications (Students + Parents)
   try {
-    const userIds = [...new Set(students.map(s => s.user_id))];
+    const studentUserIds = students.map(s => s.user_id);
+    const userIds = [...new Set([...studentUserIds, ...parentUserIds])];
     const notificationMessage = message || "Your fee is pending. Please pay before the due date to avoid late fees.";
 
     if (userIds.length > 0) {

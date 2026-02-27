@@ -12,7 +12,7 @@ const router = express.Router();
  * List all hostel blocks
  */
 router.get('/blocks', requirePermission('hostel.view'), asyncHandler(async (req, res) => {
-    const blocks = await sql`
+  const blocks = await sql`
     SELECT 
       hb.id, hb.name, hb.code, hb.total_rooms, hb.is_active,
       g.name as gender,
@@ -30,7 +30,7 @@ router.get('/blocks', requirePermission('hostel.view'), asyncHandler(async (req,
     ORDER BY hb.name
   `;
 
-    res.json(blocks);
+  res.json(blocks);
 }));
 
 /**
@@ -38,19 +38,19 @@ router.get('/blocks', requirePermission('hostel.view'), asyncHandler(async (req,
  * Create hostel block
  */
 router.post('/blocks', requirePermission('hostel.manage'), asyncHandler(async (req, res) => {
-    const { name, code, gender_id, warden_id } = req.body;
+  const { name, code, gender_id, warden_id } = req.body;
 
-    if (!name) {
-        return res.status(400).json({ error: 'Block name is required' });
-    }
+  if (!name) {
+    return res.status(400).json({ error: 'Block name is required' });
+  }
 
-    const [block] = await sql`
+  const [block] = await sql`
     INSERT INTO hostel_blocks (name, code, gender_id, warden_id)
     VALUES (${name}, ${code}, ${gender_id}, ${warden_id})
     RETURNING *
   `;
 
-    res.status(201).json({ message: 'Block created', block });
+  res.status(201).json({ message: 'Block created', block });
 }));
 
 // ============== ROOMS ==============
@@ -60,13 +60,13 @@ router.post('/blocks', requirePermission('hostel.manage'), asyncHandler(async (r
  * List rooms (filter by block)
  */
 router.get('/rooms', requirePermission('hostel.view'), asyncHandler(async (req, res) => {
-    const { block_id, available_only } = req.query;
+  const { block_id, available_only } = req.query;
 
-    if (!block_id) {
-        return res.status(400).json({ error: 'block_id is required' });
-    }
+  if (!block_id) {
+    return res.status(400).json({ error: 'block_id is required' });
+  }
 
-    const rooms = await sql`
+  const rooms = await sql`
     SELECT 
       hr.id, hr.room_no, hr.floor, hr.capacity, hr.room_type, hr.monthly_fee, hr.is_available,
       COUNT(ha.id) FILTER (WHERE ha.is_active = true) as occupied_beds
@@ -78,7 +78,7 @@ router.get('/rooms', requirePermission('hostel.view'), asyncHandler(async (req, 
     ORDER BY hr.floor, hr.room_no
   `;
 
-    res.json(rooms);
+  res.json(rooms);
 }));
 
 /**
@@ -86,22 +86,22 @@ router.get('/rooms', requirePermission('hostel.view'), asyncHandler(async (req, 
  * Add room to block
  */
 router.post('/rooms', requirePermission('hostel.manage'), asyncHandler(async (req, res) => {
-    const { block_id, room_no, floor, capacity, room_type, monthly_fee } = req.body;
+  const { block_id, room_no, floor, capacity, room_type, monthly_fee } = req.body;
 
-    if (!block_id || !room_no) {
-        return res.status(400).json({ error: 'block_id and room_no are required' });
-    }
+  if (!block_id || !room_no) {
+    return res.status(400).json({ error: 'block_id and room_no are required' });
+  }
 
-    const [room] = await sql`
+  const [room] = await sql`
     INSERT INTO hostel_rooms (block_id, room_no, floor, capacity, room_type, monthly_fee)
     VALUES (${block_id}, ${room_no}, ${floor}, ${capacity || 2}, ${room_type || 'shared'}, ${monthly_fee})
     RETURNING *
   `;
 
-    // Update block total_rooms
-    await sql`UPDATE hostel_blocks SET total_rooms = (SELECT COUNT(*) FROM hostel_rooms WHERE block_id = ${block_id}) WHERE id = ${block_id}`;
+  // Update block total_rooms
+  await sql`UPDATE hostel_blocks SET total_rooms = (SELECT COUNT(*) FROM hostel_rooms WHERE block_id = ${block_id}) WHERE id = ${block_id}`;
 
-    res.status(201).json({ message: 'Room added', room });
+  res.status(201).json({ message: 'Room added', room });
 }));
 
 /**
@@ -109,20 +109,20 @@ router.post('/rooms', requirePermission('hostel.manage'), asyncHandler(async (re
  * Get room details with occupants
  */
 router.get('/rooms/:id', requirePermission('hostel.view'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    const [room] = await sql`
+  const [room] = await sql`
     SELECT hr.*, hb.name as block_name
     FROM hostel_rooms hr
     JOIN hostel_blocks hb ON hr.block_id = hb.id
     WHERE hr.id = ${id}
   `;
 
-    if (!room) {
-        return res.status(404).json({ error: 'Room not found' });
-    }
+  if (!room) {
+    return res.status(404).json({ error: 'Room not found' });
+  }
 
-    const occupants = await sql`
+  const occupants = await sql`
     SELECT 
       ha.bed_no, ha.allocated_at,
       s.id as student_id, s.admission_no,
@@ -134,7 +134,7 @@ router.get('/rooms/:id', requirePermission('hostel.view'), asyncHandler(async (r
     ORDER BY ha.bed_no
   `;
 
-    res.json({ ...room, occupants });
+  res.json({ ...room, occupants });
 }));
 
 // ============== ALLOCATIONS ==============
@@ -144,10 +144,10 @@ router.get('/rooms/:id', requirePermission('hostel.view'), asyncHandler(async (r
  * List allocations
  */
 router.get('/allocations', requirePermission('hostel.view'), asyncHandler(async (req, res) => {
-    const { block_id, academic_year_id, page = 1, limit = 50 } = req.query;
-    const offset = (page - 1) * limit;
+  const { block_id, academic_year_id, page = 1, limit = 50 } = req.query;
+  const offset = (page - 1) * limit;
 
-    const allocations = await sql`
+  const allocations = await sql`
     SELECT 
       ha.id, ha.bed_no, ha.allocated_at, ha.is_active,
       s.id as student_id, s.admission_no,
@@ -165,7 +165,7 @@ router.get('/allocations', requirePermission('hostel.view'), asyncHandler(async 
     LIMIT ${limit} OFFSET ${offset}
   `;
 
-    res.json(allocations);
+  res.json(allocations);
 }));
 
 /**
@@ -173,21 +173,21 @@ router.get('/allocations', requirePermission('hostel.view'), asyncHandler(async 
  * Allocate student to room
  */
 router.post('/allocations', requirePermission('hostel.manage'), asyncHandler(async (req, res) => {
-    const { student_id, room_id, academic_year_id, bed_no } = req.body;
+  const { student_id, room_id, academic_year_id, bed_no } = req.body;
 
-    if (!student_id || !room_id || !academic_year_id) {
-        return res.status(400).json({ error: 'student_id, room_id, and academic_year_id are required' });
-    }
+  if (!student_id || !room_id || !academic_year_id) {
+    return res.status(400).json({ error: 'student_id, room_id, and academic_year_id are required' });
+  }
 
-    // Check room capacity
-    const [room] = await sql`SELECT capacity FROM hostel_rooms WHERE id = ${room_id}`;
-    const [occupancy] = await sql`SELECT COUNT(*) as count FROM hostel_allocations WHERE room_id = ${room_id} AND is_active = true`;
+  // Check room capacity
+  const [room] = await sql`SELECT capacity FROM hostel_rooms WHERE id = ${room_id}`;
+  const [occupancy] = await sql`SELECT COUNT(*) as count FROM hostel_allocations WHERE room_id = ${room_id} AND is_active = true`;
 
-    if (occupancy.count >= room.capacity) {
-        return res.status(400).json({ error: 'Room is at full capacity' });
-    }
+  if (occupancy.count >= room.capacity) {
+    return res.status(400).json({ error: 'Room is at full capacity' });
+  }
 
-    const [allocation] = await sql`
+  const [allocation] = await sql`
     INSERT INTO hostel_allocations (student_id, room_id, academic_year_id, bed_no)
     VALUES (${student_id}, ${room_id}, ${academic_year_id}, ${bed_no})
     ON CONFLICT (student_id, academic_year_id) 
@@ -195,7 +195,7 @@ router.post('/allocations', requirePermission('hostel.manage'), asyncHandler(asy
     RETURNING *
   `;
 
-    res.status(201).json({ message: 'Student allocated', allocation });
+  res.status(201).json({ message: 'Student allocated', allocation });
 }));
 
 /**
@@ -203,20 +203,20 @@ router.post('/allocations', requirePermission('hostel.manage'), asyncHandler(asy
  * Vacate allocation
  */
 router.delete('/allocations/:id', requirePermission('hostel.manage'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    const [updated] = await sql`
+  const [updated] = await sql`
     UPDATE hostel_allocations
     SET is_active = false, vacated_at = NOW()
     WHERE id = ${id}
     RETURNING id
   `;
 
-    if (!updated) {
-        return res.status(404).json({ error: 'Allocation not found' });
-    }
+  if (!updated) {
+    return res.status(404).json({ error: 'Allocation not found' });
+  }
 
-    res.json({ message: 'Student vacated' });
+  res.json({ message: 'Student vacated' });
 }));
 
 /**
@@ -224,9 +224,9 @@ router.delete('/allocations/:id', requirePermission('hostel.manage'), asyncHandl
  * Get student's hostel allocation
  */
 router.get('/students/:studentId', requirePermission('hostel.view'), asyncHandler(async (req, res) => {
-    const { studentId } = req.params;
+  const { studentId } = req.params;
 
-    const [allocation] = await sql`
+  const [allocation] = await sql`
     SELECT 
       ha.id, ha.bed_no, ha.allocated_at, ha.is_active,
       hr.room_no, hr.room_type, hr.monthly_fee,
@@ -237,7 +237,7 @@ router.get('/students/:studentId', requirePermission('hostel.view'), asyncHandle
     WHERE ha.student_id = ${studentId} AND ha.is_active = true
   `;
 
-    res.json(allocation || { message: 'No hostel allocation' });
+  res.json(allocation || { message: 'No hostel allocation' });
 }));
 
 export default router;

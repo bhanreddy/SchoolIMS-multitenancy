@@ -1,11 +1,10 @@
 import express from 'express';
-import fs from 'fs';
+import fs from 'fs'; // Trigger Restart 2
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const debugLogPath = path.join(__dirname, 'server_debug.log');
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
@@ -19,15 +18,6 @@ import sql from './db.js';
 
 const app = express();
 const port = config.port;
-
-// Debug Logger (Top-most for visibility)
-app.use((req, res, next) => {
-  const logMsg = `[${new Date().toISOString()}] [REQUEST] ${req.method} ${req.url} - Auth: ${req.headers.authorization ? 'Present' : 'None'}\n`;
-  try {
-    fs.appendFileSync(debugLogPath, logMsg);
-  } catch (err) { }
-  next();
-});
 
 // Security Middleware
 app.set('trust proxy', 1);
@@ -59,14 +49,6 @@ app.use(express.json());
 
 // Auth & Audit Middleware (Global)
 app.use(identifyUser);
-app.use((req, res, next) => {
-  const logMsg = `[${new Date().toISOString()}] [USER_IDENTIFIED] ${req.method} ${req.url} - UserID: ${req.user?.id || 'none'} - PersonID: ${req.user?.person_id || 'none'}\n`;
-  console.log(logMsg.trim());
-  try {
-    fs.appendFileSync(debugLogPath, logMsg);
-  } catch (err) { }
-  next();
-});
 app.use(auditLogger);
 
 // Import routes
@@ -96,6 +78,8 @@ import adminNotificationRoutes from './routes/adminNotificationRoutes.js';
 import invoicesRouter from './routes/invoicesRoutes.js';
 import expensesRouter from './routes/expensesRoutes.js';
 import payrollRouter from './routes/payrollRoutes.js';
+import logRouter from './routes/logRoutes.js';
+import schoolSettingsRouter from './routes/schoolSettingsRoutes.js';
 
 // Health check endpoint
 app.get('/api/v1/health', async (req, res) => {
@@ -121,7 +105,7 @@ app.get('/api/v1/health', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     message: 'School Management System API',
-    version: '1.0.0',
+    version: '2.0.0',
     endpoints: {
       auth: '/api/v1/auth',
       admin: '/api/v1/admin',
@@ -173,6 +157,8 @@ app.use('/api/v1/admin/notifications', adminNotificationRoutes);
 app.use('/api/v1/invoices', invoicesRouter);
 app.use('/api/v1/expenses', expensesRouter);
 app.use('/api/v1/payroll', payrollRouter);
+app.use('/api/v1/log', logRouter);
+app.use('/api/v1/school-settings', schoolSettingsRouter);
 
 // Legacy routes (for backward compatibility)
 app.use('/students', studentsRouter);
@@ -188,13 +174,19 @@ app.use((req, res) => {
 
 // Global Error Handler
 app.use((err, req, res, next) => {
-  const errorMsg = `[${new Date().toISOString()}] [ERROR] ${req.method} ${req.url} - ${err.stack || err.message}\n`;
-  try {
-    fs.appendFileSync(debugLogPath, errorMsg);
-  } catch (logErr) { }
+  console.error(`[${new Date().toISOString()}] [ERROR] ${req.method} ${req.url} - ${err.stack || err.message}`);
 
   // Call the original errorHandler utility
   errorHandler(err, req, res, next);
+});
+
+// Prevent server crash on unhandled promise rejection (e.g. transient DB ECONNRESET)
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+  // Do NOT exit — let the server keep running for transient errors
 });
 
 app.listen(port, async () => {

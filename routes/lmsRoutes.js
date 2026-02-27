@@ -242,6 +242,19 @@ router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHand
         WHERE cs.class_id = ${targetClassId}
           AND se.status = 'active'
           AND u.account_status = 'active'
+
+        UNION
+
+        SELECT DISTINCT u.id
+        FROM users u
+        JOIN parents p ON u.person_id = p.person_id
+        JOIN student_parents sp ON p.id = sp.parent_id
+        JOIN students s ON sp.student_id = s.id
+        JOIN student_enrollments se ON s.id = se.student_id
+        JOIN class_sections cs ON se.class_section_id = cs.id
+        WHERE cs.class_id = ${targetClassId}
+          AND se.status = 'active'
+          AND u.account_status = 'active'
       `;
 
       if (recipients.length > 0) {

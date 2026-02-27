@@ -1,5 +1,5 @@
 import express from 'express';
-import { supabase } from '../db.js';
+import { supabase, supabaseAdmin } from '../db.js';
 import sql from '../db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import config from '../config/env.js';
@@ -125,6 +125,7 @@ router.post('/login', asyncHandler(async (req, res) => {
             admission_no: dbUser.admission_no,
             has_student_profile: dbUser.has_student_profile,
             has_staff_profile: dbUser.has_staff_profile,
+            staff_id: dbUser.staff_id,
             class_section_id: classSectionId,
             classId: classSectionId
         }
@@ -250,6 +251,7 @@ router.get('/me', asyncHandler(async (req, res) => {
 
     res.json({
         ...dbUser,
+        staff_id: dbUser.staff_id,
         class_section_id: classSectionId,
         classId: classSectionId
     });
@@ -301,6 +303,90 @@ router.post('/reset-password', asyncHandler(async (req, res) => {
     }
 
     res.json({ message: 'Password reset successfully' });
+}));
+
+/**
+ * POST /auth/change-password
+ * Change password by verifying current password first
+ */
+router.post('/change-password', asyncHandler(async (req, res) => {
+    const { current_password, new_password } = req.body;
+
+    if (!req.user || !req.user.id) {
+        return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    if (!current_password || !new_password) {
+        return res.status(400).json({ error: 'Current password and new password are required' });
+    }
+
+    if (new_password.length < 8) {
+        return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
+
+    // We already have req.user from auth middleware, but we need email or phone to sign in again to verify old password.
+    // Let's get the email first from the database
+    const [dbUser] = await sql`SELECT email, person_id FROM users u 
+                               JOIN auth.users au ON u.id = au.id
+                               WHERE u.id = ${req.user.id}`;
+
+    // As we can't easily query auth.users from public schema if we don't have access,
+    // actually, let's use supabaseAdmin to get the user email if needed, or if we rely on req.user.email if available.
+    // Or we verify by attempting signInWithPassword using the user's email.
+
+    // Wait, let's do this cleaner:
+    const { data: userData, error: userError } = await supabase.auth.admin.getUserById(req.user.id);
+    if (userError || !userData.user) {
+        return res.status(400).json({ error: 'User not found' });
+    }
+
+    const email = userData.user.email;
+
+    // Verify current password by attempting login
+    const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+        email,
+        password: current_password
+    });
+
+    if (signInError) {
+        return res.status(401).json({ error: 'Incorrect current password' });
+    }
+
+    // Now update the password
+    const { error: updateError } = await supabase.auth.admin.updateUserById(req.user.id, {
+        password: new_password
+    });
+
+    if (updateError) {
+        return res.status(500).json({ error: 'Failed to update password', details: updateError.message });
+    }
+
+    // Log the event
+    try {
+        await sql`
+            INSERT INTO audit_logs (
+                user_id, 
+                action, 
+                entity, 
+                details, 
+                ip_address, 
+                user_agent, 
+                request_id
+            ) VALUES (
+                ${req.user.id}, 
+                'PASSWORD_CHANGED', 
+                'users', 
+                ${sql.json({ changed_at: new Date().toISOString() })}, 
+                ${req.ip}, 
+                ${req.headers['user-agent']}, 
+                ${req.headers['x-request-id']}
+            )
+        `;
+    } catch (auditErr) {
+        console.error('Audit Log Error (change-password):', auditErr);
+    }
+
+    res.json({ message: 'Password changed successfully. Please log in again.' });
 }));
 
 export default router;

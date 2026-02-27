@@ -7,8 +7,11 @@ const connectionString = config.databaseUrl;
 const sql = postgres(connectionString, {
     prepare: false,
     ssl: 'require',
-    max: 10,
-    idle_timeout: 20
+    max: 5, // Keep a small pool of active connections
+    idle_timeout: 0, // IMPORTANT: Never drop idle connections to avoid cold-start timeouts
+    connect_timeout: 30, // 30s timeout for initial handshake
+    max_lifetime: 60 * 30, // 30 minutes max lifetime
+    onnotice: () => { },
 });
 
 // Initialize Supabase Client

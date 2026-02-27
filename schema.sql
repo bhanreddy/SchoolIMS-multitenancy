@@ -6,17 +6,6 @@
   Target: PostgreSQL 15+ / Supabase
 */
 
--- 0. SCHEMA VERSIONING
-CREATE TABLE IF NOT EXISTS schema_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT,
-    applied_at TIMESTAMPTZ DEFAULT now()
-);
-
-INSERT INTO schema_meta (key, value) 
-VALUES ('version', '1.1') 
-ON CONFLICT (key) DO UPDATE SET value = '1.1', applied_at = now();
-
 SET statement_timeout = 0;
 SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
@@ -29,22 +18,18 @@ SET row_security = off;
 -- Start Transaction
 BEGIN;
 
--- SECTION 01: EXTENSIONS
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE EXTENSION IF NOT EXISTS btree_gist;
+-- 0. SCHEMA VERSIONING (inside transaction for atomicity)
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    applied_at TIMESTAMPTZ DEFAULT now()
+);
 
--- SECTION 02: CORE SCHEMA
--- ============================================================
--- SUPABASE BACKEND SCHEMA v3.1 (CONSOLIDATED & IDEMPOTENT)
--- ============================================================
--- INCLUDES:
---  1. Original v2 schema tables
---  2. Remediation Fixes (Financial, RLS, Indexes)
---  3. Idempotency Fixes (DROP IF EXISTS added for Triggers/Policies)
--- ============================================================
+INSERT INTO schema_meta (key, value) 
+VALUES ('version', '1.1') 
+ON CONFLICT (key) DO UPDATE SET value = '1.1', applied_at = now();
 
--- 0. SCHEMA & EXTENSIONS
+-- SECTION 01: EXTENSIONS (single creation, extensions schema)
 CREATE SCHEMA IF NOT EXISTS extensions;
 GRANT USAGE ON SCHEMA extensions TO postgres, anon, authenticated, service_role;
 
@@ -52,8 +37,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA extensions;
 CREATE EXTENSION IF NOT EXISTS btree_gist SCHEMA extensions;
 CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA extensions;
 
--- Ensure extensions are in search path
-ALTER DATABASE postgres SET search_path TO public, extensions;
+-- Session-level search path (no ALTER DATABASE — non-transactional DDL not allowed inside BEGIN)
 SET search_path = public, extensions;
 
 -- 1. REFERENCE TABLES
@@ -91,6 +75,41 @@ CREATE TABLE IF NOT EXISTS staff_designations (
     id SMALLINT PRIMARY KEY,
     name VARCHAR(100) NOT NULL UNIQUE
 );
+
+-- 1b. SEED REFERENCE DATA
+-- These INSERTs are idempotent (ON CONFLICT DO NOTHING) and required
+-- because persons.gender_id and students.status_id are NOT NULL FK columns.
+
+INSERT INTO genders (id, name) VALUES (1, 'Male'), (2, 'Female'), (3, 'Other')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO countries (code, name) VALUES
+('IN', 'India'), ('US', 'United States'), ('GB', 'United Kingdom'),
+('AE', 'United Arab Emirates'), ('SA', 'Saudi Arabia'), ('AU', 'Australia')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO religions (id, name) VALUES
+(1, 'Hinduism'), (2, 'Islam'), (3, 'Christianity'), (4, 'Sikhism'),
+(5, 'Buddhism'), (6, 'Jainism'), (7, 'Other')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO blood_groups (id, name) VALUES
+(1, 'A+'), (2, 'A-'), (3, 'B+'), (4, 'B-'),
+(5, 'AB+'), (6, 'AB-'), (7, 'O+'), (8, 'O-')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO student_categories (id, name) VALUES
+(1, 'General'), (2, 'OBC'), (3, 'SC'), (4, 'ST'), (5, 'EWS')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO relationship_types (id, name) VALUES
+(1, 'Father'), (2, 'Mother'), (3, 'Guardian'), (4, 'Sibling'), (5, 'Other')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO staff_designations (id, name) VALUES
+(1, 'Principal'), (2, 'Vice Principal'), (3, 'Teacher'), (4, 'Senior Teacher'),
+(5, 'Lab Assistant'), (6, 'Librarian'), (7, 'Clerk'), (8, 'Peon'), (9, 'Other')
+ON CONFLICT DO NOTHING;
 
 -- 2. CORE TRIGGERS (GLOBAL)
 CREATE OR REPLACE FUNCTION update_timestamp()
@@ -185,13 +204,17 @@ CREATE TABLE IF NOT EXISTS roles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     code VARCHAR(50) UNIQUE NOT NULL,
     name VARCHAR(100) NOT NULL,
-    is_system BOOLEAN NOT NULL DEFAULT TRUE
+    is_system BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS permissions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     code VARCHAR(100) UNIQUE NOT NULL,
-    name VARCHAR(150) NOT NULL
+    name VARCHAR(150) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
 );
 
 DO $$ BEGIN
@@ -202,6 +225,8 @@ END $$;
 CREATE TABLE IF NOT EXISTS role_permissions (
     role_id UUID REFERENCES roles(id) ON DELETE CASCADE,
     permission_id UUID REFERENCES permissions(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
     PRIMARY KEY (role_id, permission_id)
 );
 
@@ -228,6 +253,8 @@ CREATE TABLE IF NOT EXISTS user_roles (
     role_id UUID REFERENCES roles(id) ON DELETE CASCADE,
     granted_by UUID REFERENCES users(id),
     granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
     PRIMARY KEY (user_id, role_id)
 );
 
@@ -261,6 +288,11 @@ CREATE TABLE IF NOT EXISTS student_statuses (
     code VARCHAR(20) UNIQUE NOT NULL,
     is_terminal BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+INSERT INTO student_statuses (id, code, is_terminal) VALUES
+(1, 'active', false), (2, 'graduated', true), (3, 'withdrawn', true),
+(4, 'expelled', true), (5, 'transferred', true)
+ON CONFLICT (id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS students (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -366,6 +398,7 @@ CREATE TABLE IF NOT EXISTS academic_years (
     code VARCHAR(20) NOT NULL,
     start_date DATE NOT NULL,
     end_date DATE NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at TIMESTAMPTZ,
     CONSTRAINT chk_academic_year CHECK (start_date < end_date)
 );
@@ -387,6 +420,7 @@ CREATE TABLE IF NOT EXISTS classes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(50) NOT NULL UNIQUE,
     code VARCHAR(20),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at TIMESTAMPTZ
 );
 
@@ -400,6 +434,7 @@ CREATE TABLE IF NOT EXISTS sections (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(50) NOT NULL UNIQUE,
     code VARCHAR(20),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at TIMESTAMPTZ
 );
 
@@ -414,7 +449,9 @@ CREATE TABLE IF NOT EXISTS class_sections (
     class_id UUID NOT NULL REFERENCES classes(id) ON DELETE RESTRICT,
     section_id UUID NOT NULL REFERENCES sections(id) ON DELETE RESTRICT,
     academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
-    class_teacher_id UUID REFERENCES staff(id) ON DELETE RESTRICT, -- Added 2026-02-11
+    class_teacher_id UUID, -- FK added after staff table is created (Fix 10)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
     UNIQUE (class_id, section_id, academic_year_id)
 );
 
@@ -592,7 +629,6 @@ BEGIN
                 SELECT 1 FROM timetable_slots ts
                 JOIN staff s ON ts.teacher_id = s.id
                 WHERE ts.class_section_id = v_class_section_id
-                  AND ts.day_of_week = LOWER(TRIM(TO_CHAR(NEW.attendance_date, 'Day')))::day_of_week_enum
                   AND ts.period_number = 1
                   AND s.person_id = (SELECT person_id FROM users WHERE id = NEW.marked_by)
                   AND ts.deleted_at IS NULL
@@ -677,6 +713,15 @@ CREATE TRIGGER trg_staff_active_person
 BEFORE INSERT OR UPDATE ON staff
 FOR EACH ROW EXECUTE FUNCTION ensure_active_person_staff();
 
+-- Fix 10: Deferred FK — class_teacher_id now references staff(id)
+-- (class_sections was created before staff, so FK was deferred)
+DO $$ BEGIN
+    ALTER TABLE class_sections
+    ADD CONSTRAINT fk_class_sections_teacher
+    FOREIGN KEY (class_teacher_id) REFERENCES staff(id) ON DELETE RESTRICT;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
 -- 🔒 Protect System Roles
 CREATE OR REPLACE FUNCTION prevent_system_role_change()
 RETURNS TRIGGER AS $$
@@ -755,8 +800,8 @@ END $$;
 
 CREATE TABLE IF NOT EXISTS student_fees (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id UUID NOT NULL REFERENCES students(id),
-    fee_structure_id UUID NOT NULL REFERENCES fee_structures(id),
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
+    fee_structure_id UUID NOT NULL REFERENCES fee_structures(id) ON DELETE RESTRICT,
     amount_due DECIMAL(12,2) NOT NULL,
     amount_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
     discount DECIMAL(12,2) NOT NULL DEFAULT 0,
@@ -769,6 +814,8 @@ CREATE TABLE IF NOT EXISTS student_fees (
     CONSTRAINT chk_amounts CHECK (amount_due >= 0 AND amount_paid >= 0 AND discount >= 0),
     CONSTRAINT chk_paid_not_exceed CHECK (amount_paid <= amount_due - discount)
 );
+
+ALTER TABLE student_fees ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_student_fees_student ON student_fees(student_id);
 CREATE INDEX IF NOT EXISTS idx_student_fees_status ON student_fees(status);
@@ -804,45 +851,65 @@ END $$;
 
 CREATE TABLE IF NOT EXISTS fee_transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_fee_id UUID NOT NULL REFERENCES student_fees(id),
+    student_fee_id UUID NOT NULL REFERENCES student_fees(id) ON DELETE RESTRICT,
     amount DECIMAL(12,2) NOT NULL,
     payment_method payment_method_enum NOT NULL,
-    transaction_ref VARCHAR(100),
+    transaction_ref VARCHAR(100) NOT NULL,
     paid_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    received_by UUID REFERENCES users(id),
+    received_by UUID REFERENCES users(id) ON DELETE SET NULL,
     remarks TEXT,
+    refund_of UUID REFERENCES fee_transactions(id) ON DELETE RESTRICT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT chk_transaction_amount CHECK (amount > 0)
+    -- Allow negative amounts for refunds, but block zero
+    CONSTRAINT chk_transaction_amount CHECK (amount != 0),
+    -- Refund entries must have negative amount
+    CONSTRAINT chk_refund_must_be_negative CHECK (refund_of IS NULL OR amount < 0)
 );
+
+-- Backfill any existing NULL transaction_ref values before constraints
+DO $$ BEGIN
+    UPDATE fee_transactions SET transaction_ref = 'LEGACY-' || id::text WHERE transaction_ref IS NULL;
+EXCEPTION WHEN OTHERS THEN null;
+END $$;
+
+-- Enforce NOT NULL (may already be set by CREATE TABLE above, safe for existing DBs)
+ALTER TABLE fee_transactions ALTER COLUMN transaction_ref SET NOT NULL;
+ALTER TABLE fee_transactions ADD COLUMN IF NOT EXISTS refund_of UUID REFERENCES fee_transactions(id) ON DELETE RESTRICT;
+
+-- Unique idempotency key
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_txn_ref_unique ON fee_transactions(transaction_ref);
 
 CREATE INDEX IF NOT EXISTS idx_transactions_paid_at ON fee_transactions(paid_at);
 
--- Remediation: Financial Trigger (INSERT/UPDATE/DELETE)
+-- Remediation: Financial Trigger (APPEND-ONLY — INSERT only)
+-- Refunds are negative-amount INSERTs, so += handles both payment and refund
 CREATE OR REPLACE FUNCTION update_fee_paid_amount()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Handle DELETE or UPDATE (subtract old amount)
-    IF (TG_OP = 'DELETE' OR TG_OP = 'UPDATE') THEN
-        UPDATE student_fees 
-        SET amount_paid = amount_paid - OLD.amount
-        WHERE id = OLD.student_fee_id;
-    END IF;
-
-    -- Handle INSERT or UPDATE (add new amount)
-    IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
-        UPDATE student_fees 
-        SET amount_paid = amount_paid + NEW.amount
-        WHERE id = NEW.student_fee_id;
-    END IF;
-
+    UPDATE student_fees
+    SET amount_paid = amount_paid + NEW.amount
+    WHERE id = NEW.student_fee_id;
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_update_paid_on_transaction ON fee_transactions;
 CREATE TRIGGER trg_update_paid_on_transaction
-AFTER INSERT OR UPDATE OR DELETE ON fee_transactions
+AFTER INSERT ON fee_transactions
 FOR EACH ROW EXECUTE FUNCTION update_fee_paid_amount();
+
+-- Guard: Block UPDATE/DELETE on fee_transactions (append-only ledger)
+CREATE OR REPLACE FUNCTION prevent_fee_transaction_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'fee_transactions is append-only. UPDATE and DELETE are forbidden.';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_guard_fee_txn ON fee_transactions;
+CREATE TRIGGER trg_guard_fee_txn
+BEFORE UPDATE OR DELETE ON fee_transactions
+FOR EACH ROW EXECUTE FUNCTION prevent_fee_transaction_mutation();
 
 CREATE SEQUENCE IF NOT EXISTS receipt_no_seq START 1001;
 
@@ -1038,6 +1105,8 @@ CREATE TABLE IF NOT EXISTS grading_scales (
     max_percentage DECIMAL(5,2) NOT NULL,
     grade VARCHAR(5) NOT NULL,
     grade_point DECIMAL(3,1),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
     CONSTRAINT chk_percentage_range CHECK (min_percentage >= 0 AND max_percentage <= 100 AND min_percentage < max_percentage)
 );
 
@@ -1095,6 +1164,10 @@ FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 -- 13. COMMUNICATION & SUPPORT
 DO $$ BEGIN
     CREATE TYPE complaint_status_enum AS ENUM ('open','in_progress','resolved','closed','rejected');
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
     CREATE TYPE complaint_priority_enum AS ENUM ('low','medium','high','urgent');
 EXCEPTION WHEN duplicate_object THEN null;
 END $$;
@@ -1216,6 +1289,10 @@ USING (
 
 DO $$ BEGIN
     CREATE TYPE leave_status_enum AS ENUM ('pending','approved','rejected','cancelled');
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
     CREATE TYPE leave_type_enum AS ENUM ('casual','sick','earned','maternity','paternity','unpaid','other');
 EXCEPTION WHEN duplicate_object THEN null;
 END $$;
@@ -1257,6 +1334,7 @@ CREATE TABLE IF NOT EXISTS diary_entries (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_homework_due_date CHECK (homework_due_date IS NULL OR homework_due_date >= entry_date),
     -- Prevent duplicate homework for same class/subject/date
     UNIQUE (class_section_id, subject_id, entry_date, created_by)
 );
@@ -1298,7 +1376,7 @@ BEFORE UPDATE ON diary_entries
 FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
 DO $$ BEGIN
-    CREATE TYPE day_of_week_enum AS ENUM ('monday','tuesday','wednesday','thursday','friday','saturday','sunday');
+    CREATE TYPE day_of_week_enum AS ENUM ('mon','tue','wed','thu','fri','sat','sun');
 EXCEPTION WHEN duplicate_object THEN null;
 END $$;
 
@@ -1349,7 +1427,10 @@ DELETE FROM periods WHERE name NOT IN (
 
 -- (Removed Legacy timetable_entries table - Use timetable_slots)
 
+
 -- 14. TRANSPORT
+
+-- 14.1 Routes (Bus → Route → Stops → Students)
 CREATE TABLE IF NOT EXISTS transport_routes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(100) NOT NULL,
@@ -1359,6 +1440,8 @@ CREATE TABLE IF NOT EXISTS transport_routes (
     end_point VARCHAR(200),
     total_stops INTEGER,
     monthly_fee DECIMAL(12,2),
+    direction VARCHAR(20) DEFAULT 'morning' CHECK (direction IN ('morning', 'afternoon')),
+    bus_id UUID, -- FK added after buses table creation
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -1369,20 +1452,30 @@ CREATE TRIGGER trg_transport_routes_updated
 BEFORE UPDATE ON transport_routes
 FOR EACH ROW EXECUTE FUNCTION update_timestamp();
 
+-- 14.2 Buses
 CREATE TABLE IF NOT EXISTS buses (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     bus_no VARCHAR(50) NOT NULL UNIQUE,
     registration_no VARCHAR(50) UNIQUE,
     capacity INTEGER NOT NULL DEFAULT 40,
-    driver_name VARCHAR(100),
-    driver_phone VARCHAR(20),
-    route_id UUID REFERENCES transport_routes(id),
+    driver_id UUID REFERENCES staff(id),         -- FK to staff (source of truth)
+    driver_name VARCHAR(100),                     -- Legacy/display fallback
+    driver_phone VARCHAR(20),                     -- Legacy/display fallback
+    route_id UUID REFERENCES transport_routes(id) ON DELETE RESTRICT,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_bus_capacity CHECK (capacity > 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_buses_route ON buses(route_id);
+CREATE INDEX IF NOT EXISTS idx_buses_driver ON buses(driver_id);
 
+-- Add deferred FK from routes → buses (circular reference resolved)
+ALTER TABLE transport_routes ADD COLUMN IF NOT EXISTS bus_id UUID REFERENCES buses(id);
+CREATE INDEX IF NOT EXISTS idx_routes_bus ON transport_routes(bus_id);
+
+-- 14.3 Stops (strictly ordered per route)
 CREATE TABLE IF NOT EXISTS transport_stops (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     route_id UUID NOT NULL REFERENCES transport_routes(id) ON DELETE CASCADE,
@@ -1392,33 +1485,111 @@ CREATE TABLE IF NOT EXISTS transport_stops (
     pickup_time TIME,
     drop_time TIME,
     stop_order INTEGER NOT NULL,
+    deleted_at TIMESTAMPTZ,
     UNIQUE (route_id, stop_order)
 );
 
+-- 14.4 Student ↔ Transport mapping
 CREATE TABLE IF NOT EXISTS student_transport (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id UUID NOT NULL REFERENCES students(id),
-    route_id UUID NOT NULL REFERENCES transport_routes(id),
-    stop_id UUID REFERENCES transport_stops(id),
-    academic_year_id UUID NOT NULL REFERENCES academic_years(id),
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    route_id UUID NOT NULL REFERENCES transport_routes(id) ON DELETE RESTRICT,
+    stop_id UUID REFERENCES transport_stops(id) ON DELETE SET NULL,
+    bus_id UUID REFERENCES buses(id),            -- Auto-derived from route on assignment
+    academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (student_id, academic_year_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_student_transport_route ON student_transport(route_id);
+CREATE INDEX IF NOT EXISTS idx_student_transport_bus ON student_transport(bus_id);
 
+-- 14.5 Bus live locations (single row per bus, upserted)
 CREATE TABLE IF NOT EXISTS bus_locations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    bus_id UUID NOT NULL REFERENCES buses(id),
+    bus_id UUID NOT NULL REFERENCES buses(id) ON DELETE CASCADE,
     latitude DECIMAL(10,8) NOT NULL,
     longitude DECIMAL(11,8) NOT NULL,
     speed DECIMAL(5,2),
     heading DECIMAL(5,2),
-    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_bus_locations_recent ON bus_locations(bus_id, recorded_at DESC);
+
+-- 14.6 Trips (driver trip execution)
+CREATE TABLE IF NOT EXISTS trips (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    bus_id UUID NOT NULL REFERENCES buses(id),
+    route_id UUID NOT NULL REFERENCES transport_routes(id),
+    driver_id UUID NOT NULL REFERENCES staff(id),
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+      CHECK (status IN ('active', 'completed', 'cancelled')),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Only one active trip per bus at any time
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trips_active_bus ON trips(bus_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_trips_driver ON trips(driver_id);
+CREATE INDEX IF NOT EXISTS idx_trips_route ON trips(route_id);
+CREATE INDEX IF NOT EXISTS idx_trips_status ON trips(status);
+
+DROP TRIGGER IF EXISTS trg_trips_updated ON trips;
+CREATE TRIGGER trg_trips_updated
+BEFORE UPDATE ON trips
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- 14.7 Trip stop execution status
+CREATE TABLE IF NOT EXISTS trip_stop_status (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    trip_id UUID NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+    stop_id UUID NOT NULL REFERENCES transport_stops(id),
+    stop_order INTEGER NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'arrived', 'completed', 'skipped')),
+    arrival_time TIMESTAMPTZ,
+    departure_time TIMESTAMPTZ,
+    UNIQUE (trip_id, stop_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trip_stop_trip ON trip_stop_status(trip_id);
+CREATE INDEX IF NOT EXISTS idx_trip_stop_status ON trip_stop_status(status);
+
+-- 14.8 RLS for trips
+ALTER TABLE trips ENABLE ROW LEVEL SECURITY;
+GRANT ALL ON TABLE trips TO authenticated;
+GRANT ALL ON TABLE trips TO service_role;
+
+DROP POLICY IF EXISTS "Admins can manage trips" ON trips;
+CREATE POLICY "Admins can manage trips" ON trips FOR ALL USING (
+  EXISTS (
+    SELECT 1 FROM user_roles ur
+    JOIN roles r ON ur.role_id = r.id
+    WHERE ur.user_id = auth.uid() AND r.code IN ('admin', 'driver')
+  )
+);
+
+DROP POLICY IF EXISTS "Drivers can view own trips" ON trips;
+CREATE POLICY "Drivers can view own trips" ON trips FOR SELECT USING (
+  driver_id IN (
+    SELECT s.id FROM staff s
+    JOIN users u ON s.person_id = u.person_id
+    WHERE u.id = auth.uid()
+  )
+);
+
+-- 14.9 RLS for trip_stop_status
+ALTER TABLE trip_stop_status ENABLE ROW LEVEL SECURITY;
+GRANT ALL ON TABLE trip_stop_status TO authenticated;
+GRANT ALL ON TABLE trip_stop_status TO service_role;
+
+DROP POLICY IF EXISTS "Authenticated can view trip stops" ON trip_stop_status;
+CREATE POLICY "Authenticated can view trip stops" ON trip_stop_status FOR SELECT
+  TO authenticated USING (true);
 
 -- 15. HOSTEL
 CREATE TABLE IF NOT EXISTS hostel_blocks (
@@ -1434,13 +1605,14 @@ CREATE TABLE IF NOT EXISTS hostel_blocks (
 
 CREATE TABLE IF NOT EXISTS hostel_rooms (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    block_id UUID NOT NULL REFERENCES hostel_blocks(id),
+    block_id UUID NOT NULL REFERENCES hostel_blocks(id) ON DELETE CASCADE,
     room_no VARCHAR(20) NOT NULL,
     floor INTEGER,
     capacity INTEGER NOT NULL DEFAULT 2,
     room_type VARCHAR(50) DEFAULT 'shared', 
     monthly_fee DECIMAL(12,2),
     is_available BOOLEAN NOT NULL DEFAULT TRUE,
+    deleted_at TIMESTAMPTZ,
     UNIQUE (block_id, room_no)
 );
 
@@ -1479,7 +1651,9 @@ CREATE TABLE IF NOT EXISTS events (
     target_audience notice_audience_enum DEFAULT 'all',
     created_by UUID REFERENCES users(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_event_dates CHECK (end_date IS NULL OR end_date >= start_date)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_dates ON events(start_date, end_date);
@@ -1674,7 +1848,10 @@ SELECT * FROM persons WHERE deleted_at IS NULL;
 CREATE OR REPLACE FUNCTION prevent_direct_fee_update()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF (pg_trigger_depth() = 0) THEN
+    -- Block direct manual tampering at depth 0, but allow system recalculation via GUC flag
+    IF (pg_trigger_depth() = 0)
+       AND COALESCE(current_setting('app.fee_recalc_mode', true), '') != 'true'
+    THEN
         IF NEW.amount_paid IS DISTINCT FROM OLD.amount_paid THEN
             RAISE EXCEPTION 'Direct update of student_fees.amount_paid is strictly forbidden. Use fee_transactions.';
         END IF;
@@ -1819,20 +1996,14 @@ $$ LANGUAGE plpgsql;
 -- Drop table to ensure clean slate if re-running
 DROP TABLE IF EXISTS timetable_slots CASCADE;
 
--- Create Enum for Days
-DO $$ BEGIN
-    CREATE TYPE day_of_week_enum AS ENUM ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
+-- Create Enum for Days (already defined above, no duplicate needed)
 
 CREATE TABLE timetable_slots (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    school_id UUID,
     
     academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
     class_section_id UUID NOT NULL REFERENCES class_sections(id) ON DELETE RESTRICT,
     
-    day_of_week day_of_week_enum NOT NULL, 
     period_number SMALLINT NOT NULL,
     
     subject_id UUID NOT NULL REFERENCES subjects(id) ON DELETE RESTRICT,
@@ -1850,13 +2021,13 @@ CREATE TABLE timetable_slots (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_timetable_slots_active 
-ON timetable_slots (class_section_id, academic_year_id, day_of_week, period_number) 
+ON timetable_slots (class_section_id, academic_year_id, period_number) 
 WHERE deleted_at IS NULL;
 
 
-CREATE INDEX IF NOT EXISTS idx_timetable_class ON timetable_slots(class_section_id, day_of_week);
-CREATE INDEX IF NOT EXISTS idx_timetable_teacher ON timetable_slots(teacher_id, day_of_week);
-CREATE INDEX IF NOT EXISTS idx_timetable_slots_time_check ON timetable_slots(teacher_id, day_of_week, start_time, end_time); -- Updated for collision detection
+CREATE INDEX IF NOT EXISTS idx_timetable_class ON timetable_slots(class_section_id);
+CREATE INDEX IF NOT EXISTS idx_timetable_teacher ON timetable_slots(teacher_id);
+CREATE INDEX IF NOT EXISTS idx_timetable_slots_time_check ON timetable_slots(teacher_id, start_time, end_time); -- Updated for collision detection
 
 -- Financial & Course Performance Indexes
 CREATE INDEX IF NOT EXISTS idx_complaints_assigned_to ON complaints(assigned_to);
@@ -1884,18 +2055,17 @@ BEGIN
             NULL;
         END IF;
 
-        -- 2. Teacher Collision Check (Same day, same period)
+        -- 2. Teacher Collision Check (Same period)
         SELECT EXISTS (
             SELECT 1 FROM timetable_slots
             WHERE teacher_id = NEW.teacher_id
-              AND day_of_week = NEW.day_of_week
               AND period_number = NEW.period_number
               AND academic_year_id = NEW.academic_year_id
               AND id <> COALESCE(NEW.id, '00000000-0000-0000-0000-000000000000'::uuid)
         ) INTO v_teacher_collision;
 
         IF v_teacher_collision THEN
-            RAISE EXCEPTION 'Teacher Collision: Teacher is already booked for period % on %', NEW.period_number, NEW.day_of_week;
+            RAISE EXCEPTION 'Teacher Collision: Teacher is already booked for period %', NEW.period_number;
         END IF;
     END IF;
 
@@ -1904,14 +2074,13 @@ BEGIN
         SELECT EXISTS (
             SELECT 1 FROM timetable_slots
             WHERE room_no = NEW.room_no
-              AND day_of_week = NEW.day_of_week
               AND period_number = NEW.period_number
               AND academic_year_id = NEW.academic_year_id
               AND id <> COALESCE(NEW.id, '00000000-0000-0000-0000-000000000000'::uuid)
         ) INTO v_room_collision;
 
         IF v_room_collision THEN
-            RAISE EXCEPTION 'Room Collision: Room % is already occupied during period % on %', NEW.room_no, NEW.period_number, NEW.day_of_week;
+            RAISE EXCEPTION 'Room Collision: Room % is already occupied during period %', NEW.room_no, NEW.period_number;
         END IF;
     END IF;
 
@@ -1937,11 +2106,24 @@ RETURNS TRIGGER AS $$
 DECLARE
     v_class_section_id UUID;
     v_teacher_id UUID;
+    v_monday_label TEXT;
 BEGIN
-    -- Only care about Monday Period 1 changes
-    -- 'monday' checks for Day enum. '1' checks for Period Number.
+    -- Dynamically detect the correct Monday enum label ('mon' or 'monday')
+    SELECT e.enumlabel INTO v_monday_label
+    FROM pg_type t
+    JOIN pg_enum e ON t.oid = e.enumtypid
+    WHERE t.typname = 'day_of_week_enum'
+      AND e.enumlabel IN ('mon', 'monday')
+    LIMIT 1;
+
+    -- If no Monday label found, skip silently
+    IF v_monday_label IS NULL THEN
+        IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+        RETURN NEW;
+    END IF;
+
     IF (TG_OP = 'DELETE') THEN
-        IF OLD.period_number = 1 AND OLD.day_of_week = 'monday' THEN
+        IF OLD.period_number = 1 AND OLD.day_of_week::text = v_monday_label THEN
              UPDATE class_sections 
              SET class_teacher_id = NULL 
              WHERE id = OLD.class_section_id;
@@ -1950,7 +2132,7 @@ BEGIN
     END IF;
 
     IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
-        IF NEW.period_number = 1 AND NEW.day_of_week = 'monday' THEN
+        IF NEW.period_number = 1 AND NEW.day_of_week::text = v_monday_label THEN
              UPDATE class_sections 
              SET class_teacher_id = NEW.teacher_id 
              WHERE id = NEW.class_section_id;
@@ -1971,16 +2153,33 @@ FOR EACH ROW EXECUTE FUNCTION sync_class_teacher_from_timetable();
 DO $$
 DECLARE
     r RECORD;
+    v_monday_label TEXT;
 BEGIN
+    -- Dynamically find the correct enum label for Monday ('mon' or 'monday')
+    SELECT e.enumlabel INTO v_monday_label
+    FROM pg_type t
+    JOIN pg_enum e ON t.oid = e.enumtypid
+    WHERE t.typname = 'day_of_week_enum'
+      AND e.enumlabel IN ('mon', 'monday')
+    LIMIT 1;
+
+    IF v_monday_label IS NULL THEN
+        RAISE NOTICE 'Initial timetable sync skipped: no Monday label found in day_of_week_enum';
+        RETURN;
+    END IF;
+
     FOR r IN 
-        SELECT class_section_id, teacher_id 
-        FROM timetable_slots 
-        WHERE day_of_week = 'monday' AND period_number = 1
+        EXECUTE format(
+            'SELECT class_section_id, teacher_id FROM timetable_slots WHERE day_of_week = %L::day_of_week_enum AND period_number = 1',
+            v_monday_label
+        )
     LOOP
         UPDATE class_sections 
         SET class_teacher_id = r.teacher_id 
         WHERE id = r.class_section_id;
     END LOOP;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Initial timetable sync skipped: %', SQLERRM;
 END $$;
 
 
@@ -2156,7 +2355,14 @@ GRANT ALL ON student_life_values_progress TO authenticated;
 DROP POLICY IF EXISTS "Allow all authenticated check" ON student_life_values_progress;
 CREATE POLICY "Allow all authenticated check" ON student_life_values_progress FOR SELECT USING (true);
 DROP POLICY IF EXISTS "Students can view own progress" ON student_life_values_progress;
-CREATE POLICY "Students can view own progress" ON student_life_values_progress FOR ALL USING (auth.uid() IN (SELECT id FROM users WHERE id = (SELECT person_id FROM students WHERE id = student_id)));
+CREATE POLICY "Students can view own progress" ON student_life_values_progress FOR ALL USING (
+    student_id IN (
+        SELECT s.id FROM students s
+        JOIN persons p ON s.person_id = p.id
+        JOIN users u ON u.person_id = p.id
+        WHERE u.id = auth.uid()
+    )
+);
 
 -- 5. AUTOMATION: ENROLLMENT
 DROP FUNCTION IF EXISTS ensure_student_enrollment(uuid);
@@ -2332,95 +2538,55 @@ ALTER TABLE academic_years ENABLE ROW LEVEL SECURITY;
 ALTER TABLE student_enrollments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE lms_materials ENABLE ROW LEVEL SECURITY;
 
--- C. Create Default "Allow Authenticated" Policies
--- To prevent "RLS Enabled but no policy" (which equals deny all),
--- we add a permissive default policy for Authenticated users.
--- This ensures the app keeps working while satisfying the linter.
-
-DO $$
-DECLARE
-    t text;
-BEGIN
-    FOR t IN 
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = 'public' 
-          AND table_type = 'BASE TABLE'
-    LOOP
-        EXECUTE format('
-            DROP POLICY IF EXISTS "Enable all for authenticated" ON %I;
-            CREATE POLICY "Enable all for authenticated" ON %I
-            FOR ALL
-            TO authenticated
-            USING (auth.role() = ''authenticated'')
-            WITH CHECK (auth.role() = ''authenticated'');
-        ', t, t);
-    END LOOP;
-END $$;
+-- C. Default RLS policies removed (Fix 9)
+-- The blanket "Enable all for authenticated" policy was overriding all 
+-- per-table security policies. Backend uses service_role key (bypasses RLS),
+-- so fine-grained RLS policies above are sufficient.
 
 -- ============================================================
 -- 101. LINTER FIXES (ROUND 2)
 -- ============================================================
 
--- A. Fix "Function Search Path Mutable"
--- We explicitly set search_path to 'public' for all functions to prevent path hijacking.
+-- A. Fix "Function Search Path Mutable" (Fix 8)
+-- Only ALTER functions that actually exist in this schema.
+-- Wrapped in DO blocks so non-existent functions don't break the transaction.
 
-ALTER FUNCTION generate_ticket_no SET search_path = 'public';
-ALTER FUNCTION fn_check_invoice_amounts SET search_path = 'public';
-ALTER FUNCTION is_staff SET search_path = 'public';
-ALTER FUNCTION update_fee_paid_amount SET search_path = 'public';
-ALTER FUNCTION is_admin SET search_path = 'public';
-ALTER FUNCTION promote_students_academic_year SET search_path = 'public';
-ALTER FUNCTION is_principal SET search_path = 'public';
-ALTER FUNCTION fn_transaction_immutability SET search_path = 'public';
-ALTER FUNCTION fn_prevent_immutable_changes SET search_path = 'public';
-ALTER FUNCTION ensure_student_enrollment SET search_path = 'public';
-ALTER FUNCTION fn_prevent_overpayment SET search_path = 'public';
-ALTER FUNCTION ensure_active_person_staff SET search_path = 'public';
-ALTER FUNCTION fn_check_academic_year_dates SET search_path = 'public';
-ALTER FUNCTION validate_timetable_entry SET search_path = 'public';
-ALTER FUNCTION is_management SET search_path = 'public';
-ALTER FUNCTION update_fee_status SET search_path = 'public';
-ALTER FUNCTION recalculate_section_rolls SET search_path = 'public';
-ALTER FUNCTION validate_enrollment_year SET search_path = 'public';
-ALTER FUNCTION fn_update_timestamp SET search_path = 'public';
-ALTER FUNCTION fn_update_fee_balance SET search_path = 'public';
-ALTER FUNCTION ensure_active_student_enrollment SET search_path = 'public';
-ALTER FUNCTION ensure_active_person_ref SET search_path = 'public';
-ALTER FUNCTION prevent_system_role_change SET search_path = 'public';
-ALTER FUNCTION auth_has_role SET search_path = 'public';
-ALTER FUNCTION prevent_direct_fee_update SET search_path = 'public';
-ALTER FUNCTION ensure_active_student_parent SET search_path = 'public';
-ALTER FUNCTION current_staff_id SET search_path = 'public';
-ALTER FUNCTION is_accounts SET search_path = 'public';
-ALTER FUNCTION update_person_display_name SET search_path = 'public';
-ALTER FUNCTION fn_lower_email SET search_path = 'public';
-ALTER FUNCTION validate_attendance_date SET search_path = 'public';
-ALTER FUNCTION fn_verify_fee_integrity SET search_path = 'public';
-ALTER FUNCTION set_updated_at SET search_path = 'public';
-ALTER FUNCTION fn_check_no_future_attendance SET search_path = 'public';
-ALTER FUNCTION sync_class_teacher_from_timetable SET search_path = 'public';
+DO $$ 
+DECLARE
+    func_name TEXT;
+BEGIN
+    FOR func_name IN 
+        SELECT unnest(ARRAY[
+            'update_timestamp', 'update_fee_paid_amount', 'update_fee_status',
+            'auto_generate_receipt', 'generate_ticket_no', 'validate_marks_entry',
+            'recalculate_section_rolls', 'validate_enrollment_year',
+            'ensure_active_person_ref', 'ensure_active_person_staff',
+            'ensure_active_student_enrollment', 'ensure_active_student_parent',
+            'prevent_system_role_change', 'prevent_direct_fee_update',
+            'update_person_display_name', 'auth_has_role',
+            'validate_attendance_entry', 'validate_diary_entry',
+            'validate_timetable_entry', 'sync_class_teacher_from_timetable',
+            'promote_students_academic_year', 'ensure_student_enrollment',
+            'log_financial_destruction', 'get_financial_analytics',
+            'get_attendance_analytics', 'get_dashboard_insights',
+            'debug_user_permissions', 'debug_teacher_profile',
+            'run_integrity_check', 'recalculate_fee_ledger'
+        ])
+    LOOP
+        BEGIN
+            EXECUTE format('ALTER FUNCTION %I SET search_path = ''public''', func_name);
+        EXCEPTION WHEN undefined_function THEN
+            -- Function does not exist, skip silently
+            NULL;
+        END;
+    END LOOP;
+END $$;
 
 -- B. Fix "Extension in Public"
 -- We try to move extensions to 'extensions' schema, creating it if needed.
 -- Note: 'auth' schema is managed by Supabase, 'extensions' is a good convention.
 
-CREATE SCHEMA IF NOT EXISTS extensions;
-GRANT USAGE ON SCHEMA extensions TO postgres, anon, authenticated, service_role;
-
--- Move extensions (Wrapped in DO block to avoid errors if they don't exist)
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'btree_gist') THEN
-        ALTER EXTENSION btree_gist SET SCHEMA extensions;
-    END IF;
-    
-    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') THEN
-        ALTER EXTENSION pg_trgm SET SCHEMA extensions;
-    END IF;
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'Skipping extension migration: %', SQLERRM;
-END $$;
+-- Extensions already created in SECTION 01. No duplicate creation or migration needed.
 
 -- ============================================================
 -- 102. EXPENSE TRACKER MODULE
@@ -2429,8 +2595,7 @@ END $$;
 -- 1. Create Expenses Table
 CREATE TABLE IF NOT EXISTS expenses (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    school_id UUID NOT NULL, -- In a real multi-tenant app, this links to the school
-    created_by UUID NOT NULL REFERENCES auth.users(id), -- Links to Supabase Auth User
+    created_by UUID NOT NULL REFERENCES users(id), -- Fixed: was auth.users(id) (Fix 6)
     title TEXT NOT NULL,
     category TEXT NOT NULL,
     amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
@@ -2443,7 +2608,6 @@ CREATE TABLE IF NOT EXISTS expenses (
 );
 
 -- 2. Indexes
-CREATE INDEX IF NOT EXISTS idx_expenses_school ON expenses(school_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(expense_date DESC);
 CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
 
@@ -2512,12 +2676,12 @@ GRANT ALL ON expenses TO authenticated;
 GRANT ALL ON expenses TO service_role;
 
 
--- Ensure 'extensions' is in the search path for everyone
-ALTER DATABASE postgres SET search_path TO public, extensions;
+-- search_path managed at session level (ALTER DATABASE is non-transactional DDL)
+SET search_path = public, extensions;
 
 
--- Commit Transaction
-COMMIT;
+-- (Fix 1: Removed mid-file COMMIT that split the transaction)
+-- The single COMMIT is at the end of the file.
 
 -- VERIFICATION (Commented)
 /*
@@ -3373,8 +3537,10 @@ CREATE TABLE IF NOT EXISTS notification_batches (
     sent_count INTEGER DEFAULT 0,
     failure_count INTEGER DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    deleted_at TIMESTAMPTZ
 );
+ALTER TABLE notification_batches ENABLE ROW LEVEL SECURITY;
 
 -- Index for rate limiting (finding last batch by type/created_at)
 CREATE INDEX IF NOT EXISTS idx_notification_batches_type_created ON notification_batches(type, created_at);
@@ -3391,8 +3557,10 @@ CREATE TABLE IF NOT EXISTS notification_logs (
     provider_response JSONB,
     status TEXT CHECK (status IN ('success', 'failed', 'partial')),
     error_message TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    deleted_at TIMESTAMPTZ
 );
+ALTER TABLE notification_logs ENABLE ROW LEVEL SECURITY;
 
 -- Part 3: Rate Limiting (Optional: can use Redis, but DB is fine for this scale)
 -- We will query notification_logs for rate limiting, so we need good indexes.
@@ -3402,8 +3570,10 @@ CREATE INDEX IF NOT EXISTS idx_notification_logs_user_type_date ON notification_
 CREATE TABLE IF NOT EXISTS notification_config (
     key TEXT PRIMARY KEY,
     value JSONB,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+    deleted_at TIMESTAMPTZ
 );
+ALTER TABLE notification_config ENABLE ROW LEVEL SECURITY;
 
 -- Seed default config if not exists
 INSERT INTO notification_config (key, value)
@@ -3419,17 +3589,12 @@ ON CONFLICT (key) DO NOTHING;
 CREATE OR REPLACE FUNCTION propagate_fee_structure_updates()
 RETURNS TRIGGER AS $$
 BEGIN
+    -- Only update amount_due; status is deterministically handled by trg_auto_fee_status (single owner)
     IF NEW.amount IS DISTINCT FROM OLD.amount THEN
         UPDATE student_fees
         SET 
             amount_due = NEW.amount,
-            updated_at = now(),
-            status = CASE 
-                WHEN amount_paid >= (NEW.amount - discount) THEN 'paid'::fee_status_enum
-                WHEN amount_paid > 0 THEN 'partial'::fee_status_enum
-                WHEN due_date < CURRENT_DATE THEN 'overdue'::fee_status_enum
-                ELSE 'pending'::fee_status_enum
-            END
+            updated_at = now()
         WHERE fee_structure_id = NEW.id
           AND status IN ('pending', 'partial', 'overdue');
     END IF;
@@ -3807,8 +3972,394 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
--- Final search path enforcement
-ALTER DATABASE postgres SET search_path TO public, extensions;
+-- ============================================================
+-- UTILITIES & MAINTENANCE
+-- ============================================================
+
+-- Function to recalculate fee ledger from transactions (Fix for double-counting)
+CREATE OR REPLACE FUNCTION recalculate_fee_ledger()
+RETURNS VOID AS $$
+DECLARE
+    r_fee RECORD;
+    v_calculated_paid DECIMAL(12,2);
+    v_new_status fee_status_enum;
+    v_remaining DECIMAL(12,2);
+BEGIN
+    -- Set GUC flag to bypass prevent_direct_fee_update guard trigger
+    PERFORM set_config('app.fee_recalc_mode', 'true', true);
+
+    FOR r_fee IN 
+        SELECT sf.id, sf.amount_due, sf.amount_paid, sf.discount, sf.status
+        FROM student_fees sf
+    LOOP
+        -- Calculate total from transactions
+        SELECT COALESCE(SUM(amount), 0) INTO v_calculated_paid
+        FROM fee_transactions
+        WHERE student_fee_id = r_fee.id;
+
+        -- Only update if different
+        IF v_calculated_paid IS DISTINCT FROM r_fee.amount_paid THEN
+            
+            v_remaining := r_fee.amount_due - r_fee.discount - v_calculated_paid;
+
+            IF v_remaining <= 0 THEN
+                v_new_status := 'paid';
+            ELSIF v_calculated_paid > 0 THEN
+                v_new_status := 'partial';
+            ELSE
+                IF r_fee.status = 'overdue' THEN
+                    v_new_status := 'overdue';
+                ELSE
+                    v_new_status := 'pending';
+                END IF;
+            END IF;
+
+            UPDATE student_fees
+            SET 
+                amount_paid = v_calculated_paid,
+                status = v_new_status,
+                updated_at = NOW()
+            WHERE id = r_fee.id;
+            
+            RAISE NOTICE 'Fixed Fee ID %: Old Paid %, New Paid %', r_fee.id, r_fee.amount_paid, v_calculated_paid;
+        END IF;
+    END LOOP;
+
+    -- Reset GUC flag
+    PERFORM set_config('app.fee_recalc_mode', '', true);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Session-level search path (ALTER DATABASE removed — non-transactional DDL)
+SET search_path = public, extensions;
+
+-- ============================================================
+-- NOTIFICATION SYSTEM (Production Hardened)
+-- ============================================================
+
+DO $$ BEGIN
+    CREATE TYPE notification_channel AS ENUM ('IN_APP', 'EMAIL', 'SMS', 'PUSH');
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE notification_status AS ENUM ('PENDING', 'PROCESSING', 'DELIVERED', 'FAILED', 'READ', 'DISMISSED');
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    CREATE TYPE event_status AS ENUM ('RECEIVED', 'PROCESSED', 'FAILED');
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
+
+-- 1. Notification Templates
+CREATE TABLE IF NOT EXISTS notification_templates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type VARCHAR(100) UNIQUE NOT NULL,
+    title_template TEXT NOT NULL,
+    body_template TEXT NOT NULL,
+    default_channels notification_channel[] NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ
+);
+ALTER TABLE notification_templates ENABLE ROW LEVEL SECURITY;
+
+-- 2. Notification Preferences
+CREATE TABLE IF NOT EXISTS notification_preferences (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    event_type VARCHAR(100) REFERENCES notification_templates(event_type),
+    channel notification_channel NOT NULL,
+    is_enabled BOOLEAN DEFAULT TRUE,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ,
+    PRIMARY KEY (user_id, event_type, channel)
+);
+ALTER TABLE notification_preferences ENABLE ROW LEVEL SECURITY;
+
+-- 3. Notification Events
+CREATE TABLE IF NOT EXISTS notification_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    idempotency_key VARCHAR(255) UNIQUE NOT NULL,
+    event_type VARCHAR(100) NOT NULL REFERENCES notification_templates(event_type),
+    actor_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    target_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    payload JSONB NOT NULL,
+    status event_status NOT NULL DEFAULT 'RECEIVED',
+    error_reason TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ
+);
+ALTER TABLE notification_events ENABLE ROW LEVEL SECURITY;
+
+-- 4. Notifications
+CREATE TABLE IF NOT EXISTS notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id UUID NOT NULL REFERENCES notification_events(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL, 
+    body TEXT NOT NULL,
+    action_url TEXT,
+    status notification_status NOT NULL DEFAULT 'PENDING',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    read_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT uniq_notifications_event_user UNIQUE (event_id, user_id)
+);
+ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
+
+-- 5. Notification Deliveries
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    channel notification_channel NOT NULL,
+    provider_message_id VARCHAR(255),
+    status notification_status NOT NULL DEFAULT 'PENDING',
+    retry_count INT DEFAULT 0,
+    next_retry_at TIMESTAMPTZ,
+    error_log TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT uniq_delivery_notification_channel UNIQUE (notification_id, channel),
+    CONSTRAINT chk_max_retries CHECK (retry_count <= 5),
+    CONSTRAINT chk_retry_time CHECK (
+        (status = 'FAILED' AND next_retry_at IS NOT NULL) OR 
+        (status != 'FAILED')
+    )
+);
+ALTER TABLE notification_deliveries ENABLE ROW LEVEL SECURITY;
+
+-- 6. Notification Audit Logs
+CREATE TABLE IF NOT EXISTS notification_audit_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    delivery_id UUID REFERENCES notification_deliveries(id),
+    notification_id UUID REFERENCES notifications(id),
+    action VARCHAR(50) NOT NULL,
+    metadata JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes for Performance
+CREATE INDEX IF NOT EXISTS idx_notifications_unread_fetch 
+ON notifications (user_id, created_at DESC) 
+WHERE status IN ('PENDING', 'DELIVERED');
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_worker_fetch 
+ON notification_deliveries (next_retry_at) 
+WHERE status = 'FAILED' AND retry_count < 5;
+
+CREATE INDEX IF NOT EXISTS idx_events_idempotency ON notification_events(idempotency_key);
+
+-- ============================================================
+-- RECENT DDL PATCHES (Drivers, RLS, Timetables)
+-- ============================================================
+
+-- From apply_phase5_db.js
+CREATE TABLE IF NOT EXISTS public.driver_devices (
+    driver_id uuid NOT NULL,
+    device_id varchar NOT NULL,
+    last_active timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now(),
+    PRIMARY KEY (driver_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.driver_heartbeat (
+    driver_id uuid NOT NULL,
+    last_ping timestamp with time zone DEFAULT now(),
+    status varchar DEFAULT 'online', -- online, offline, paused
+    PRIMARY KEY (driver_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.bus_trip_history (
+    id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+    bus_id uuid NOT NULL,
+    latitude double precision,
+    longitude double precision,
+    speed double precision,
+    is_mocked boolean DEFAULT false,
+    is_suspicious boolean DEFAULT false,
+    recorded_at timestamp with time zone DEFAULT now()
+);
+
+ALTER TABLE public.bus_locations 
+  ADD COLUMN IF NOT EXISTS is_mocked boolean DEFAULT false,
+  ADD COLUMN IF NOT EXISTS is_suspicious boolean DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS idx_bus_locations_bus_id ON public.bus_locations (bus_id);
+CREATE INDEX IF NOT EXISTS idx_bus_locations_recorded_at ON public.bus_locations (recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bus_trip_history_bus_id_time ON public.bus_trip_history (bus_id, recorded_at DESC);
+
+
+-- From apply_driver_rls.js
+ALTER TABLE IF EXISTS public.buses ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Authenticated users can read buses" ON public.buses;
+CREATE POLICY "Authenticated users can read buses" ON public.buses FOR SELECT USING (auth.role() = 'authenticated');
+
+ALTER TABLE IF EXISTS public.bus_locations ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Authenticated users can read bus locations" ON public.bus_locations;
+CREATE POLICY "Authenticated users can read bus locations" ON public.bus_locations FOR SELECT USING (auth.role() = 'authenticated');
+DROP POLICY IF EXISTS "Authenticated users can insert bus locations" ON public.bus_locations;
+CREATE POLICY "Authenticated users can insert bus locations" ON public.bus_locations FOR INSERT WITH CHECK (auth.role() = 'authenticated');
+
+ALTER TABLE IF EXISTS public.transport_routes ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Authenticated users can read routes" ON public.transport_routes;
+CREATE POLICY "Authenticated users can read routes" ON public.transport_routes FOR SELECT USING (auth.role() = 'authenticated');
+
+ALTER TABLE IF EXISTS public.persons ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can read own person" ON public.persons;
+CREATE POLICY "Users can read own person" ON public.persons FOR SELECT USING (id IN (SELECT person_id FROM public.users WHERE public.users.id = auth.uid()) OR auth.role() = 'service_role' OR auth.role() = 'anon');
+
+ALTER TABLE IF EXISTS public.staff ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can read own staff record" ON public.staff;
+CREATE POLICY "Users can read own staff record" ON public.staff FOR SELECT USING (person_id IN (SELECT person_id FROM public.users WHERE public.users.id = auth.uid()) OR auth.role() = 'service_role' OR auth.role() = 'anon');
+
+
+-- From fix_trigger.js
+CREATE OR REPLACE FUNCTION public.sync_class_teacher_from_timetable()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+    IF (TG_OP = 'DELETE') THEN
+        IF OLD.period_number = 1 THEN
+             UPDATE class_sections 
+             SET class_teacher_id = NULL 
+             WHERE id = OLD.class_section_id;
+        END IF;
+        RETURN OLD;
+    END IF;
+
+    IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
+        IF NEW.period_number = 1 THEN
+             UPDATE class_sections 
+             SET class_teacher_id = NEW.teacher_id 
+             WHERE id = NEW.class_section_id;
+        END IF;
+        RETURN NEW;
+    END IF;
+    
+    RETURN NULL;
+END;
+$function$;
+
+
+-- From migrate_timetable.js
+CREATE OR REPLACE FUNCTION validate_timetable_entry()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_teacher_collision BOOLEAN;
+    v_room_collision BOOLEAN;
+BEGIN
+    IF NEW.teacher_id IS NOT NULL THEN
+        SELECT EXISTS (
+            SELECT 1 FROM timetable_slots
+            WHERE teacher_id = NEW.teacher_id
+              AND period_number = NEW.period_number
+              AND academic_year_id = NEW.academic_year_id
+              AND id <> COALESCE(NEW.id, '00000000-0000-0000-0000-000000000000'::uuid)
+        ) INTO v_teacher_collision;
+
+        IF v_teacher_collision THEN
+            RAISE EXCEPTION 'Teacher Collision: Teacher is already booked for period %', NEW.period_number;
+        END IF;
+    END IF;
+
+    IF NEW.room_no IS NOT NULL AND NEW.room_no <> '' THEN
+        SELECT EXISTS (
+            SELECT 1 FROM timetable_slots
+            WHERE room_no = NEW.room_no
+              AND period_number = NEW.period_number
+              AND academic_year_id = NEW.academic_year_id
+              AND id <> COALESCE(NEW.id, '00000000-0000-0000-0000-000000000000'::uuid)
+        ) INTO v_room_collision;
+
+        IF v_room_collision THEN
+            RAISE EXCEPTION 'Room Collision: Room % is already occupied during period %', NEW.room_no, NEW.period_number;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION validate_attendance_entry()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_class_section_id UUID;
+    v_class_teacher_id UUID;
+    v_is_admin BOOLEAN;
+    v_is_p1_teacher BOOLEAN;
+BEGIN
+    -- 1. Basic Date Validation 
+    IF NOT EXISTS (
+        SELECT 1 FROM student_enrollments
+        WHERE id = NEW.student_enrollment_id
+          AND status = 'active'
+          AND NEW.attendance_date BETWEEN start_date AND COALESCE(end_date, '9999-12-31'::date)
+          AND deleted_at IS NULL
+    ) THEN
+        RAISE EXCEPTION 'Invalid Attendance: Student is not active in this enrollment on %', NEW.attendance_date;
+    END IF;
+
+    -- 2. Authorization Check
+    IF NEW.marked_by IS NOT NULL THEN
+        SELECT se.class_section_id, cs.class_teacher_id INTO v_class_section_id, v_class_teacher_id
+        FROM student_enrollments se
+        JOIN class_sections cs ON se.class_section_id = cs.id
+        WHERE se.id = NEW.student_enrollment_id;
+
+        SELECT EXISTS (
+            SELECT 1 FROM user_roles ur
+            JOIN roles r ON ur.role_id = r.id
+            WHERE ur.user_id = NEW.marked_by AND r.code = 'admin'
+        ) INTO v_is_admin;
+
+        IF NOT v_is_admin THEN
+            SELECT EXISTS (
+                SELECT 1 FROM timetable_slots ts
+                JOIN staff s ON ts.teacher_id = s.id
+                WHERE ts.class_section_id = v_class_section_id
+                  AND ts.period_number = 1
+                  AND s.person_id = (SELECT person_id FROM users WHERE id = NEW.marked_by)
+                  AND ts.deleted_at IS NULL
+            ) INTO v_is_p1_teacher;
+
+            IF NOT v_is_p1_teacher AND v_class_teacher_id IS NOT NULL THEN
+                IF NOT EXISTS (
+                    SELECT 1 FROM staff s
+                    WHERE s.id = v_class_teacher_id
+                      AND s.person_id = (SELECT person_id FROM users WHERE id = NEW.marked_by)
+                ) THEN
+                    RAISE EXCEPTION 'Unauthorized: Only the assigned Class Teacher, Period 1 Teacher, or Admin can mark attendance';
+                END IF;
+            END IF;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ 
+BEGIN
+  ALTER TABLE timetable_slots DROP COLUMN IF EXISTS day_of_week CASCADE;
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+
+DROP INDEX IF EXISTS uq_timetable_slots_active;
+DROP INDEX IF EXISTS idx_timetable_slots_time_check;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_timetable_slots_active 
+ON timetable_slots (class_section_id, academic_year_id, period_number) 
+WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_timetable_class ON timetable_slots(class_section_id);
+CREATE INDEX IF NOT EXISTS idx_timetable_teacher ON timetable_slots(teacher_id);
+CREATE INDEX IF NOT EXISTS idx_timetable_slots_time_check ON timetable_slots(teacher_id, start_time, end_time);
 
 COMMIT;
 

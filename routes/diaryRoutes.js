@@ -3,23 +3,61 @@ import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
+import fs from 'fs';
+import { translateToHybridTelugu } from '../services/translationService.js';
 
 const router = express.Router();
+
+function logDebug(msg) {
+  try {
+    fs.appendFileSync('debug_log.txt', `${new Date().toISOString()} - ${msg}\n`);
+  } catch (e) {
+    console.error('Log failed', e);
+  }
+}
 
 /**
  * GET /diary
  * Get diary entries (filter by class, date)
  */
 router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) => {
-  const { class_section_id, date, from_date, to_date, subject_id, page = 1, limit = 20 } = req.query;
+  const { class_section_id, entry_date, from_date, to_date, subject_id, page = 1, limit = 20, updated_since } = req.query;
   const offset = (page - 1) * limit;
 
+  logDebug(`[Diary] URL: ${req.originalUrl}`);
+  logDebug(`[Diary] Fetch Request: class=${class_section_id}, updated_since=${updated_since}, user=${req.user?.id}`);
+
   let entries;
-  if (class_section_id && date) {
+
+  // Sync Logic: If updated_since is provided, return all changed records without pagination
+  if (updated_since && class_section_id) {
+    const sinceDate = new Date(parseInt(updated_since));
+
+    entries = await sql`
+      SELECT 
+        d.id, d.entry_date, d.title, d.title_te, d.content, d.content_te, d.homework_due_date, d.attachments,
+        d.class_section_id, d.subject_id, d.created_by, d.created_at, d.updated_at,
+        s.name as subject_name,
+        creator.display_name as created_by_name
+      FROM diary_entries d
+      LEFT JOIN subjects s ON d.subject_id = s.id
+      JOIN users u ON d.created_by = u.id
+      JOIN persons creator ON u.person_id = creator.id
+      WHERE d.class_section_id = ${class_section_id}
+        AND (d.updated_at > ${sinceDate} OR d.created_at > ${sinceDate})
+      ORDER BY d.updated_at DESC
+    `;
+
+    logDebug(`[Diary] Sync found ${entries.length} entries`);
+    res.set('ETag', false); // Disable ETag to prevent 304 Not Modified
+    return res.json(entries);
+  }
+  if (class_section_id && entry_date) {
     // Specific class and date
     entries = await sql`
       SELECT 
-        d.id, d.entry_date, d.title, d.content, d.homework_due_date, d.attachments,
+        d.id, d.entry_date, d.title, d.title_te, d.content, d.content_te, d.homework_due_date, d.attachments,
+        d.class_section_id,
         s.name as subject_name,
         creator.display_name as created_by_name,
         d.created_at
@@ -28,7 +66,7 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
       JOIN users u ON d.created_by = u.id
       JOIN persons creator ON u.person_id = creator.id
       WHERE d.class_section_id = ${class_section_id}
-        AND d.entry_date = ${date}
+        AND d.entry_date = ${entry_date}
         ${subject_id ? sql`AND d.subject_id = ${subject_id}` : sql``}
       ORDER BY s.name NULLS LAST
     `;
@@ -36,7 +74,8 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
     // Date range
     entries = await sql`
       SELECT 
-        d.id, d.entry_date, d.title, d.content, d.homework_due_date,
+        d.id, d.entry_date, d.title, d.title_te, d.content, d.content_te, d.homework_due_date,
+        d.class_section_id,
         s.name as subject_name,
         creator.display_name as created_by_name
       FROM diary_entries d
@@ -52,8 +91,9 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
     // All entries for a class
     entries = await sql`
       SELECT 
-        d.id, d.entry_date, d.title, d.content, d.homework_due_date, d.attachments,
+        d.id, d.entry_date, d.title, d.title_te, d.content, d.content_te, d.homework_due_date, d.attachments,
         d.subject_id, d.created_by, d.created_at, d.updated_at,
+        d.class_section_id,
         s.name as subject_name
       FROM diary_entries d
       LEFT JOIN subjects s ON d.subject_id = s.id
@@ -66,7 +106,7 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
     // Only return entries for classes/subjects currently assigned to the teacher
     entries = await sql`
             SELECT 
-                d.id, d.entry_date, d.title, d.content, d.homework_due_date,
+                d.id, d.entry_date, d.title, d.title_te, d.content, d.content_te, d.homework_due_date,
                 s.name as subject_name,
                 c.name as class_name, sec.name as section_name,
                 d.class_section_id, d.subject_id,
@@ -102,7 +142,9 @@ router.get('/:id', requirePermission('diary.view'), asyncHandler(async (req, res
 
   const [entry] = await sql`
     SELECT 
-      d.*,
+      d.id, d.entry_date, d.title, d.title_te, d.content, d.content_te, d.homework_due_date, d.attachments,
+      d.subject_id, d.created_by, d.created_at, d.updated_at,
+      d.class_section_id,
       s.name as subject_name,
       c.name as class_name, sec.name as section_name,
       creator.display_name as created_by_name
@@ -129,17 +171,36 @@ router.get('/:id', requirePermission('diary.view'), asyncHandler(async (req, res
  */
 router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res) => {
   const { class_section_id, subject_id, entry_date, title, content, homework_due_date, attachments } = req.body;
+  logDebug(`[Diary] Creating entry: class=${class_section_id}, date=${entry_date}, subject=${subject_id}, user=${req.user.internal_id}`);
 
   if (!class_section_id || !content || !entry_date) {
     return res.status(400).json({ error: 'class_section_id, content, and entry_date are required' });
   }
 
-  const [entry] = await sql`
-    INSERT INTO diary_entries (class_section_id, subject_id, entry_date, title, content, homework_due_date, attachments, created_by)
-    VALUES (${class_section_id}, ${subject_id}, ${entry_date}, ${title}, ${content}, 
-            ${homework_due_date}, ${attachments ? JSON.stringify(attachments) : null}, ${req.user.internal_id})
-    RETURNING *
-  `;
+  let title_te = null;
+  let content_te = null;
+  try {
+    const translations = await translateToHybridTelugu([title || '', content || '']);
+    if (title) title_te = translations[0];
+    if (content) content_te = translations[1];
+  } catch (e) {
+    console.error('[Diary] Translation Error:', e);
+  }
+
+  let entry;
+  try {
+    const result = await sql`
+      INSERT INTO diary_entries (class_section_id, subject_id, entry_date, title, title_te, content, content_te, homework_due_date, attachments, created_by)
+      VALUES (${class_section_id}, ${subject_id}, ${entry_date}, ${title}, ${title_te}, ${content}, ${content_te}, 
+              ${homework_due_date || null}, ${attachments ? JSON.stringify(attachments) : null}, ${req.user.internal_id})
+      RETURNING *
+    `;
+    entry = result[0];
+  } catch (dbErr) {
+    logDebug(`[Diary] DB Insert Error: ${dbErr.message}`);
+    console.error('[Diary] DB Insert Error:', dbErr);
+    throw dbErr;
+  }
 
   // Notification: DIARY_UPDATED (Students in class section)
   (async () => {
@@ -201,18 +262,45 @@ router.put('/:id', requirePermission('diary.create'), asyncHandler(async (req, r
     return res.status(403).json({ error: 'Can only update your own entries' });
   }
 
-  const [updated] = await sql`
-    UPDATE diary_entries
-    SET 
-      subject_id = COALESCE(${subject_id}, subject_id),
-      title = COALESCE(${title}, title),
-      content = COALESCE(${content}, content),
-      homework_due_date = COALESCE(${homework_due_date}, homework_due_date),
-      attachments = COALESCE(${attachments ? JSON.stringify(attachments) : null}, attachments),
-      updated_at = now()
-    WHERE id = ${id}
-    RETURNING *
-  `;
+  logDebug(`[Diary] Updating entry: id=${id}, subject=${subject_id}`);
+
+  let sql_title_te = sql`title_te`;
+  let sql_content_te = sql`content_te`;
+
+  if (title || content) {
+    try {
+      const transTitle = title || '';
+      const transContent = content || '';
+      const translations = await translateToHybridTelugu([transTitle, transContent]);
+      if (title) sql_title_te = sql`${translations[0]}`;
+      if (content) sql_content_te = sql`${translations[1]}`;
+    } catch (e) {
+      console.error('[Diary] Translation Update Error:', e);
+    }
+  }
+
+  let updated;
+  try {
+    const result = await sql`
+      UPDATE diary_entries
+      SET 
+        subject_id = COALESCE(${subject_id}, subject_id),
+        title = COALESCE(${title || null}, title),
+        content = COALESCE(${content || null}, content),
+        title_te = ${sql_title_te},
+        content_te = ${sql_content_te},
+        homework_due_date = COALESCE(${homework_due_date || null}, homework_due_date),
+        attachments = COALESCE(${attachments ? JSON.stringify(attachments) : null}, attachments),
+        updated_at = now()
+      WHERE id = ${id}
+      RETURNING *
+    `;
+    updated = result[0];
+  } catch (dbErr) {
+    logDebug(`[Diary] DB Update Error: ${dbErr.message}`);
+    console.error('[Diary] DB Update Error:', dbErr);
+    throw dbErr;
+  }
 
   res.json({ message: 'Diary entry updated', entry: updated });
 }));

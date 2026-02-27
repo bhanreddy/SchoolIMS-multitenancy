@@ -7,11 +7,45 @@ const router = express.Router();
 // Get all students
 router.get('/', requirePermission('students.view'), async (req, res) => {
   try {
-    const { search, limit, class_section_id } = req.query;
+    const { search, limit = 20, page = 1, class_id, section_id, status_id, sort_by = 'name', sort_order = 'asc' } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
 
-    let query = sql`
+    let whereClause = sql`s.deleted_at IS NULL`;
+
+    if (class_id) {
+      whereClause = sql`${whereClause} AND c.id = ${class_id}`;
+    }
+    if (section_id) {
+      whereClause = sql`${whereClause} AND sec.id = ${section_id}`;
+    }
+    if (status_id) {
+      whereClause = sql`${whereClause} AND s.status_id = ${status_id}`;
+    }
+    if (search) {
+      whereClause = sql`${whereClause} AND (
+        p.display_name ILIKE ${'%' + search + '%'} OR 
+        s.admission_no ILIKE ${'%' + search + '%'}
+      )`;
+    }
+
+    // Dynamic sorting
+    const direction = sort_order.toLowerCase() === 'desc' ? sql`DESC` : sql`ASC`;
+    let orderBy;
+    switch (sort_by) {
+      case 'roll_number':
+        orderBy = sql`se.roll_number ${direction}, p.first_name ASC`;
+        break;
+      case 'admission_no':
+        orderBy = sql`s.admission_no ${direction}`;
+        break;
+      case 'name':
+      default:
+        orderBy = sql`p.first_name ${direction}, p.last_name ${direction}`;
+    }
+
+    const students = await sql`
       SELECT 
-        s.id, s.admission_no, s.admission_date,
+        s.id, s.admission_no, s.admission_date, s.status_id,
         p.first_name, p.middle_name, p.last_name, p.display_name, p.dob, p.gender_id,
         st.code as status,
         (SELECT contact_value FROM person_contacts pc WHERE pc.person_id = p.id AND pc.contact_type = 'email' AND pc.is_primary = true LIMIT 1) as email,
@@ -29,8 +63,10 @@ router.get('/', requirePermission('students.view'), async (req, res) => {
         json_build_object(
             'roll_number', se.roll_number,
             'class_code', c.code,
+            'class_id', c.id,
             'section_name', sec.name,
-            'id', se.id -- Useful for enrollment mapping
+            'section_id', sec.id,
+            'id', se.id
         ) as current_enrollment
       FROM students s
       JOIN persons p ON s.person_id = p.id
@@ -39,35 +75,45 @@ router.get('/', requirePermission('students.view'), async (req, res) => {
       LEFT JOIN class_sections cs ON se.class_section_id = cs.id
       LEFT JOIN classes c ON cs.class_id = c.id
       LEFT JOIN sections sec ON cs.section_id = sec.id
-      WHERE s.deleted_at IS NULL
+      WHERE ${whereClause}
+      ORDER BY ${orderBy}
+      LIMIT ${limit} OFFSET ${offset}
     `;
 
-    if (class_section_id) {
-      query = sql`${query} AND se.class_section_id = ${class_section_id}`;
-    }
+    const [countResult] = await sql`
+      SELECT count(*)::int as total
+      FROM students s
+      JOIN persons p ON s.person_id = p.id
+      LEFT JOIN student_enrollments se ON s.id = se.student_id AND se.status = 'active' AND se.deleted_at IS NULL
+      LEFT JOIN class_sections cs ON se.class_section_id = cs.id
+      LEFT JOIN classes c ON cs.class_id = c.id
+      LEFT JOIN sections sec ON cs.section_id = sec.id
+      WHERE ${whereClause}
+    `;
 
-    if (search) {
-      query = sql`${query} AND (
-        p.display_name ILIKE ${'%' + search + '%'} OR 
-        s.admission_no ILIKE ${'%' + search + '%'}
-      )`;
-    }
-
-    if (limit) {
-      query = sql`${query} LIMIT ${limit}`;
-    }
-
-    const students = await query;
     res.json({
       data: students,
       meta: {
-        total: students.length,
-        limit: limit ? parseInt(limit) : students.length
+        total: countResult.total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total_pages: Math.ceil(countResult.total / parseInt(limit))
       }
     });
   } catch (error) {
     console.error('Error fetching students:', error);
     res.status(500).json({ error: 'Failed to fetch students', details: error.message });
+  }
+});
+
+// Get student statuses
+router.get('/statuses', requirePermission('students.view'), async (req, res) => {
+  try {
+    const statuses = await sql`SELECT id, code as name FROM student_statuses ORDER BY id`;
+    res.json(statuses);
+  } catch (error) {
+    console.error('Error fetching student statuses:', error);
+    res.status(500).json({ error: 'Failed to fetch student statuses' });
   }
 });
 

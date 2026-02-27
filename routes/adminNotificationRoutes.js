@@ -72,7 +72,6 @@ router.post('/fees/send-all', requirePermission('fees.manage'), asyncHandler(asy
             s.admission_no,
             p.display_name,
             u_parent.id as parent_user_id,
-            u_parent.role_id, -- We might need to join roles to get text code
             d.fcm_token
         FROM students s
         JOIN persons p ON s.person_id = p.id

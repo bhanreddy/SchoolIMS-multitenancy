@@ -2,6 +2,7 @@ import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import sql from '../db.js';
+import { translateToHybridTelugu } from '../services/translationService.js';
 
 const router = express.Router();
 
@@ -126,6 +127,32 @@ Answer the question now, adhering strictly to the rules above.
         res.status(502).json({
             error: 'AI Request Failed',
             details: error.message || 'Unknown error'
+        });
+    }
+});
+
+// NEW ROUTE: Hybrid Telugu Translation Endpoint
+router.post('/translate', async (req, res) => {
+    try {
+        const { texts } = req.body;
+
+        if (!texts || !Array.isArray(texts)) {
+            return res.status(400).json({ error: 'texts array is required' });
+        }
+
+        // Limit chunk sizes to prevent timeouts / giant payload
+        if (texts.length > 50) {
+            return res.status(400).json({ error: 'Max 50 strings per request' });
+        }
+
+        const translatedTexts = await translateToHybridTelugu(texts);
+
+        res.json({ translations: translatedTexts });
+    } catch (error) {
+        console.error('Translation Endpoint Error:', error);
+        res.status(500).json({
+            error: 'Failed to translate texts',
+            details: error.message
         });
     }
 });

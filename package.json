@@ -1,6 +1,6 @@
 {
   "name": "supabase-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Supabase Backend API",
   "main": "server.js",
   "scripts": {
@@ -23,6 +23,8 @@
     "nodemon": "^3.1.11",
     "openai": "^6.17.0",
     "pg": "^8.18.0",
-    "postgres": "^3.4.8"
+    "postgres": "^3.4.8",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1"
   }
 }

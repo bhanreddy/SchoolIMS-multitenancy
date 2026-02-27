@@ -1,6 +1,6 @@
 import express from 'express';
 import sql, { supabaseAdmin } from '../db.js';
-import { requirePermission } from '../middleware/auth.js';
+import { requirePermission, requireAuth } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = express.Router();
@@ -323,6 +323,76 @@ router.get('/:id/timetable', requirePermission('staff.view'), asyncHandler(async
 }));
 
 /**
+ * GET /staff/:id/payslips
+ * Get ALL staff payslips (list)
+ */
+router.get('/:id/payslips', requireAuth, asyncHandler(async (req, res) => {
+    const { id } = req.params;
+
+    // 1. Check permissions (Own Data OR Has Permission)
+    const [targetStaff] = await sql`SELECT person_id FROM staff WHERE id = ${id}`;
+
+    if (!targetStaff) {
+        return res.status(404).json({ error: 'Staff not found' });
+    }
+
+    // Allow if user is looking at their own data OR has staff.view permission
+    const isSelf = req.user.person_id === targetStaff.person_id;
+    const hasPermission = req.user.permissions && req.user.permissions.includes('staff.view');
+
+    if (!isSelf && !hasPermission) {
+        return res.status(403).json({ error: 'Forbidden: missing permission staff.view' });
+    }
+
+    // Get all payslips ordered by date desc
+    const payslips = await sql`
+        SELECT 
+            sp.id,
+            sp.payroll_month as month,
+            sp.payroll_year as year,
+            sp.status,
+            sp.net_salary as net,
+            sp.base_salary + COALESCE(sp.bonus, 0) as earnings,
+            sp.deductions as deductions,
+            sp.payment_date,
+            st.staff_code,
+            p.display_name as staff_name,
+            sd.name as designation
+        FROM staff_payroll sp
+        JOIN staff st ON sp.staff_id = st.id
+        JOIN persons p ON st.person_id = p.id
+        LEFT JOIN staff_designations sd ON st.designation_id = sd.id
+        WHERE sp.staff_id = ${id}
+        ORDER BY sp.payroll_year DESC, sp.payroll_month DESC
+    `;
+
+    // Format for frontend (matches Payslip interface in payslip.tsx)
+    const formattedPayslips = payslips.map(p => {
+        // Format currency helper
+        const formatCurrency = (amount) => {
+            return `₹${Number(amount || 0).toLocaleString('en-IN')}`;
+        };
+
+        // Get month name
+        const date = new Date();
+        date.setMonth(p.month - 1);
+        const monthName = date.toLocaleString('default', { month: 'long' });
+
+        return {
+            id: p.id,
+            month: `${monthName} ${p.year}`,
+            status: p.status.charAt(0).toUpperCase() + p.status.slice(1), // Capitalize
+            earnings: formatCurrency(p.earnings),
+            deductions: formatCurrency(p.deductions),
+            net: formatCurrency(p.net),
+            payment_date: p.payment_date
+        };
+    });
+
+    res.json(formattedPayslips);
+}));
+
+/**
  * GET /staff/:id/payslip
  * Get staff payslip (placeholder - needs payroll tables)
  */
@@ -350,8 +420,8 @@ router.get('/:id/payslip', requirePermission('staff.view'), asyncHandler(async (
         JOIN persons p ON st.person_id = p.id
         LEFT JOIN staff_designations sd ON st.designation_id = sd.id
         WHERE sp.staff_id = ${id}
-          AND sp.payroll_month = ${targetMonth}
-          AND sp.payroll_year = ${targetYear}
+        AND sp.payroll_month = ${targetMonth}
+        AND sp.payroll_year = ${targetYear}
     `;
 
     if (!payroll) {

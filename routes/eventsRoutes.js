@@ -10,12 +10,12 @@ const router = express.Router();
  * List events (with date range and type filters)
  */
 router.get('/', requirePermission('events.view'), asyncHandler(async (req, res) => {
-    const { from_date, to_date, event_type, upcoming_only, page = 1, limit = 20 } = req.query;
-    const offset = (page - 1) * limit;
+  const { from_date, to_date, event_type, upcoming_only, page = 1, limit = 20 } = req.query;
+  const offset = (page - 1) * limit;
 
-    let events;
-    if (upcoming_only === 'true') {
-        events = await sql`
+  let events;
+  if (upcoming_only === 'true') {
+    events = await sql`
       SELECT 
         id, title, description, event_type, start_date, end_date,
         start_time, end_time, location, is_all_day, is_public
@@ -25,8 +25,8 @@ router.get('/', requirePermission('events.view'), asyncHandler(async (req, res) 
       ORDER BY start_date, start_time
       LIMIT ${limit} OFFSET ${offset}
     `;
-    } else {
-        events = await sql`
+  } else {
+    events = await sql`
       SELECT 
         id, title, description, event_type, start_date, end_date,
         start_time, end_time, location, is_all_day, is_public
@@ -38,9 +38,9 @@ router.get('/', requirePermission('events.view'), asyncHandler(async (req, res) 
       ORDER BY start_date DESC, start_time
       LIMIT ${limit} OFFSET ${offset}
     `;
-    }
+  }
 
-    res.json(events);
+  res.json(events);
 }));
 
 /**
@@ -48,16 +48,16 @@ router.get('/', requirePermission('events.view'), asyncHandler(async (req, res) 
  * Get events for calendar view (month/week)
  */
 router.get('/calendar', requirePermission('events.view'), asyncHandler(async (req, res) => {
-    const { year, month } = req.query;
+  const { year, month } = req.query;
 
-    if (!year || !month) {
-        return res.status(400).json({ error: 'year and month are required' });
-    }
+  if (!year || !month) {
+    return res.status(400).json({ error: 'year and month are required' });
+  }
 
-    const startDate = `${year}-${month.padStart(2, '0')}-01`;
-    const endDate = new Date(year, month, 0).toISOString().split('T')[0]; // Last day of month
+  const startDate = `${year}-${month.padStart(2, '0')}-01`;
+  const endDate = new Date(year, month, 0).toISOString().split('T')[0]; // Last day of month
 
-    const events = await sql`
+  const events = await sql`
     SELECT 
       id, title, event_type, start_date, end_date, start_time, end_time,
       is_all_day, location
@@ -68,7 +68,7 @@ router.get('/calendar', requirePermission('events.view'), asyncHandler(async (re
     ORDER BY start_date, start_time
   `;
 
-    res.json(events);
+  res.json(events);
 }));
 
 /**
@@ -76,9 +76,9 @@ router.get('/calendar', requirePermission('events.view'), asyncHandler(async (re
  * Get event details
  */
 router.get('/:id', requirePermission('events.view'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    const [event] = await sql`
+  const [event] = await sql`
     SELECT e.*, creator.display_name as created_by_name
     FROM events e
     LEFT JOIN users u ON e.created_by = u.id
@@ -86,11 +86,11 @@ router.get('/:id', requirePermission('events.view'), asyncHandler(async (req, re
     WHERE e.id = ${id}
   `;
 
-    if (!event) {
-        return res.status(404).json({ error: 'Event not found' });
-    }
+  if (!event) {
+    return res.status(404).json({ error: 'Event not found' });
+  }
 
-    res.json(event);
+  res.json(event);
 }));
 
 /**
@@ -98,13 +98,13 @@ router.get('/:id', requirePermission('events.view'), asyncHandler(async (req, re
  * Create an event
  */
 router.post('/', requirePermission('events.manage'), asyncHandler(async (req, res) => {
-    const { title, description, event_type, start_date, end_date, start_time, end_time, location, is_all_day, is_public, target_audience } = req.body;
+  const { title, description, event_type, start_date, end_date, start_time, end_time, location, is_all_day, is_public, target_audience } = req.body;
 
-    if (!title || !start_date) {
-        return res.status(400).json({ error: 'title and start_date are required' });
-    }
+  if (!title || !start_date) {
+    return res.status(400).json({ error: 'title and start_date are required' });
+  }
 
-    const [event] = await sql`
+  const [event] = await sql`
     INSERT INTO events (title, description, event_type, start_date, end_date, start_time, end_time, location, is_all_day, is_public, target_audience, created_by)
     VALUES (${title}, ${description}, ${event_type || 'other'}, ${start_date}, ${end_date}, 
             ${start_time}, ${end_time}, ${location}, ${is_all_day || false}, ${is_public !== false}, 
@@ -112,7 +112,7 @@ router.post('/', requirePermission('events.manage'), asyncHandler(async (req, re
     RETURNING *
   `;
 
-    res.status(201).json({ message: 'Event created', event });
+  res.status(201).json({ message: 'Event created', event });
 }));
 
 /**
@@ -120,10 +120,10 @@ router.post('/', requirePermission('events.manage'), asyncHandler(async (req, re
  * Update an event
  */
 router.put('/:id', requirePermission('events.manage'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const { title, description, event_type, start_date, end_date, start_time, end_time, location, is_all_day, is_public } = req.body;
+  const { id } = req.params;
+  const { title, description, event_type, start_date, end_date, start_time, end_time, location, is_all_day, is_public } = req.body;
 
-    const [updated] = await sql`
+  const [updated] = await sql`
     UPDATE events
     SET 
       title = COALESCE(${title}, title),
@@ -140,11 +140,11 @@ router.put('/:id', requirePermission('events.manage'), asyncHandler(async (req, 
     RETURNING *
   `;
 
-    if (!updated) {
-        return res.status(404).json({ error: 'Event not found' });
-    }
+  if (!updated) {
+    return res.status(404).json({ error: 'Event not found' });
+  }
 
-    res.json({ message: 'Event updated', event: updated });
+  res.json({ message: 'Event updated', event: updated });
 }));
 
 /**
@@ -152,15 +152,15 @@ router.put('/:id', requirePermission('events.manage'), asyncHandler(async (req, 
  * Delete an event
  */
 router.delete('/:id', requirePermission('events.manage'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    const [deleted] = await sql`DELETE FROM events WHERE id = ${id} RETURNING id`;
+  const [deleted] = await sql`DELETE FROM events WHERE id = ${id} RETURNING id`;
 
-    if (!deleted) {
-        return res.status(404).json({ error: 'Event not found' });
-    }
+  if (!deleted) {
+    return res.status(404).json({ error: 'Event not found' });
+  }
 
-    res.json({ message: 'Event deleted' });
+  res.json({ message: 'Event deleted' });
 }));
 
 export default router;

@@ -3,6 +3,7 @@ import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
+import { translateToHybridTelugu } from '../services/translationService.js';
 
 const router = express.Router();
 
@@ -16,7 +17,7 @@ router.get('/', requirePermission('notices.view'), asyncHandler(async (req, res)
 
   const notices = await sql`
     SELECT 
-      n.id, n.title, n.content, n.audience, n.priority,
+      n.id, n.title, n.content, n.title_te, n.content_te, n.audience, n.priority,
       n.is_pinned, 
       n.publish_at as published_at,
       n.expires_at,
@@ -88,9 +89,21 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
   const safePublishAt = publish_at || new Date();
 
   try {
+    let title_te = null;
+    let content_te = null;
+
+    // Auto-generate Hybrid Telugu
+    try {
+      const translations = await translateToHybridTelugu([title, content]);
+      title_te = translations[0];
+      content_te = translations[1];
+    } catch (e) {
+      console.error('Failed to translate notice to Hybrid Telugu:', e);
+    }
+
     const [notice] = await sql`
-        INSERT INTO notices (title, content, audience, target_class_id, priority, is_pinned, publish_at, expires_at, created_by)
-        VALUES (${title}, ${content}, ${safeAudience}, ${safeTargetClassId}, 
+        INSERT INTO notices (title, content, title_te, content_te, audience, target_class_id, priority, is_pinned, publish_at, expires_at, created_by)
+        VALUES (${title}, ${content}, ${title_te}, ${content_te}, ${safeAudience}, ${safeTargetClassId}, 
                 ${safePriority}, ${is_pinned || false}, ${safePublishAt}, ${expires_at || null}, ${req.user.internal_id})
         RETURNING *
       `;
@@ -117,7 +130,7 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
              JOIN parents p ON u.person_id = p.person_id
              JOIN student_parents sp ON p.id = sp.parent_id
              JOIN students s ON sp.student_id = s.id
-             JOIN student_enrollments se ON s.id = se.student_id
+             JOIN student_enrollments se ON s.id = se.class_section_id
              JOIN class_sections cs ON se.class_section_id = cs.id
              WHERE cs.class_id = ${safeTargetClassId}
                AND se.status = 'active'
@@ -173,11 +186,28 @@ router.put('/:id', requirePermission('notices.manage'), asyncHandler(async (req,
   const { id } = req.params;
   const { title, content, audience, target_class_id, priority, is_pinned, publish_at, expires_at } = req.body;
 
+  let sql_title_te = sql`title_te`;
+  let sql_content_te = sql`content_te`;
+
+  if (title || content) {
+    try {
+      const transTitle = title || '';
+      const transContent = content || '';
+      const translations = await translateToHybridTelugu([transTitle, transContent]);
+      if (title) sql_title_te = sql`${translations[0]}`;
+      if (content) sql_content_te = sql`${translations[1]}`;
+    } catch (e) {
+      console.error('Failed to translate notice update to Hybrid Telugu:', e);
+    }
+  }
+
   const [updated] = await sql`
     UPDATE notices
     SET 
-      title = COALESCE(${title}, title),
-      content = COALESCE(${content}, content),
+      title = COALESCE(${title || null}, title),
+      content = COALESCE(${content || null}, content),
+      title_te = ${sql_title_te},
+      content_te = ${sql_content_te},
       audience = COALESCE(${audience}, audience),
       target_class_id = COALESCE(${target_class_id}, target_class_id),
       priority = COALESCE(${priority}, priority),

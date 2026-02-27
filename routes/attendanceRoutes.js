@@ -243,7 +243,7 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
 
         // 1. Resolve Users (Student User + Parent Users)
         const targetUsers = await sql`
-           SELECT u.id as user_id, u.role_id, 'student' as role
+           SELECT u.id as user_id, 'student' as role
            FROM students s
            JOIN users u ON s.person_id = u.person_id
            WHERE s.id = ${student_id}
@@ -251,7 +251,7 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
            
            UNION
            
-           SELECT u.id as user_id, u.role_id, 'parent' as role
+           SELECT u.id as user_id, 'parent' as role
            FROM student_parents sp
            JOIN parents p ON sp.parent_id = p.id
            JOIN users u ON p.person_id = u.person_id
