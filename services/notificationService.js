@@ -53,7 +53,7 @@ export async function sendNotificationToUsers(userIds = [], type, params = {}) {
     if (customSoundTokens.length > 0) {
         for (let i = 0; i < customSoundTokens.length; i += BATCH_SIZE) {
             const tokenChunk = customSoundTokens.slice(i, i + BATCH_SIZE);
-            const { success, failure } = await sendBatch(tokenChunk, { title, body, deepLink, soundFile, channelId, type, customSound: true });
+            const { success, failure } = await sendBatch(tokenChunk, { title, body, deepLink, soundFile, channelId: `${channelId}_custom`, type, customSound: true });
             totalSuccess += success;
             totalFailure += failure;
         }
@@ -63,7 +63,7 @@ export async function sendNotificationToUsers(userIds = [], type, params = {}) {
     if (defaultSoundTokens.length > 0) {
         for (let i = 0; i < defaultSoundTokens.length; i += BATCH_SIZE) {
             const tokenChunk = defaultSoundTokens.slice(i, i + BATCH_SIZE);
-            const { success, failure } = await sendBatch(tokenChunk, { title, body, deepLink, soundFile: 'default', channelId: 'default', type, customSound: false });
+            const { success, failure } = await sendBatch(tokenChunk, { title, body, deepLink, soundFile: 'default', channelId: `${channelId}_default`, type, customSound: false });
             totalSuccess += success;
             totalFailure += failure;
         }
@@ -87,7 +87,7 @@ async function sendBatch(tokens, { title, body, deepLink, soundFile, channelId, 
         notification: { title, body },
         android: {
             notification: {
-                sound: channelId, // android sound matches channelId usually as per config
+                sound: soundFile && soundFile !== 'default' ? soundFile.replace(/\.[^/.]+$/, "") : 'default',
                 channelId: channelId
             }
         },
