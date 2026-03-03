@@ -43,6 +43,7 @@ router.get('/me/classes', async (req, res) => {
                 cs.class_section_id,
                 c.id as class_id,
                 c.name as class_name,
+                sec.id as section_id,
                 sec.name as section_name,
                 s.id as subject_id,
                 s.name as subject_name,

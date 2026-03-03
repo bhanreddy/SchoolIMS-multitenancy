@@ -13,6 +13,23 @@ const router = express.Router();
  * Get a flat feed of all materials (filtered by student's class if needed, here getting all public/latest)
  */
 router.get('/all-materials', requirePermission('lms.view'), asyncHandler(async (req, res) => {
+  // Try to determine the user's class if they are a student
+  let studentClassId = null;
+
+  if (req.user?.roles.includes('student')) {
+    const [enrollment] = await sql`
+      SELECT cs.class_id
+      FROM users u
+      JOIN students s ON u.person_id = s.person_id
+      JOIN student_enrollments se ON s.id = se.student_id
+      JOIN class_sections cs ON se.class_section_id = cs.id
+      WHERE u.id = ${req.user.internal_id}
+        AND se.status = 'active'
+      LIMIT 1
+    `;
+    studentClassId = enrollment?.class_id || null;
+  }
+
   const materials = await sql`
     SELECT 
       m.id, m.title, m.description, m.content_url, m.duration, m.material_type, m.created_at,
@@ -24,7 +41,9 @@ router.get('/all-materials', requirePermission('lms.view'), asyncHandler(async (
     LEFT JOIN classes cl ON c.class_id = cl.id
     LEFT JOIN staff st ON c.instructor_id = st.id
     LEFT JOIN persons instructor ON st.person_id = instructor.id
-    WHERE m.is_published = true AND c.is_published = true
+    WHERE m.is_published = true 
+      AND c.is_published = true
+      ${studentClassId ? sql`AND c.class_id = ${studentClassId}` : sql``}
     ORDER BY m.created_at DESC
     LIMIT 100
   `;
@@ -311,6 +330,60 @@ router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async
     WHERE id = ${id}
     RETURNING *
   `;
+
+  // Notification Logic (Async)
+  (async () => {
+    try {
+      // Only notify if published
+      if (!updated?.is_published) return;
+
+      // Fetch Course Class ID
+      const [courseInfo] = await sql`
+        SELECT c.class_id, c.title as course_title 
+        FROM lms_materials m
+        JOIN lms_courses c ON m.course_id = c.id
+        WHERE m.id = ${id}
+      `;
+      const targetClassId = courseInfo?.class_id;
+
+      if (!targetClassId) return;
+
+      const recipients = await sql`
+        SELECT DISTINCT u.id
+        FROM users u
+        JOIN students s ON u.person_id = s.person_id
+        JOIN student_enrollments se ON s.id = se.student_id
+        JOIN class_sections cs ON se.class_section_id = cs.id
+        WHERE cs.class_id = ${targetClassId}
+          AND se.status = 'active'
+          AND u.account_status = 'active'
+
+        UNION
+
+        SELECT DISTINCT u.id
+        FROM users u
+        JOIN parents p ON u.person_id = p.person_id
+        JOIN student_parents sp ON p.id = sp.parent_id
+        JOIN students s ON sp.student_id = s.id
+        JOIN student_enrollments se ON s.id = se.student_id
+        JOIN class_sections cs ON se.class_section_id = cs.id
+        WHERE cs.class_id = ${targetClassId}
+          AND se.status = 'active'
+          AND u.account_status = 'active'
+      `;
+
+      if (recipients.length > 0) {
+        const userIds = recipients.map(r => r.id);
+        await sendNotificationToUsers(
+          userIds,
+          'LMS_CONTENT',
+          { message: `Study material updated: ${updated.title || 'In Course: ' + courseInfo.course_title}` }
+        );
+      }
+    } catch (notifyErr) {
+      console.error('[Notification] LMS_CONTENT update notify failed:', notifyErr);
+    }
+  })();
 
   res.json({ message: 'Material updated', material: updated });
 }));

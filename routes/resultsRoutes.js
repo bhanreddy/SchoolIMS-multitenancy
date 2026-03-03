@@ -908,6 +908,13 @@ router.post('/upload', requirePermission('marks.enter'), asyncHandler(async (req
     }
 
     try {
+      const [existingMark] = await sql`
+        SELECT id FROM marks 
+        WHERE exam_subject_id = ${examSubject.id} 
+          AND student_enrollment_id = ${enrollment.id}
+        LIMIT 1
+      `;
+
       // Upsert Mark
       const [markEntry] = await sql`
         INSERT INTO marks (exam_subject_id, student_enrollment_id, marks_obtained, is_absent, entered_by)
@@ -928,17 +935,70 @@ router.post('/upload', requirePermission('marks.enter'), asyncHandler(async (req
           updated_at = NOW()
         RETURNING id
       `;
-      processedResults.push({ student_id, mark_id: markEntry.id, success: true });
+      processedResults.push({
+        student_id,
+        mark_id: markEntry.id,
+        success: true,
+        isNew: !existingMark,
+        enrollment_id: enrollment.id
+      });
     } catch (err) {
       processedResults.push({ student_id, error: err.message });
     }
   }
 
+  // 5. Send Notification (Async)
+  (async () => {
+    try {
+      const { sendNotificationToUsers } = await import('../services/notificationService.js');
+
+      const successEnrollmentIds = processedResults
+        .filter(r => r.success && r.isNew)
+        .map(r => r.enrollment_id);
+
+      if (successEnrollmentIds.length === 0) return;
+
+      const usersToNotify = await sql`
+        SELECT u.id as user_id 
+        FROM users u
+        JOIN students s ON u.person_id = s.person_id
+        JOIN student_enrollments se ON s.id = se.student_id
+        WHERE se.id IN ${sql(successEnrollmentIds)}
+          AND u.account_status = 'active'
+        UNION
+        SELECT u.id as user_id
+        FROM users u
+        JOIN parents p ON u.person_id = p.person_id
+        JOIN student_parents sp ON p.id = sp.parent_id
+        JOIN students s ON sp.student_id = s.id
+        JOIN student_enrollments se ON s.id = se.student_id
+        WHERE se.id IN ${sql(successEnrollmentIds)}
+          AND u.account_status = 'active'
+      `;
+
+      const userIds = usersToNotify.map(u => u.user_id);
+      if (userIds.length > 0) {
+        await sendNotificationToUsers(
+          userIds,
+          'RESULT_RELEASED',
+          { message: `Results for ${exam.name} are now available.` }
+        );
+      }
+    } catch (err) {
+      console.error('[Notification] Failed to trigger RESULT_RELEASED in upload:', err);
+    }
+  })();
+
   res.json({
     message: 'Marks uploaded successfully',
     exam_id: exam.id,
     exam_subject_id: examSubject.id,
-    results: processedResults
+    results: processedResults.map(r => ({
+      student_id: r.student_id,
+      mark_id: r.mark_id,
+      success: r.success,
+      error: r.error
+    }))
   });
 }));
 

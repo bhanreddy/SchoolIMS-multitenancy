@@ -1,0 +1,227 @@
+[
+  {
+    "id": "0c7fe9da-107e-421d-a4b4-55e92e7a667a",
+    "display_name": "Admin User",
+    "roles": [
+      "admin"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": false
+  },
+  {
+    "id": "178e6cc6-af1f-4c6a-b3d3-caec055e2dcf",
+    "display_name": "Salaar  Prabha",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  },
+  {
+    "id": "1d7909d3-f78b-4d84-b645-abb6ab57079c",
+    "display_name": "Ramu  Bantu",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  },
+  {
+    "id": "363359cc-e8e1-4aa1-8c94-8cc2966f6e72",
+    "display_name": "Ayesha  Khan",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  },
+  {
+    "id": "3a750976-c6a8-4d12-8318-9efdd7ad3bc2",
+    "display_name": "Rambabu Rambabu",
+    "roles": [
+      "driver"
+    ],
+    "has_staff_profile": true,
+    "has_student_profile": false
+  },
+  {
+    "id": "3ccf9b9e-a479-43b3-a2c2-c2f2768b867b",
+    "display_name": "Rahul  Sharma",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  },
+  {
+    "id": "3d104fda-d99b-4e83-80f5-bdee4f730f51",
+    "display_name": "Madhu Madhu",
+    "roles": [
+      "staff"
+    ],
+    "has_staff_profile": true,
+    "has_student_profile": false
+  },
+  {
+    "id": "443cf593-b05f-4ff7-a118-d6c9d1e3a32b",
+    "display_name": "Narayana Narayana",
+    "roles": [
+      "staff"
+    ],
+    "has_staff_profile": true,
+    "has_student_profile": false
+  },
+  {
+    "id": "5ac1c9ef-5e02-4eb1-89f6-91c1b894428d",
+    "display_name": "Bhanu Reddy",
+    "roles": [
+      "accounts"
+    ],
+    "has_staff_profile": true,
+    "has_student_profile": false
+  },
+  {
+    "id": "66a8b743-a340-4615-9975-deac01f9e66a",
+    "display_name": "Arjun  Reddy",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  },
+  {
+    "id": "6e82ab30-4d5e-4896-8c09-75b0ce32e814",
+    "display_name": "Bhanu Reddy",
+    "roles": [
+      "accounts"
+    ],
+    "has_staff_profile": true,
+    "has_student_profile": false
+  },
+  {
+    "id": "76f82511-77df-4502-827e-a40944a86e5b",
+    "display_name": "Sneha  Patel",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  },
+  {
+    "id": "7fc555b7-31d1-429b-aac3-eae9fa18cf42",
+    "display_name": "Mohan Bantu",
+    "roles": [
+      "staff"
+    ],
+    "has_staff_profile": true,
+    "has_student_profile": false
+  },
+  {
+    "id": "7ff04af9-8590-4deb-96e1-883c8fdb1c9e",
+    "display_name": "Admin User",
+    "roles": [
+      "NULL"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": false
+  },
+  {
+    "id": "87ae5cc1-dfd2-484f-9463-753af9da0b86",
+    "display_name": "Bharath  Reddy",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  },
+  {
+    "id": "8eb9b150-e1e7-48f9-b88d-3565d3d624ab",
+    "display_name": "Kiran Goud",
+    "roles": [
+      "accounts"
+    ],
+    "has_staff_profile": true,
+    "has_student_profile": false
+  },
+  {
+    "id": "937dba62-1622-4d20-b583-8407218e4be9",
+    "display_name": "Kiran  Chinna",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  },
+  {
+    "id": "a6bbfba1-3f0e-445b-ae59-ab5ac00fd61c",
+    "display_name": "Sai  Kiran",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  },
+  {
+    "id": "b2913f62-ef82-4eff-bf14-3412a42f11d3",
+    "display_name": "Brahmi  Bhai",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  },
+  {
+    "id": "d70dd68c-ddc8-4fad-beb1-9889a4cde4d2",
+    "display_name": "Rushi Reddy",
+    "roles": [
+      "staff"
+    ],
+    "has_staff_profile": true,
+    "has_student_profile": false
+  },
+  {
+    "id": "dc757925-d924-46be-aa34-82c3105e49b6",
+    "display_name": "Anil Yadav",
+    "roles": [
+      "staff"
+    ],
+    "has_staff_profile": true,
+    "has_student_profile": false
+  },
+  {
+    "id": "e127da66-862e-40ad-ac8b-52163ad9f517",
+    "display_name": "Daniel  J",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  },
+  {
+    "id": "e8e63403-f35f-47a3-98e0-69273b6805cd",
+    "display_name": "Arun Kura",
+    "roles": [
+      "staff"
+    ],
+    "has_staff_profile": true,
+    "has_student_profile": false
+  },
+  {
+    "id": "ec101917-f4eb-409c-b29f-848d3eae5d8b",
+    "display_name": "Naveen Kuyya",
+    "roles": [
+      "staff"
+    ],
+    "has_staff_profile": true,
+    "has_student_profile": false
+  },
+  {
+    "id": "f6f343ec-e836-45e2-98d4-65ab91d5a1aa",
+    "display_name": "Kiran  Goud",
+    "roles": [
+      "student"
+    ],
+    "has_staff_profile": false,
+    "has_student_profile": true
+  }
+]

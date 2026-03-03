@@ -150,6 +150,9 @@ router.delete('/:id', asyncHandler(async (req, res) => {
  * For Students to see their own timetable
  */
 router.get('/my-timetable', asyncHandler(async (req, res) => {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized: Authentication required' });
+  }
   const userId = req.user.id;
 
   // 1. Get Class Section ID for the student
@@ -197,6 +200,9 @@ router.get('/my-timetable', asyncHandler(async (req, res) => {
  * For Teachers to see their own schedule
  */
 router.get('/teacher-timetable', asyncHandler(async (req, res) => {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized: Authentication required' });
+  }
   const userId = req.user.id;
   const { academic_year_id } = req.query;
 

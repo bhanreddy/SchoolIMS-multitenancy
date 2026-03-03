@@ -37,20 +37,36 @@ export async function sendNotificationToUsers(userIds = [], type, params = {}) {
         return { successCount: 0, failureCount: 0 };
     }
 
-    // 3️⃣ Fetch Tokens
-    let tokens = await fetchTokens(userIds);
-    if (!tokens || tokens.length === 0) return { successCount: 0, failureCount: 0 };
+    // 3️⃣ Fetch Tokens & Preferences
+    let userTokensAndPrefs = await fetchTokens(userIds);
+    if (!userTokensAndPrefs || userTokensAndPrefs.length === 0) return { successCount: 0, failureCount: 0 };
+
+    // Group by preference
+    const customSoundTokens = userTokensAndPrefs.filter(d => d.notification_sound === 'custom').map(d => d.fcm_token);
+    const defaultSoundTokens = userTokensAndPrefs.filter(d => d.notification_sound === 'default').map(d => d.fcm_token);
 
     // 4️⃣ Chunk and Send (Sequential batches to avoid exploding memory/connections)
     let totalSuccess = 0;
     let totalFailure = 0;
 
-    // Split into chunks of 500
-    for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
-        const tokenChunk = tokens.slice(i, i + BATCH_SIZE);
-        const { success, failure } = await sendBatch(tokenChunk, { title, body, deepLink, soundFile, channelId, type });
-        totalSuccess += success;
-        totalFailure += failure;
+    // Send Custom Sound Batches
+    if (customSoundTokens.length > 0) {
+        for (let i = 0; i < customSoundTokens.length; i += BATCH_SIZE) {
+            const tokenChunk = customSoundTokens.slice(i, i + BATCH_SIZE);
+            const { success, failure } = await sendBatch(tokenChunk, { title, body, deepLink, soundFile, channelId, type, customSound: true });
+            totalSuccess += success;
+            totalFailure += failure;
+        }
+    }
+
+    // Send Default Sound Batches
+    if (defaultSoundTokens.length > 0) {
+        for (let i = 0; i < defaultSoundTokens.length; i += BATCH_SIZE) {
+            const tokenChunk = defaultSoundTokens.slice(i, i + BATCH_SIZE);
+            const { success, failure } = await sendBatch(tokenChunk, { title, body, deepLink, soundFile: 'default', channelId: 'default', type, customSound: false });
+            totalSuccess += success;
+            totalFailure += failure;
+        }
     }
 
     // 5️⃣ Log Final Summary
@@ -63,7 +79,7 @@ export async function sendNotificationToUsers(userIds = [], type, params = {}) {
 /**
  * Process a single batch of up to 500 tokens
  */
-async function sendBatch(tokens, { title, body, deepLink, soundFile, channelId, type }) {
+async function sendBatch(tokens, { title, body, deepLink, soundFile, channelId, type, customSound = true }) {
     if (tokens.length === 0) return { success: 0, failure: 0 };
 
     const message = {
@@ -174,8 +190,13 @@ async function isKillSwitchActive(type) {
 
 async function fetchTokens(userIds) {
     try {
-        const devices = await sql`SELECT fcm_token FROM user_devices WHERE user_id IN ${sql(userIds)}`;
-        return devices.map(d => d.fcm_token);
+        const devices = await sql`
+            SELECT ud.fcm_token, COALESCE(us.notification_sound, 'custom') as notification_sound
+            FROM user_devices ud
+            LEFT JOIN user_settings us ON ud.user_id = us.user_id
+            WHERE ud.user_id IN ${sql(userIds)}
+        `;
+        return devices;
     } catch (err) {
         console.error('[Notification] Token fetch failed:', err.message);
         return [];

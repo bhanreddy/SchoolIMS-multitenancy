@@ -42,6 +42,16 @@ export const errorHandler = (err, req, res, next) => {
         });
     }
 
+    // Handle transient DB/network errors → 503 (so frontend can auto-retry)
+    const transientCodes = ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'CONNECTION_ENDED', 'CONNECTION_CLOSED'];
+    if (transientCodes.includes(err.code) || err.message?.includes('ETIMEDOUT') || err.message?.includes('Connect Timeout')) {
+        console.warn(`[TRANSIENT] [${requestId}] DB/network error (${err.code}), returning 503`);
+        return res.status(503).json({
+            error: 'Service temporarily unavailable. Please retry.',
+            requestId
+        });
+    }
+
     // Default to 500
     const status = err.status || err.statusCode || 500;
     res.status(status).json({

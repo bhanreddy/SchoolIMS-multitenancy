@@ -248,6 +248,18 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_person_active 
 ON users(person_id) WHERE deleted_at IS NULL; 
 
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    notification_sound VARCHAR(20) DEFAULT 'custom' CHECK (notification_sound IN ('custom', 'default')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+DROP TRIGGER IF EXISTS trg_user_settings_updated ON user_settings;
+CREATE TRIGGER trg_user_settings_updated
+BEFORE UPDATE ON user_settings
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
 CREATE TABLE IF NOT EXISTS user_roles (
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     role_id UUID REFERENCES roles(id) ON DELETE CASCADE,
@@ -4363,4 +4375,12 @@ CREATE INDEX IF NOT EXISTS idx_timetable_slots_time_check ON timetable_slots(tea
 
 COMMIT;
 
+
+
+-- ========================================== 
+-- SUPABASE AUTH CONFIGURATION (1-Year Sessions 
+-- ========================================== 
+-- Required for React Native mobile app persistence to survive 1-year offline 
+ALTER ROLE authenticator SET app.settings.sessions.timebox = '31536000'; 
+ALTER ROLE authenticator SET app.settings.sessions.inactivity_timeout = '0'; 
 

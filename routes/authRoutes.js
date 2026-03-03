@@ -33,12 +33,15 @@ router.post('/login', asyncHandler(async (req, res) => {
       p.first_name, p.last_name, p.display_name, p.photo_url,
       s.admission_no,
       st.id as staff_id,
+      st.staff_code,
       (SELECT EXISTS(SELECT 1 FROM students st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_student_profile,
       (SELECT EXISTS(SELECT 1 FROM staff st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_staff_profile,
       array_agg(DISTINCT r.code) FILTER (WHERE r.code IS NOT NULL) as roles,
-      array_agg(DISTINCT perm.code) FILTER (WHERE perm.code IS NOT NULL) as permissions
+      array_agg(DISTINCT perm.code) FILTER (WHERE perm.code IS NOT NULL) as permissions,
+      us.notification_sound
     FROM users u
     JOIN persons p ON u.person_id = p.id
+    LEFT JOIN user_settings us ON u.id = us.user_id
     LEFT JOIN students s ON p.id = s.person_id
     LEFT JOIN staff st ON p.id = st.person_id
     LEFT JOIN user_roles ur ON u.id = ur.user_id
@@ -46,7 +49,7 @@ router.post('/login', asyncHandler(async (req, res) => {
     LEFT JOIN role_permissions rp ON r.id = rp.role_id
     LEFT JOIN permissions perm ON rp.permission_id = perm.id
     WHERE u.id = ${data.user.id}
-    GROUP BY u.id, p.id, s.admission_no, st.id
+    GROUP BY u.id, p.id, s.admission_no, st.id, us.notification_sound
   `;
 
     if (userInfo.length === 0) {
@@ -126,8 +129,10 @@ router.post('/login', asyncHandler(async (req, res) => {
             has_student_profile: dbUser.has_student_profile,
             has_staff_profile: dbUser.has_staff_profile,
             staff_id: dbUser.staff_id,
+            staff_code: dbUser.staff_code,
             class_section_id: classSectionId,
-            classId: classSectionId
+            classId: classSectionId,
+            notification_sound: dbUser.notification_sound || 'custom'
         }
     });
 }));
@@ -192,15 +197,18 @@ router.get('/me', asyncHandler(async (req, res) => {
       g.name as gender,
       s.admission_no,
       st.id as staff_id,
+      st.staff_code,
       (SELECT EXISTS(SELECT 1 FROM students st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_student_profile,
       (SELECT EXISTS(SELECT 1 FROM staff st WHERE st.person_id = p.id AND st.deleted_at IS NULL)) as has_staff_profile,
       array_agg(DISTINCT r.code) FILTER (WHERE r.code IS NOT NULL) as roles,
       array_agg(DISTINCT perm.code) FILTER (WHERE perm.code IS NOT NULL) as permissions,
+      us.notification_sound,
       -- Get contacts
       (SELECT json_agg(json_build_object('type', pc.contact_type, 'value', pc.contact_value, 'is_primary', pc.is_primary))
        FROM person_contacts pc WHERE pc.person_id = p.id AND pc.deleted_at IS NULL) as contacts
     FROM users u
     JOIN persons p ON u.person_id = p.id
+    LEFT JOIN user_settings us ON u.id = us.user_id
     LEFT JOIN students s ON p.id = s.person_id
     LEFT JOIN staff st ON p.id = st.person_id
     LEFT JOIN genders g ON p.gender_id = g.id
@@ -209,7 +217,7 @@ router.get('/me', asyncHandler(async (req, res) => {
     LEFT JOIN role_permissions rp ON r.id = rp.role_id
     LEFT JOIN permissions perm ON rp.permission_id = perm.id
     WHERE u.id = ${req.user.id}
-    GROUP BY u.id, p.id, g.name, s.admission_no, st.id
+    GROUP BY u.id, p.id, g.name, s.admission_no, st.id, us.notification_sound
   `;
 
     if (userInfo.length === 0) {
@@ -252,8 +260,10 @@ router.get('/me', asyncHandler(async (req, res) => {
     res.json({
         ...dbUser,
         staff_id: dbUser.staff_id,
+        staff_code: dbUser.staff_code,
         class_section_id: classSectionId,
-        classId: classSectionId
+        classId: classSectionId,
+        notification_sound: dbUser.notification_sound || 'custom'
     });
 }));
 

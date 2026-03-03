@@ -143,6 +143,37 @@ router.get('/', async (req, res) => {
 });
 
 /**
+ * PUT /users/settings
+ * Update personal settings for the authenticated user
+ */
+router.put('/settings', async (req, res) => {
+    if (!req.user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { notification_sound } = req.body;
+
+    if (notification_sound && !['custom', 'default'].includes(notification_sound)) {
+        return res.status(400).json({ error: 'Invalid notification sound' });
+    }
+
+    try {
+        const [upserted] = await sql`
+            INSERT INTO user_settings (user_id, notification_sound)
+            VALUES (${req.user.internal_id}, ${notification_sound || 'custom'})
+            ON CONFLICT (user_id) 
+            DO UPDATE SET notification_sound = COALESCE(EXCLUDED.notification_sound, user_settings.notification_sound), updated_at = now()
+            RETURNING *
+        `;
+
+        res.json({ message: 'Settings updated successfully', settings: upserted });
+    } catch (error) {
+        console.error('Error updating user settings:', error);
+        res.status(500).json({ error: 'Failed to update settings' });
+    }
+});
+
+/**
  * PUT /users/:id
  * Update user (account status, etc.)
  */
