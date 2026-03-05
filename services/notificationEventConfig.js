@@ -128,8 +128,8 @@ export const NotificationEventConfig = Object.freeze({
 
     // ===== LEAVES =====
     LEAVE_SUBMITTED: {   // Notify admin only
-        channelId: 'exam',
-        sound: 'default.wav',
+        channelId: 'notification_default',
+        sound: 'notification_default.wav',
         titleTemplate: 'Leave Request',
         bodyTemplate: '{{message}}',
         titleTemplate_te: 'సెలవు అభ్యర్థన',
@@ -138,8 +138,8 @@ export const NotificationEventConfig = Object.freeze({
         requiredParams: ['message']
     },
     LEAVE_APPROVED: {    // Notify applicant only
-        channelId: 'exam',
-        sound: 'default.wav',
+        channelId: 'notification_default',
+        sound: 'notification_default.wav',
         titleTemplate: 'Leave Approved',
         bodyTemplate: '{{message}}',
         titleTemplate_te: 'సెలవు ఆమోదించబడింది',
@@ -148,8 +148,8 @@ export const NotificationEventConfig = Object.freeze({
         requiredParams: ['message']
     },
     LEAVE_REJECTED: {    // Notify applicant only
-        channelId: 'exam',
-        sound: 'default.wav',
+        channelId: 'notification_default',
+        sound: 'notification_default.wav',
         titleTemplate: 'Leave Rejected',
         bodyTemplate: '{{message}}',
         titleTemplate_te: 'సెలవు తిరస్కరించబడింది',
@@ -160,8 +160,8 @@ export const NotificationEventConfig = Object.freeze({
 
     // ===== EXPENSES =====
     EXPENSE_CREATED: {
-        channelId: 'exam',
-        sound: 'default.wav',
+        channelId: 'notification_default',
+        sound: 'notification_default.wav',
         titleTemplate: 'Expense Submitted',
         bodyTemplate: '{{message}}',
         titleTemplate_te: 'ఖర్చు సమర్పించబడింది',
@@ -170,8 +170,8 @@ export const NotificationEventConfig = Object.freeze({
         requiredParams: ['message']
     },
     EXPENSE_APPROVED: {
-        channelId: 'exam',
-        sound: 'default.wav',
+        channelId: 'notification_default',
+        sound: 'notification_default.wav',
         titleTemplate: 'Expense Approved',
         bodyTemplate: '{{message}}',
         titleTemplate_te: 'ఖర్చు ఆమోదించబడింది',
@@ -180,8 +180,8 @@ export const NotificationEventConfig = Object.freeze({
         requiredParams: ['message']
     },
     EXPENSE_REJECTED: {
-        channelId: 'exam',
-        sound: 'default.wav',
+        channelId: 'notification_default',
+        sound: 'notification_default.wav',
         titleTemplate: 'Expense Rejected',
         bodyTemplate: '{{message}}',
         titleTemplate_te: 'ఖర్చు తిరస్కరించబడింది',
@@ -192,8 +192,8 @@ export const NotificationEventConfig = Object.freeze({
 
     // ===== PAYROLL =====
     PAYROLL_SUCCESS: {
-        channelId: 'exam',
-        sound: 'default.wav',
+        channelId: 'notification_default',
+        sound: 'notification_default.wav',
         titleTemplate: 'Salary Credited',
         bodyTemplate: '{{message}}',
         titleTemplate_te: 'జీతం జమ అయింది',
