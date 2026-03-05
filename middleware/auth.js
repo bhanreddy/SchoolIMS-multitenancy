@@ -1,6 +1,33 @@
-import { supabase } from '../db.js';
+import { supabase, supabaseAdmin } from '../db.js';
 import sql from '../db.js';
 import { withRetry } from '../utils/retry.js';
+import { toZonedTime } from 'date-fns-tz';
+
+// --- CONFIG CACHE FOR SCHOOL HOURS ---
+let schoolHoursCache = null;
+let schoolHoursCacheTime = 0;
+const SCHOOL_HOURS_CACHE_TTL = 60 * 1000; // 60 seconds
+
+async function getSchoolHoursConfig() {
+  if (schoolHoursCache && Date.now() - schoolHoursCacheTime < SCHOOL_HOURS_CACHE_TTL) {
+    return schoolHoursCache;
+  }
+  const rows = await sql`
+        SELECT key, value FROM school_settings 
+        WHERE key IN ('school_hours_start', 'school_hours_end', 'school_timezone')
+    `;
+  const config = {};
+  for (const row of rows) {
+    config[row.key] = row.value;
+  }
+  schoolHoursCache = {
+    school_hours_start: config.school_hours_start || '08:00',
+    school_hours_end: config.school_hours_end || '17:00',
+    school_timezone: config.school_timezone || 'Asia/Kolkata'
+  };
+  schoolHoursCacheTime = Date.now();
+  return schoolHoursCache;
+}
 
 // ── In-Memory Token Cache ──────────────────────────────────────────────
 // Caches verified token → user data to avoid repeated Supabase API calls.
@@ -10,91 +37,139 @@ const TOKEN_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const TOKEN_CACHE_MAX_SIZE = 500;
 
 function getCachedUser(token) {
-    const entry = tokenCache.get(token);
-    if (!entry) return null;
-    if (Date.now() - entry.timestamp > TOKEN_CACHE_TTL) {
-        tokenCache.delete(token);
-        return null;
-    }
-    return entry.user;
+  const entry = tokenCache.get(token);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > TOKEN_CACHE_TTL) {
+    tokenCache.delete(token);
+    return null;
+  }
+  return entry.user;
 }
 
 function setCachedUser(token, user) {
-    // Evict oldest entries if cache is too large
-    if (tokenCache.size >= TOKEN_CACHE_MAX_SIZE) {
-        const firstKey = tokenCache.keys().next().value;
-        tokenCache.delete(firstKey);
-    }
-    tokenCache.set(token, { user, timestamp: Date.now() });
+  // Evict oldest entries if cache is too large
+  if (tokenCache.size >= TOKEN_CACHE_MAX_SIZE) {
+    const firstKey = tokenCache.keys().next().value;
+    tokenCache.delete(firstKey);
+  }
+  tokenCache.set(token, { user, timestamp: Date.now() });
 }
-
 
 // ── Middleware: identifyUser ───────────────────────────────────────────
 // Verifies the Supabase JWT, fetches user roles/permissions, attaches to req.
 // Uses token cache + retry logic to survive transient network issues.
 export const identifyUser = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      req.user = null;
+      return next();
+    }
+
+    const token = authHeader.split(' ')[1];
+    if (!token) {
+      req.user = null;
+      return next();
+    }
+
+    // ── Check cache first ──
+    const cached = getCachedUser(token);
+    if (cached) {
+      req.user = cached;
+      return next();
+    }
+
+    // ── 1. Verify Token with Supabase (with retry) ──
+    let user;
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader) {
-            req.user = null;
-            return next();
-        }
+      const result = await withRetry(async () => {
+        const { data, error } = await supabase.auth.getUser(token);
+        if (error) throw error;
+        return data;
+      }, { retries: 2, delayMs: 800 });
+      user = result.user;
+    } catch (authErr) {
+      // Distinguish network failure from invalid tokeny
+      const isNetworkError =
+        authErr.code === 'ETIMEDOUT' ||
+        authErr.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+        authErr.message?.includes('fetch failed') ||
+        authErr.message?.includes('Connect Timeout') ||
+        authErr.cause?.code === 'UND_ERR_CONNECT_TIMEOUT';
 
-        const token = authHeader.split(' ')[1];
-        if (!token) {
-            req.user = null;
-            return next();
-        }
+      const isTokenExpired = authErr.status === 401 && authErr.message?.includes('token expired');
 
-        // ── Check cache first ──
-        const cached = getCachedUser(token);
-        if (cached) {
-            req.user = cached;
-            return next();
-        }
+      if (isNetworkError) {
 
-        // ── 1. Verify Token with Supabase (with retry) ──
-        let user;
-        try {
-            const result = await withRetry(async () => {
-                const { data, error } = await supabase.auth.getUser(token);
-                if (error) throw error;
-                return data;
-            }, { retries: 2, delayMs: 800 });
-            user = result.user;
-        } catch (authErr) {
-            // Distinguish network failure from invalid token
-            const isNetworkError =
-                authErr.code === 'ETIMEDOUT' ||
-                authErr.code === 'UND_ERR_CONNECT_TIMEOUT' ||
-                authErr.message?.includes('fetch failed') ||
-                authErr.message?.includes('Connect Timeout') ||
-                authErr.cause?.code === 'UND_ERR_CONNECT_TIMEOUT';
+        // Return 503 Service Unavailable instead of silently setting user=null
+        return res.status(503).json({ error: 'Auth service temporarily unavailable. Please retry.' });
+      }
 
-            if (isNetworkError) {
-                console.error('Auth Middleware: Supabase Auth unreachable after retries');
-                // Return 503 Service Unavailable instead of silently setting user=null
-                return res.status(503).json({ error: 'Auth service temporarily unavailable. Please retry.' });
+      // Fix #5: Student Session Auto-Refresh (Mobile-First)
+      if (isTokenExpired) {
+        const isStudentOrUnknownYet = true; // We don't know the role yet, we MUST safely attempt refresh if token exists
+        const refreshToken = req.headers['authorization-refresh'] || req.cookies?.refresh_token;
+
+        if (refreshToken) {
+          try {
+            const refreshResult = await supabase.auth.refreshSession({ refresh_token: refreshToken });
+            if (refreshResult.error) throw refreshResult.error;
+
+            user = refreshResult.data.user;
+
+            // Check 7-day rule IMMEDIATELY before accepting the refresh to avoid eternal session
+            const [userLoginCheck] = await sql`SELECT last_login_at FROM users WHERE id = ${user.id} LIMIT 1`;
+            if (userLoginCheck && userLoginCheck.last_login_at) {
+              const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+              const loginAge = Date.now() - new Date(userLoginCheck.last_login_at).getTime();
+              if (loginAge >= SEVEN_DAYS_MS) {
+                // Exceeded 7 days. Even though we refreshed the supabase token, we invalidate it server side.
+                try { await supabaseAdmin.auth.admin.signOut(user.id, 'global'); } catch (e) { }
+                return res.status(401).json({ error: 'Weekly session reset. Please log in again.', code: 'WEEKLY_LOGOUT' });
+              }
             }
-            // Token is genuinely invalid/expired
-            req.user = null;
-            return next();
+
+            // We will check role after we get dbUser. 
+            // If it's NOT a student, we will reject them later down.
+
+            // Set the new token on the response so the mobile client can save it
+            res.setHeader('X-Refreshed-Token', refreshResult.data.session.access_token);
+            res.setHeader('X-Refreshed-Refresh-Token', refreshResult.data.session.refresh_token);
+          } catch (refreshErr) {
+
+            // Still fail down below
+          }
+        }
+      }
+
+      if (!user) {
+        // Check if it was an expired token for a student specifically that failed refresh,
+        // but we don't know role yet. We just return 401 if we STILL don't have a user.
+        const refreshToken = req.headers['authorization-refresh'] || req.cookies?.refresh_token;
+        if (isTokenExpired && refreshToken) {
+          return res.status(401).json({ error: 'Session lost permanently. Please login again.', code: 'STUDENT_SESSION_LOST' });
         }
 
-        if (!user) {
-            req.user = null;
-            return next();
-        }
+        req.user = null;
+        return next();
+      }
+    }
 
-        // ── 2. Fetch Internal User & Permissions (with retry) ──
-        let userInfo;
-        try {
-            userInfo = await withRetry(async () => {
-                return await sql`
+    if (!user) {
+      req.user = null;
+      return next();
+    }
+
+    // ── 2. Fetch Internal User & Permissions (with retry) ──
+    let userInfo;
+    try {
+      userInfo = await withRetry(async () => {
+        return await sql`
                     SELECT 
                         u.id, 
                         u.account_status,
                         u.person_id,
+                        u.last_login_at,
                         array_agg(DISTINCT r.code) as roles,
                         array_agg(DISTINCT p.code) as permissions
                     FROM users u
@@ -105,69 +180,155 @@ export const identifyUser = async (req, res, next) => {
                     WHERE u.id = ${user.id}
                     GROUP BY u.id, u.person_id
                 `;
-            }, { retries: 1, delayMs: 500 });
-        } catch (dbErr) {
-            console.error('Auth Middleware: DB unreachable after retries');
-            return res.status(503).json({ error: 'Database temporarily unavailable. Please retry.' });
-        }
+      }, { retries: 1, delayMs: 500 });
+    } catch (dbErr) {
 
-        if (userInfo.length === 0) {
-            req.user = null;
-            return next();
-        }
-
-        const dbUser = userInfo[0];
-
-        if (dbUser.account_status !== 'active') {
-            req.user = null;
-            return res.status(403).json({ error: 'Account is not active' });
-        }
-
-        // Attach to req
-        req.user = {
-            ...user,
-            roles: dbUser.roles || [],
-            permissions: dbUser.permissions || [],
-            internal_id: dbUser.id,
-            person_id: dbUser.person_id
-        };
-
-        // ── Cache the result ──
-        setCachedUser(token, req.user);
-
-        next();
-
-    } catch (err) {
-        console.error('Auth Middleware Error:', err);
-        req.user = null;
-        next();
+      return res.status(503).json({ error: 'Database temporarily unavailable. Please retry.' });
     }
+
+    if (userInfo.length === 0) {
+      req.user = null;
+      return next();
+    }
+
+    const dbUser = userInfo[0];
+
+    if (dbUser.account_status !== 'active') {
+      req.user = null;
+      return res.status(403).json({ error: 'Account is not active' });
+    }
+
+    // Fix #5 Continuation: Reject auto-refresh for non-students
+    const isStudent = dbUser.roles && dbUser.roles.includes('student');
+    if (res.getHeader('X-Refreshed-Token') && !isStudent) {
+      // We auto-refreshed above, but they are NOT a student. Reject them.
+      return res.status(401).json({ error: 'Session expired. Please log in again.' });
+    }
+
+    // FIX #2: TIME-RESTRICTED ACCESS FOR ACCOUNTS ROLE
+    if (dbUser.roles && dbUser.roles.includes('accounts')) {
+      // 1. Fetch school hours from DB (cache for 60s to avoid per-request DB hits)
+      const { school_hours_start, school_hours_end, school_timezone } = await getSchoolHoursConfig();
+
+      // 2. Get current time in school timezone
+      const now = toZonedTime(new Date(), school_timezone);
+      const currentMinutes = now.getHours() * 60 + now.getMinutes();
+      const [startH, startM] = school_hours_start.split(':').map(Number);
+      const [endH, endM] = school_hours_end.split(':').map(Number);
+      const startMinutes = startH * 60 + startM;
+      const endMinutes = endH * 60 + endM;
+
+      // 3. Also check it is a weekday (Mon–Fri only - getDay() returns 0 for Sunday, 1 for Mon, up to 6 for Sat)
+      const dayOfWeek = now.getDay();
+      const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
+
+      if (!isWeekday || currentMinutes < startMinutes || currentMinutes >= endMinutes) {
+        // Check temp_access_grants to see if an admin has granted them temporary access
+        let hasTempAccess = false;
+        try {
+          const grants = await sql`
+            SELECT id FROM temp_access_grants
+            WHERE requested_by = ${dbUser.id}
+              AND department = 'accounts'
+              AND is_active = true
+              AND expires_at > NOW()
+            LIMIT 1
+          `;
+          if (grants && grants.length > 0) {
+            hasTempAccess = true;
+          }
+        } catch (err) {
+          console.error("Error checking temp_access_grants:", err);
+        }
+
+        if (!hasTempAccess) {
+          // 4. Log violation to admin_notifications
+          try {
+            await sql`
+                          INSERT INTO admin_notifications (type, message, user_id, ip_address)
+                          VALUES (
+                              'accounts_off_hours_access',
+                              ${'Accounts user ' + dbUser.id + ' attempted access outside school hours'},
+                              ${dbUser.id},
+                              ${req.ip}
+                          )
+                      `;
+          } catch (err) {
+
+          }
+
+          // 5. Return 403 — do NOT reveal exact school hours in error message
+          return res.status(403).json({
+            error: 'Access denied. Accounts department access is restricted to school hours.',
+            code: 'OUT_OF_HOURS_NO_ACCESS'
+          });
+        }
+      }
+    }
+
+    // FIX #3: WEEKLY FORCED LOGOUT FOR ALL ROLES
+    if (dbUser.last_login_at) {
+      const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+      const loginAge = Date.now() - new Date(dbUser.last_login_at).getTime();
+
+      if (loginAge >= SEVEN_DAYS_MS) {
+        // Invalidate Supabase session server-side
+        try {
+          await supabaseAdmin.auth.admin.signOut(user.id, 'global');
+        } catch (e) { }
+
+        return res.status(401).json({
+          error: 'Weekly session reset. Please log in again.',
+          code: 'WEEKLY_LOGOUT'
+        });
+      }
+    }
+
+    // Attach to req
+    req.user = {
+      ...user,
+      roles: dbUser.roles || [],
+      permissions: dbUser.permissions || [],
+      internal_id: dbUser.id,
+      person_id: dbUser.person_id
+    };
+
+    // ── Cache the result ──
+    setCachedUser(token, req.user);
+
+    next();
+
+  } catch (err) {
+
+    req.user = null;
+    next();
+  }
 };
 
 // Middleware to require specific permission
 export const requirePermission = (permissionCode) => {
-    return (req, res, next) => {
-        if (!req.user) {
-            return res.status(401).json({ error: 'Unauthorized: No user logged in' });
-        }
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Unauthorized: No user logged in' });
+    }
 
-        // Super admin bypass (optional, e.g. if role is 'admin')
-        if (req.user.roles.includes('admin')) {
-            return next();
-        }
+    // Super admin bypass (optional, e.g. if role is 'admin')
+    if (req.user.roles.includes('admin')) {
+      return next();
+    }
 
-        if (!req.user.permissions.includes(permissionCode)) {
-            return res.status(403).json({ error: `Forbidden: Missing permission ${permissionCode}` });
-        }
+    if (!req.user.permissions.includes(permissionCode)) {
+      return res.status(403).json({ error: `Forbidden: Missing permission ${permissionCode}` });
+    }
 
-        next();
-    };
+    next();
+  };
 };
 
 // Middleware to just require authentication (valid user)
 export const requireAuth = (req, res, next) => {
-    if (!req.user) {
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
-    next();
+  if (!req.user) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
 };

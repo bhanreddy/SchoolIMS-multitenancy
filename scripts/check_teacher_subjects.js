@@ -1,8 +1,8 @@
 import sql from '../db.js';
 
 async function check() {
-    try {
-        const res = await sql`
+  try {
+    const res = await sql`
             SELECT 
                 cs.id, 
                 c.name as class_name, 
@@ -19,12 +19,12 @@ async function check() {
             JOIN persons p ON st.person_id = p.id
             WHERE p.first_name = 'Bharath'
         `;
-        console.log(res);
-    } catch (err) {
-        console.error(err);
-    } finally {
-        process.exit(0);
-    }
+
+  } catch (err) {
+
+  } finally {
+    process.exit(0);
+  }
 }
 
 check();

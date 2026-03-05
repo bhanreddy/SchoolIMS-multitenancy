@@ -374,13 +374,13 @@ async function processFeeTransaction({ student_fee_id, amount, payment_method, t
 
       if (recipients.length > 0) {
         await sendNotificationToUsers(
-          recipients.map(r => r.user_id),
+          recipients.map((r) => r.user_id),
           'FEE_COLLECTED',
           { message: 'Your fee payment has been successfully recorded.' }
         );
       }
     } catch (err) {
-      console.error('[Notification] Failed to trigger FEE_COLLECTED:', err);
+
     }
   })();
 
@@ -402,8 +402,6 @@ async function processFeeTransaction({ student_fee_id, amount, payment_method, t
 
   return enrichedTransaction;
 }
-
-
 
 /**
  * GET /fees/summaries
@@ -534,7 +532,8 @@ router.get('/receipts/:id', requirePermission('fees.view'), asyncHandler(async (
 
   const [receipt] = await sql`
     SELECT 
-      r.*,
+      r.id, r.receipt_no, r.student_id, r.total_amount,
+      r.issued_at, r.issued_by, r.remarks, r.created_at,
       s.admission_no, p.display_name as student_name,
       issuer.display_name as issued_by_name
     FROM receipts r
@@ -682,7 +681,6 @@ router.get('/collection-summary', requirePermission('fees.view'), asyncHandler(a
  */
 // Fix 4: Protected with requirePermission
 router.get('/dashboard-stats', requirePermission('fees.view'), asyncHandler(async (req, res) => {
-  console.log(`[DASHBOARD-STATS] Request received. User: ${req.user?.id || 'none'}`);
 
   // 1. Today's Collection
   const todayStats = await sql`
@@ -790,7 +788,7 @@ router.post('/adjust', requirePermission('fees.manage'), asyncHandler(async (req
     const newTotalDiscount = Number(fee.discount) + parsedAmount;
     if (newTotalDiscount > Number(fee.amount_due)) {
       const err = new Error(`Total discount (${newTotalDiscount}) cannot exceed amount due (${fee.amount_due})`);
-      err.status = 400;
+      err.status = 422;
       throw err;
     }
 
@@ -817,7 +815,7 @@ router.post('/adjust', requirePermission('fees.manage'), asyncHandler(async (req
 router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req, res) => {
   const { target_group, class_id, message } = req.body;
 
-  if (!target_group || (target_group === 'class' && !class_id)) {
+  if (!target_group || target_group === 'class' && !class_id) {
     return res.status(400).json({ error: 'Valid target_group and class_id (if target is class) are required' });
   }
 
@@ -854,7 +852,7 @@ router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req
   }
 
   // 2. Also fetch parent user IDs for the same students
-  const studentIds = [...new Set(students.map(s => s.id))];
+  const studentIds = [...new Set(students.map((s) => s.id))];
   let parentUserIds = [];
   if (studentIds.length > 0) {
     const parentUsers = await sql`
@@ -865,12 +863,12 @@ router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req
       WHERE sp.student_id IN ${sql(studentIds)}
         AND u.account_status = 'active'
     `;
-    parentUserIds = parentUsers.map(p => p.user_id);
+    parentUserIds = parentUsers.map((p) => p.user_id);
   }
 
   // 3. Send Notifications (Students + Parents)
   try {
-    const studentUserIds = students.map(s => s.user_id);
+    const studentUserIds = students.map((s) => s.user_id);
     const userIds = [...new Set([...studentUserIds, ...parentUserIds])];
     const notificationMessage = message || "Your fee is pending. Please pay before the due date to avoid late fees.";
 
@@ -885,7 +883,7 @@ router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req
     res.json({ message: 'Fee reminders queued', student_count: students.length });
 
   } catch (err) {
-    console.error('[Notification] Failed to send fee reminders:', err);
+
     // Return success to client as process was initiated, but log the error
     res.json({ message: 'Identified students but failed to send notifications', error: err.message });
   }

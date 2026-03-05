@@ -1,8 +1,8 @@
 import sql from '../db.js';
 
 async function checkUsers() {
-    try {
-        const users = await sql`
+  try {
+    const users = await sql`
             SELECT u.id, p.display_name, 
                 ARRAY_AGG(r.code) as roles,
                 EXISTS(SELECT 1 FROM staff s WHERE s.person_id = u.person_id AND s.deleted_at IS NULL) as has_staff_profile,
@@ -13,12 +13,12 @@ async function checkUsers() {
             LEFT JOIN roles r ON ur.role_id = r.id
             GROUP BY u.id, p.display_name, u.person_id
         `;
-        const fs = await import('fs');
-        fs.writeFileSync('users_dump.json', JSON.stringify(users, null, 2), 'utf-8');
-        process.exit(0);
-    } catch (e) {
-        console.error(e);
-        process.exit(1);
-    }
+    const fs = await import('fs');
+    fs.writeFileSync('users_dump.json', JSON.stringify(users, null, 2), 'utf-8');
+    process.exit(0);
+  } catch (e) {
+
+    process.exit(1);
+  }
 }
 checkUsers();

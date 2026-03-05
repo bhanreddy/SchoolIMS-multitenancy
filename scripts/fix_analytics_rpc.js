@@ -1,11 +1,10 @@
 import sql from '../db.js';
 
 const fixAnalytics = async () => {
-    try {
-        console.log('Fixing get_financial_analytics RPC...');
+  try {
 
-        // redefined without 'deleted_at' check on student_fees
-        await sql`
+    // redefined without 'deleted_at' check on student_fees
+    await sql`
             CREATE OR REPLACE FUNCTION get_financial_analytics(
                 p_from_date DATE,
                 p_to_date DATE,
@@ -29,7 +28,7 @@ const fixAnalytics = async () => {
                 SELECT COALESCE(SUM(amount_due - discount - amount_paid), 0) INTO v_total_outstanding
                 FROM student_fees
                 WHERE status != 'waived';
-                
+
                 -- Ensure non-negative
                 IF v_total_outstanding < 0 THEN v_total_outstanding := 0; END IF;
 
@@ -68,12 +67,11 @@ const fixAnalytics = async () => {
             $$ LANGUAGE plpgsql;
         `;
 
-        console.log('Successfully updated get_financial_analytics.');
-        process.exit(0);
-    } catch (error) {
-        console.error('Error updating RPC:', error);
-        process.exit(1);
-    }
+    process.exit(0);
+  } catch (error) {
+
+    process.exit(1);
+  }
 };
 
 fixAnalytics();

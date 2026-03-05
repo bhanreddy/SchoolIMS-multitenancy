@@ -2,28 +2,28 @@ import sql from '../db.js';
 import fs from 'fs';
 
 async function debug() {
-    const output = [];
+  const output = [];
 
-    // 1. Check school_settings
-    const settings = await sql`SELECT key, value FROM school_settings`;
-    output.push('=== SCHOOL SETTINGS ===');
-    output.push(JSON.stringify(settings, null, 2));
+  // 1. Check school_settings
+  const settings = await sql`SELECT key, value FROM school_settings`;
+  output.push('=== SCHOOL SETTINGS ===');
+  output.push(JSON.stringify(settings, null, 2));
 
-    // 2. Check receipts
-    const receipts = await sql`SELECT id, receipt_no, student_id, total_amount FROM receipts ORDER BY issued_at DESC LIMIT 3`;
-    output.push('\n=== RECEIPTS ===');
-    output.push(JSON.stringify(receipts, null, 2));
+  // 2. Check receipts
+  const receipts = await sql`SELECT id, receipt_no, student_id, total_amount FROM receipts ORDER BY issued_at DESC LIMIT 3`;
+  output.push('\n=== RECEIPTS ===');
+  output.push(JSON.stringify(receipts, null, 2));
 
-    if (receipts.length > 0) {
-        const receiptId = receipts[0].id;
+  if (receipts.length > 0) {
+    const receiptId = receipts[0].id;
 
-        // 3. Check receipt_items
-        const items = await sql`SELECT * FROM receipt_items WHERE receipt_id = ${receiptId}`;
-        output.push(`\n=== RECEIPT ITEMS for ${receiptId} ===`);
-        output.push(JSON.stringify(items, null, 2));
+    // 3. Check receipt_items
+    const items = await sql`SELECT * FROM receipt_items WHERE receipt_id = ${receiptId}`;
+    output.push(`\n=== RECEIPT ITEMS for ${receiptId} ===`);
+    output.push(JSON.stringify(items, null, 2));
 
-        // 4. Full receipt detail
-        const [receipt] = await sql`
+    // 4. Full receipt detail
+    const [receipt] = await sql`
             SELECT 
                 r.*,
                 s.admission_no, p.display_name as student_name,
@@ -35,16 +35,16 @@ async function debug() {
             LEFT JOIN persons issuer ON u.person_id = issuer.id
             WHERE r.id = ${receiptId}
         `;
-        output.push('\n=== FULL RECEIPT DETAIL ===');
-        output.push(JSON.stringify(receipt, null, 2));
-    }
+    output.push('\n=== FULL RECEIPT DETAIL ===');
+    output.push(JSON.stringify(receipt, null, 2));
+  }
 
-    fs.writeFileSync('debug_receipt_output.json', output.join('\n'));
-    console.log('Done. Output written to debug_receipt_output.json');
-    process.exit(0);
+  fs.writeFileSync('debug_receipt_output.json', output.join('\n'));
+
+  process.exit(0);
 }
 
-debug().catch(err => {
-    console.error('ERROR:', err);
-    process.exit(1);
+debug().catch((err) => {
+
+  process.exit(1);
 });

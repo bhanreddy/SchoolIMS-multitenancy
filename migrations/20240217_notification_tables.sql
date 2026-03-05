@@ -1,4 +1,4 @@
--- Migration: Create Notification Config & Log Tables
+-- ============================================================\r\n-- DEPRECATED: This migration has been consolidated into schema.sql.\r\n-- Do NOT run this file on new deployments. It is kept for historical reference only.\r\n-- All notification tables (user_devices, notification_config, notification_logs, notification_batches)\r\n-- are now created by schema.sql (Section 19: Notification Infrastructure).\r\n-- ============================================================\r\n\r\n-- Migration: Create Notification Config & Log Tables
 
 -- 1. Notification Configuration
 CREATE TABLE IF NOT EXISTS notification_config (

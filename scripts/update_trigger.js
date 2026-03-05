@@ -1,9 +1,8 @@
 import sql from '../db.js';
 
 async function updateTrigger() {
-    console.log('--- Updating validate_timetable_entry Trigger ---');
 
-    const triggerSql = `
+  const triggerSql = `
 CREATE OR REPLACE FUNCTION validate_timetable_entry()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -71,14 +70,14 @@ END;
 $$ LANGUAGE plpgsql;
     `;
 
-    try {
-        await sql.unsafe(triggerSql);
-        console.log('Trigger updated successfully.');
-    } catch (err) {
-        console.error('Error updating trigger:', err);
-    } finally {
-        process.exit();
-    }
+  try {
+    await sql.unsafe(triggerSql);
+
+  } catch (err) {
+
+  } finally {
+    process.exit();
+  }
 }
 
 updateTrigger();

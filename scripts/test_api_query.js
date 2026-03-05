@@ -1,13 +1,11 @@
 import sql from '../db.js';
 
 async function testQuery() {
-    const class_section_id = '6f891673-8d9a-4e6f-8519-d5363df86406'; // Class 10 A
-    const date = '2026-02-11';
+  const class_section_id = '6f891673-8d9a-4e6f-8519-d5363df86406'; // Class 10 A
+  const date = '2026-02-11';
 
-    console.log('Testing query for class:', class_section_id);
-
-    try {
-        const students = await sql`
+  try {
+    const students = await sql`
             SELECT 
                 s.id as student_id, s.admission_no,
                 p.display_name as student_name, p.photo_url,
@@ -26,13 +24,10 @@ async function testQuery() {
             ORDER BY p.display_name
         `;
 
-        console.log('Results count:', students.length);
-        console.log('Results:', JSON.stringify(students, null, 2));
+  } catch (err) {
 
-    } catch (err) {
-        console.error('Query failed:', err);
-    }
-    process.exit(0);
+  }
+  process.exit(0);
 }
 
 testQuery();

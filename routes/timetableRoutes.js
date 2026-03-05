@@ -20,8 +20,8 @@ router.get('/:classSectionId/slots', asyncHandler(async (req, res) => {
   let yearId = academic_year_id;
   if (!yearId) {
     const currentYear = await sql`SELECT id FROM academic_years WHERE start_date <= current_date AND end_date >= current_date LIMIT 1`;
-    if (currentYear.length > 0) yearId = currentYear[0].id;
-    else return res.json([]); // No active year
+    if (currentYear.length > 0) yearId = currentYear[0].id;else
+    return res.json([]); // No active year
   }
 
   const slots = await sql`
@@ -84,9 +84,8 @@ router.post('/', asyncHandler(async (req, res) => {
   const final_teacher_id = provided_teacher_id || null;
   const final_room_no = room_no || null;
 
-
   // Process Logic within Transaction
-  await sql.begin(async sql => {
+  await sql.begin(async (sql) => {
     // 2. Teacher Overlap Check
     if (final_teacher_id) {
       const overlap = await sql`
@@ -128,7 +127,7 @@ router.post('/', asyncHandler(async (req, res) => {
     try {
       await notifyTimetableUpdate([class_section_id]);
     } catch (err) {
-      console.error('[Notification] TIMETABLE_UPDATE failed:', err);
+
     }
   })();
 
@@ -210,8 +209,8 @@ router.get('/teacher-timetable', asyncHandler(async (req, res) => {
   let yearId = academic_year_id;
   if (!yearId) {
     const currentYear = await sql`SELECT id FROM academic_years WHERE start_date <= current_date AND end_date >= current_date LIMIT 1`;
-    if (currentYear.length > 0) yearId = currentYear[0].id;
-    else return res.json([]);
+    if (currentYear.length > 0) yearId = currentYear[0].id;else
+    return res.json([]);
   }
 
   // Fetch Slots for this teacher
@@ -296,7 +295,7 @@ router.put('/periods', asyncHandler(async (req, res) => {
   const updatedPeriodNumbers = [];
 
   // Use a transaction for atomic updates
-  await sql.begin(async sql => {
+  await sql.begin(async (sql) => {
     for (const p of periods) {
       if (p.id) {
         // 1. Update Period Definition
@@ -339,11 +338,11 @@ router.put('/periods', asyncHandler(async (req, res) => {
         `;
 
         if (affected.length > 0) {
-          const classSectionIds = affected.map(a => a.class_section_id);
+          const classSectionIds = affected.map((a) => a.class_section_id);
           await notifyTimetableUpdate(classSectionIds);
         }
       } catch (err) {
-        console.error('[Notification] TIMETABLE_UPDATE (Periods) failed:', err);
+
       }
     }
   })();
@@ -364,7 +363,7 @@ router.delete('/periods/:id', asyncHandler(async (req, res) => {
     return res.status(404).json({ error: 'Period not found' });
   }
 
-  await sql.begin(async sql => {
+  await sql.begin(async (sql) => {
     // Delete associated timetable slots first
     await sql`DELETE FROM timetable_slots WHERE period_number = ${period.sort_order}`;
     // Delete the period
@@ -403,7 +402,7 @@ async function notifyTimetableUpdate(classSectionIds) {
   `;
 
   if (recipients.length > 0) {
-    const userIds = recipients.map(r => r.id);
+    const userIds = recipients.map((r) => r.id);
     await sendNotificationToUsers(
       userIds,
       'TIMETABLE_UPDATED',

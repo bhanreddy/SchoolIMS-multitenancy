@@ -1,11 +1,10 @@
 import sql from '../db.js';
 
 async function checkMappings() {
-    try {
-        console.log(JSON.stringify({ message: "Starting mapping check..." }));
+  try {
 
-        // 1. Get recent diary entries and their class sections
-        const entries = await sql`
+    // 1. Get recent diary entries and their class sections
+    const entries = await sql`
       SELECT d.id, d.title, d.entry_date, d.class_section_id, 
              c.name as class_name, s.name as section_name
       FROM diary_entries d
@@ -16,11 +15,11 @@ async function checkMappings() {
       LIMIT 3
     `;
 
-        // 2. Get students in those class sections
-        let students = [];
-        if (entries.length > 0) {
-            const classSectionIds = [...new Set(entries.map(e => e.class_section_id))];
-            students = await sql`
+    // 2. Get students in those class sections
+    let students = [];
+    if (entries.length > 0) {
+      const classSectionIds = [...new Set(entries.map((e) => e.class_section_id))];
+      students = await sql`
         SELECT st.id as student_id, st.admission_no, p.display_name, se.class_section_id
         FROM students st
         JOIN student_enrollments se ON st.id = se.student_id
@@ -29,18 +28,13 @@ async function checkMappings() {
           AND se.status = 'active'
         LIMIT 5
       `;
-        }
-
-        console.log(JSON.stringify({
-            entries,
-            students_in_target_classes: students
-        }, null, 2));
-
-        process.exit(0);
-    } catch (err) {
-        console.error(JSON.stringify({ error: err.message }));
-        process.exit(1);
     }
+
+    process.exit(0);
+  } catch (err) {
+
+    process.exit(1);
+  }
 }
 
 checkMappings();

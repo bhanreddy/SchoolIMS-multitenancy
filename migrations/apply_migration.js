@@ -7,9 +7,9 @@ dotenv.config();
 const sql = postgres(process.env.DATABASE_URL);
 
 async function migrate() {
-    try {
-        console.log('Running migration...');
-        await sql`
+  try {
+
+    await sql`
             DO $$
             BEGIN
                 IF NOT EXISTS (
@@ -26,12 +26,12 @@ async function migrate() {
                 END IF;
             END $$;
         `;
-        console.log('Migration completed successfully.');
-    } catch (error) {
-        console.error('Migration failed:', error);
-    } finally {
-        await sql.end();
-    }
+
+  } catch (error) {
+
+  } finally {
+    await sql.end();
+  }
 }
 
 migrate();

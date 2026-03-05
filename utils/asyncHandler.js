@@ -4,7 +4,7 @@
  */
 import config from '../config/env.js';
 export const asyncHandler = (fn) => (req, res, next) => {
-    Promise.resolve(fn(req, res, next)).catch(next);
+  Promise.resolve(fn(req, res, next)).catch(next);
 };
 
 /**
@@ -12,53 +12,52 @@ export const asyncHandler = (fn) => (req, res, next) => {
  * Centralizes error handling for all routes
  */
 export const errorHandler = (err, req, res, next) => {
-    const requestId = req.requestId || 'no-id';
-    console.error(`[ERROR] [${requestId}] ${req.method} ${req.url}:`, err);
+  const requestId = req.requestId || 'no-id';
 
-    // Handle known error types
-    if (err.name === 'ValidationError') {
-        return res.status(400).json({
-            error: 'Validation Error',
-            details: err.errors || err.message,
-            requestId
-        });
-    }
-
-    if (err.code === '23505') {
-        // PostgreSQL unique violation
-        return res.status(409).json({
-            error: 'Duplicate Entry',
-            details: err.detail || 'A record with this value already exists',
-            requestId
-        });
-    }
-
-    if (err.code === '23503') {
-        // PostgreSQL foreign key violation
-        return res.status(400).json({
-            error: 'Invalid Reference',
-            details: err.detail || 'Referenced record does not exist',
-            requestId
-        });
-    }
-
-    // Handle transient DB/network errors → 503 (so frontend can auto-retry)
-    const transientCodes = ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'CONNECTION_ENDED', 'CONNECTION_CLOSED'];
-    if (transientCodes.includes(err.code) || err.message?.includes('ETIMEDOUT') || err.message?.includes('Connect Timeout')) {
-        console.warn(`[TRANSIENT] [${requestId}] DB/network error (${err.code}), returning 503`);
-        return res.status(503).json({
-            error: 'Service temporarily unavailable. Please retry.',
-            requestId
-        });
-    }
-
-    // Default to 500
-    const status = err.status || err.statusCode || 500;
-    res.status(status).json({
-        error: config.nodeEnv === 'production' && status === 500
-            ? 'Internal Server Error'
-            : err.message || 'Internal Server Error',
-        requestId,
-        ...(config.nodeEnv === 'development' && { stack: err.stack })
+  // Handle known error types
+  if (err.name === 'ValidationError') {
+    return res.status(400).json({
+      error: 'Validation Error',
+      details: err.errors || err.message,
+      requestId
     });
+  }
+
+  if (err.code === '23505') {
+    // PostgreSQL unique violation
+    return res.status(409).json({
+      error: 'Duplicate Entry',
+      details: err.detail || 'A record with this value already exists',
+      requestId
+    });
+  }
+
+  if (err.code === '23503') {
+    // PostgreSQL foreign key violation
+    return res.status(400).json({
+      error: 'Invalid Reference',
+      details: err.detail || 'Referenced record does not exist',
+      requestId
+    });
+  }
+
+  // Handle transient DB/network errors → 503 (so frontend can auto-retry)
+  const transientCodes = ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'CONNECTION_ENDED', 'CONNECTION_CLOSED'];
+  if (transientCodes.includes(err.code) || err.message?.includes('ETIMEDOUT') || err.message?.includes('Connect Timeout')) {
+
+    return res.status(503).json({
+      error: 'Service temporarily unavailable. Please retry.',
+      requestId
+    });
+  }
+
+  // Default to 500
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({
+    error: config.nodeEnv === 'production' && status === 500 ?
+    'Internal Server Error' :
+    err.message || 'Internal Server Error',
+    requestId,
+    ...(config.nodeEnv === 'development' && { stack: err.stack })
+  });
 };

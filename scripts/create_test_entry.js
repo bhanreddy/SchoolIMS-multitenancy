@@ -2,13 +2,11 @@ import sql from '../db.js';
 import fs from 'fs';
 
 async function createTestEntry() {
-    try {
-        const classId = fs.readFileSync('class_id.txt', 'utf8').trim();
-        if (!classId) throw new Error('No class_id found');
+  try {
+    const classId = fs.readFileSync('class_id.txt', 'utf8').trim();
+    if (!classId) throw new Error('No class_id found');
 
-        console.log(`Creating test entry for class: ${classId}`);
-
-        const [entry] = await sql`
+    const [entry] = await sql`
       INSERT INTO diary_entries (
         class_section_id, 
         entry_date, 
@@ -29,12 +27,11 @@ async function createTestEntry() {
       RETURNING *
     `;
 
-        console.log('Created entry:', entry.id);
-        process.exit(0);
-    } catch (err) {
-        console.error(err);
-        process.exit(1);
-    }
+    process.exit(0);
+  } catch (err) {
+
+    process.exit(1);
+  }
 }
 
 createTestEntry();

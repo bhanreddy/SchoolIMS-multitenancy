@@ -6,7 +6,6 @@ import { asyncHandler } from '../utils/asyncHandler.js';
 const router = express.Router();
 import { sendNotificationToUsers } from '../services/notificationService.js';
 
-
 /**
  * GET /attendance
  * Get attendance records with filters
@@ -14,7 +13,7 @@ import { sendNotificationToUsers } from '../services/notificationService.js';
  */
 router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, res) => {
   const { date, class_section_id, student_id, from_date, to_date, page = 1, limit = 50 } = req.query;
-  console.log('[DEBUG] GET /attendance called with params:', req.query);
+
   const offset = (page - 1) * limit;
 
   // Build dynamic query based on filters
@@ -162,7 +161,7 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
 
   const markedBy = req.user?.internal_id || null;
 
-  const results = await sql.begin(async sql => {
+  const results = await sql.begin(async (sql) => {
     const inserted = [];
 
     for (const record of attendance) {
@@ -181,7 +180,7 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
       `;
 
       if (!enrollment) {
-        console.warn(`No active enrollment for student ${student_id} in class ${class_section_id}`);
+
         continue;
       }
 
@@ -248,9 +247,9 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
            JOIN users u ON s.person_id = u.person_id
            WHERE s.id = ${student_id}
            AND u.account_status = 'active'
-           
+
            UNION
-           
+
            SELECT u.id as user_id, 'parent' as role
            FROM student_parents sp
            JOIN parents p ON sp.parent_id = p.id
@@ -261,7 +260,7 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
 
         if (targetUsers.length === 0) continue;
 
-        const userIds = targetUsers.map(u => u.user_id);
+        const userIds = targetUsers.map((u) => u.user_id);
 
         // 2. Fetch Tokens
         const devices = await sql`
@@ -271,11 +270,11 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
 
         if (devices.length === 0) continue;
 
-        const tokens = devices.map(d => d.fcm_token);
+        const tokens = devices.map((d) => d.fcm_token);
 
         // Map back to targetUsers structure for logging completeness
-        const notificationTargets = devices.map(d => {
-          const info = targetUsers.find(u => u.user_id === d.user_id);
+        const notificationTargets = devices.map((d) => {
+          const info = targetUsers.find((u) => u.user_id === d.user_id);
           return { id: d.user_id, role: info?.role || 'unknown' };
         });
 
@@ -287,8 +286,7 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
         );
       }
     } catch (notificationError) {
-      console.error('[Notification Integration] Failed to send attendance notifications:', notificationError);
-      // Suppress error so we don't affect the HTTP response
+
     }
   })();
 
@@ -467,7 +465,7 @@ router.get('/my-class', requireAuth, asyncHandler(async (req, res) => {
     class_name: classInfo?.class_name,
     section_name: classInfo?.section_name,
     total_students: students.length,
-    marked_count: students.filter(s => s.status).length,
+    marked_count: students.filter((s) => s.status).length,
     students
   });
 }));
@@ -553,11 +551,10 @@ router.get('/class/:classSectionId', requirePermission('attendance.view'), async
     class_name: classInfo?.class_name,
     section_name: classInfo?.section_name,
     total_students: students.length,
-    marked_count: students.filter(s => s.status).length,
+    marked_count: students.filter((s) => s.status).length,
     students
   });
 }));
-
 
 /**
  * GET /attendance/staff
@@ -608,7 +605,7 @@ router.post('/staff', requirePermission('attendance.mark'), asyncHandler(async (
   const markedBy = req.user?.internal_id || null;
 
   // Process attendance
-  const results = await sql.begin(async sql => {
+  const results = await sql.begin(async (sql) => {
     const inserted = [];
 
     for (const record of attendance) {
@@ -641,4 +638,3 @@ router.post('/staff', requirePermission('attendance.mark'), asyncHandler(async (
 }));
 
 export default router;
-

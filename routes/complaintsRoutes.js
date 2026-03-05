@@ -2,6 +2,7 @@ import express from 'express';
 import sql from '../db.js';
 import { requirePermission, requireAuth } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { translateFields } from '../services/geminiTranslator.js';
 
 const router = express.Router();
 
@@ -19,7 +20,7 @@ router.get('/', requirePermission('complaints.view'), asyncHandler(async (req, r
   if (isAdmin) {
     complaints = await sql`
       SELECT 
-        c.id, c.ticket_no, c.title, c.category, c.priority, c.status,
+        c.id, c.ticket_no, c.title, c.title_te, c.category, c.priority, c.status,
         c.created_at, c.resolved_at,
         raiser.display_name as raised_by_name,
         assignee.display_name as assigned_to_name
@@ -49,7 +50,7 @@ router.get('/', requirePermission('complaints.view'), asyncHandler(async (req, r
 
     complaints = await sql`
       SELECT 
-        c.id, c.ticket_no, c.title, c.category, c.priority, c.status,
+        c.id, c.ticket_no, c.title, c.title_te, c.description_te, c.category, c.priority, c.status,
         c.created_at, c.resolved_at,
         raiser.display_name as raised_by_name
       FROM complaints c
@@ -144,9 +145,20 @@ router.post('/', requirePermission('complaints.create'), asyncHandler(async (req
     }
   }
 
+  // Translate text fields
+  let title_te = null;
+  let description_te = null;
+  try {
+    const te = await translateFields({ title, description });
+    title_te = te.title || null;
+    description_te = te.description || null;
+  } catch (e) {
+
+  }
+
   const [complaint] = await sql`
-    INSERT INTO complaints (title, description, category, priority, raised_by, raised_for_student_id)
-    VALUES (${title}, ${description}, ${category || 'other'}, ${priority || 'medium'}, 
+    INSERT INTO complaints (title, title_te, description, description_te, category, priority, raised_by, raised_for_student_id)
+    VALUES (${title}, ${title_te}, ${description}, ${description_te}, ${category || 'other'}, ${priority || 'medium'}, 
             ${req.user.internal_id}, ${raised_for_student_id})
     RETURNING *
   `;
@@ -172,7 +184,7 @@ router.post('/', requirePermission('complaints.create'), asyncHandler(async (req
       `;
 
       if (recipients.length > 0) {
-        const userIds = recipients.map(r => r.user_id);
+        const userIds = recipients.map((r) => r.user_id);
 
         await sendNotificationToUsers(
           userIds,
@@ -181,7 +193,7 @@ router.post('/', requirePermission('complaints.create'), asyncHandler(async (req
         );
       }
     } catch (err) {
-      console.error('[Notification] Failed to trigger COMPLAINT_CREATED:', err);
+
     }
   })();
 
@@ -221,6 +233,17 @@ router.put('/:id', asyncHandler(async (req, res) => {
     resolved_at = sql`NOW()`;
   }
 
+  // Translate resolution if provided
+  let sql_resolution_te = sql`resolution_te`;
+  if (resolution) {
+    try {
+      const te = await translateFields({ resolution });
+      if (te.resolution) sql_resolution_te = sql`${te.resolution}`;
+    } catch (e) {
+
+    }
+  }
+
   const [updated] = await sql`
     UPDATE complaints
     SET 
@@ -228,6 +251,7 @@ router.put('/:id', asyncHandler(async (req, res) => {
       priority = COALESCE(${priority}, priority),
       assigned_to = COALESCE(${assigned_to}, assigned_to),
       resolution = COALESCE(${resolution}, resolution),
+      resolution_te = ${sql_resolution_te},
       resolved_by = COALESCE(${resolved_by}, resolved_by),
       resolved_at = ${status === 'resolved' || status === 'closed' ? sql`NOW()` : sql`resolved_at`}
     WHERE id = ${id}
@@ -255,13 +279,13 @@ router.put('/:id', asyncHandler(async (req, res) => {
 
         if (recipients.length > 0) {
           await sendNotificationToUsers(
-            recipients.map(r => r.user_id),
+            recipients.map((r) => r.user_id),
             'COMPLAINT_RESPONSE',
             { message: `Complaint "${updated.title}" has been ${status}.` }
           );
         }
       } catch (err) {
-        console.error('[Notification] COMPLAINT_RESPONSE failed:', err);
+
       }
     })();
   }
@@ -275,6 +299,5 @@ router.put('/:id', asyncHandler(async (req, res) => {
  */
 // DELETE endpoint removed as per audit requirements
 // router.delete('/:id', ...)
-
 
 export default router;

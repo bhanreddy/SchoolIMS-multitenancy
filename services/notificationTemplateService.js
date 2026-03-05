@@ -11,36 +11,40 @@ export const NotificationTemplateService = {
      * Renders a notification template.
      * @param {string} type - One of the template keys from NotificationEventConfig
      * @param {object} params - Dynamic parameters
+     * @param {string} [languageCode='en'] - Language code ('en' or 'te')
      * @returns {object} { title, body, deepLink, android: { channelId } }
      * @throws {Error} If type is invalid or params are missing
      */
-    render(type, params) {
+    render(type, params, languageCode = 'en') {
         const config = NotificationEventConfig[type];
         if (!config) {
             throw new Error(`Invalid notification type: ${type}`);
         }
 
-        // Validate required parameters
+        // Fix 11: Falsy param validation rejects valid values
         const requiredParams = config.requiredParams || [];
-        const missingParams = requiredParams.filter(p => !params[p]);
+        const missingParams = requiredParams.filter(p => params[p] === undefined || params[p] === null);
         if (missingParams.length > 0) {
             throw new Error(`Missing required parameters for ${type}: ${missingParams.join(', ')}`);
         }
 
-        // Render templates
-        let title = config.titleTemplate;
-        let body = config.bodyTemplate;
+        // Select Telugu or English templates (fall back to English if Telugu missing)
+        const useTelugu = languageCode === 'te';
+        let title = (useTelugu && config.titleTemplate_te) ? config.titleTemplate_te : config.titleTemplate;
+        let body = (useTelugu && config.bodyTemplate_te) ? config.bodyTemplate_te : config.bodyTemplate;
 
         // Replace placeholders
         Object.keys(params).forEach(key => {
             const value = params[key];
-            const regex = new RegExp(`{{${key}}}`, 'g');
+            // Fix 9: Escape dynamic RegExp keys
+            const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const regex = new RegExp(`{{${escapedKey}}}`, 'g');
             title = title.replace(regex, value);
             body = body.replace(regex, value);
         });
 
-        // Final check for unplaced variables (sanity check)
-        if (body.includes('{{') || title.includes('{{')) {
+        // Fix 10: Overly strict {{ sanity check
+        if (/\{\{[^}]+\}\}/.test(body) || /\{\{[^}]+\}\}/.test(title)) {
             throw new Error(`Template rendering failed. Unreplaced placeholders in ${type}`);
         }
 

@@ -3,7 +3,7 @@ import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
-import { translateToHybridTelugu } from '../services/translationService.js';
+import { translateFields } from '../services/geminiTranslator.js';
 
 const router = express.Router();
 
@@ -83,7 +83,7 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
   }
 
   // Sanitize inputs
-  const safeTargetClassId = (target_class_id && target_class_id !== '') ? target_class_id : null;
+  const safeTargetClassId = target_class_id && target_class_id !== '' ? target_class_id : null;
   const safePriority = priority || 'medium';
   const safeAudience = audience || 'all';
   const safePublishAt = publish_at || new Date();
@@ -92,13 +92,13 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
     let title_te = null;
     let content_te = null;
 
-    // Auto-generate Hybrid Telugu
+    // Auto-generate Telugu translation
     try {
-      const translations = await translateToHybridTelugu([title, content]);
-      title_te = translations[0];
-      content_te = translations[1];
+      const te = await translateFields({ title, content });
+      title_te = te.title || null;
+      content_te = te.content || null;
     } catch (e) {
-      console.error('Failed to translate notice to Hybrid Telugu:', e);
+
     }
 
     const [notice] = await sql`
@@ -122,9 +122,9 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
              WHERE cs.class_id = ${safeTargetClassId}
                AND se.status = 'active'
                AND u.account_status = 'active'
-             
+
              UNION
-             
+
              SELECT DISTINCT u.id
              FROM users u
              JOIN parents p ON u.person_id = p.person_id
@@ -144,9 +144,9 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
              JOIN student_enrollments se ON s.id = se.student_id
              WHERE se.status = 'active'
                AND u.account_status = 'active'
-             
+
              UNION
-             
+
              SELECT DISTINCT u.id
              FROM users u
              JOIN parents p ON u.person_id = p.person_id
@@ -159,7 +159,7 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
         }
 
         if (recips.length > 0) {
-          const userIds = [...new Set(recips.map(r => r.id))];
+          const userIds = [...new Set(recips.map((r) => r.id))];
           await sendNotificationToUsers(
             userIds,
             'NOTICE_ADMIN_STUDENT',
@@ -167,13 +167,13 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
           );
         }
       } catch (notifyErr) {
-        console.error('[Notification] NOTICE_ADMIN_STUDENT failed:', notifyErr);
+
       }
     })();
 
     res.status(201).json({ message: 'Notice created', notice });
   } catch (err) {
-    console.error('Create Notice Failed:', err);
+
     res.status(500).json({ error: 'Failed to create notice: ' + err.message });
   }
 }));
@@ -191,13 +191,14 @@ router.put('/:id', requirePermission('notices.manage'), asyncHandler(async (req,
 
   if (title || content) {
     try {
-      const transTitle = title || '';
-      const transContent = content || '';
-      const translations = await translateToHybridTelugu([transTitle, transContent]);
-      if (title) sql_title_te = sql`${translations[0]}`;
-      if (content) sql_content_te = sql`${translations[1]}`;
+      const fields = {};
+      if (title) fields.title = title;
+      if (content) fields.content = content;
+      const te = await translateFields(fields);
+      if (te.title) sql_title_te = sql`${te.title}`;
+      if (te.content) sql_content_te = sql`${te.content}`;
     } catch (e) {
-      console.error('Failed to translate notice update to Hybrid Telugu:', e);
+
     }
   }
 

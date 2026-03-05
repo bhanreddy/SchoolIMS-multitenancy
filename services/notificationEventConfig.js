@@ -6,7 +6,9 @@ export const NotificationEventConfig = Object.freeze({
         sound: 'attendance_absent_alert.wav',
         titleTemplate: 'Attendance Alert',
         bodyTemplate: 'Absent on {{date}}.',
-        deepLink: '/student/attendance',
+        titleTemplate_te: 'హాజరు హెచ్చరిక',
+        bodyTemplate_te: '{{date}} న గైర్హాజరు.',
+        deepLink: '/Screen/attendance',
         requiredParams: ['date']
     },
     ATTENDANCE_PRESENT: {
@@ -14,7 +16,9 @@ export const NotificationEventConfig = Object.freeze({
         sound: 'voice_alert.wav',
         titleTemplate: 'Attendance Update',
         bodyTemplate: '{{message}}',
-        deepLink: '/student/attendance',
+        titleTemplate_te: 'హాజరు నవీకరణ',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/attendance',
         requiredParams: ['message']
     },
 
@@ -24,7 +28,9 @@ export const NotificationEventConfig = Object.freeze({
         sound: 'voice_alert.wav',
         titleTemplate: 'Diary Update',
         bodyTemplate: '{{message}}',
-        deepLink: '/student/diary',
+        titleTemplate_te: 'డైరీ నవీకరణ',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/diary',
         requiredParams: ['message']
     },
 
@@ -34,7 +40,9 @@ export const NotificationEventConfig = Object.freeze({
         sound: 'voice_alert.wav',
         titleTemplate: 'Results Announced',
         bodyTemplate: '{{message}}',
-        deepLink: '/student/results',
+        titleTemplate_te: 'ఫలితాలు ప్రకటించబడ్డాయి',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/results',
         requiredParams: ['message']
     },
 
@@ -44,7 +52,9 @@ export const NotificationEventConfig = Object.freeze({
         sound: 'emergency.wav',
         titleTemplate: 'New Complaint',
         bodyTemplate: '{{message}}',
-        deepLink: '/student/complaints',
+        titleTemplate_te: 'కొత్త ఫిర్యాదు',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/complaints',
         requiredParams: ['message']
     },
     COMPLAINT_RESPONSE: {  // If admin replies later
@@ -52,7 +62,9 @@ export const NotificationEventConfig = Object.freeze({
         sound: 'emergency.wav',
         titleTemplate: 'Complaint Update',
         bodyTemplate: '{{message}}',
-        deepLink: '/student/complaints',
+        titleTemplate_te: 'ఫిర్యాదు నవీకరణ',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/complaints',
         requiredParams: ['message']
     },
 
@@ -62,7 +74,9 @@ export const NotificationEventConfig = Object.freeze({
         sound: 'voice_alert.wav',
         titleTemplate: 'New Study Material',
         bodyTemplate: '{{message}}',
-        deepLink: '/student/lms',
+        titleTemplate_te: 'కొత్త అధ్యయన సామగ్రి',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/lms',
         requiredParams: ['message']
     },
 
@@ -72,7 +86,9 @@ export const NotificationEventConfig = Object.freeze({
         sound: 'voice_alert.wav',
         titleTemplate: 'Timetable Update',
         bodyTemplate: '{{message}}',
-        deepLink: '/student/timetable',
+        titleTemplate_te: 'టైమ్‌టేబుల్ నవీకరణ',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/timetable',
         requiredParams: ['message']
     },
 
@@ -82,7 +98,9 @@ export const NotificationEventConfig = Object.freeze({
         sound: 'voice_alert.wav',
         titleTemplate: 'Admin Notice',
         bodyTemplate: '{{message}}',
-        deepLink: '/student/notices',
+        titleTemplate_te: 'అడ్మిన్ నోటీసు',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/announcements',
         requiredParams: ['message']
     },
 
@@ -92,7 +110,9 @@ export const NotificationEventConfig = Object.freeze({
         sound: 'fee_reminder.wav',
         titleTemplate: 'Fee Reminder',
         bodyTemplate: '{{message}}',
-        deepLink: '/student/fees',
+        titleTemplate_te: 'ఫీజు రిమైండర్',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/fees',
         requiredParams: ['message']
     },
     FEE_COLLECTED: {
@@ -100,32 +120,40 @@ export const NotificationEventConfig = Object.freeze({
         sound: 'voice_alert.wav',
         titleTemplate: 'Fee Received',
         bodyTemplate: '{{message}}',
-        deepLink: '/student/fees',
+        titleTemplate_te: 'ఫీజు అందుకున్నారు',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/fees',
         requiredParams: ['message']
     },
 
     // ===== LEAVES =====
     LEAVE_SUBMITTED: {   // Notify admin only
         channelId: 'exam',
-        sound: 'exam.wav',
+        sound: 'default.wav',
         titleTemplate: 'Leave Request',
         bodyTemplate: '{{message}}',
+        titleTemplate_te: 'సెలవు అభ్యర్థన',
+        bodyTemplate_te: '{{message}}',
         deepLink: '/admin/leaves',
         requiredParams: ['message']
     },
     LEAVE_APPROVED: {    // Notify applicant only
         channelId: 'exam',
-        sound: 'exam.wav',
+        sound: 'default.wav',
         titleTemplate: 'Leave Approved',
         bodyTemplate: '{{message}}',
+        titleTemplate_te: 'సెలవు ఆమోదించబడింది',
+        bodyTemplate_te: '{{message}}',
         deepLink: '/staff/leaves',
         requiredParams: ['message']
     },
     LEAVE_REJECTED: {    // Notify applicant only
         channelId: 'exam',
-        sound: 'exam.wav',
+        sound: 'default.wav',
         titleTemplate: 'Leave Rejected',
         bodyTemplate: '{{message}}',
+        titleTemplate_te: 'సెలవు తిరస్కరించబడింది',
+        bodyTemplate_te: '{{message}}',
         deepLink: '/staff/leaves',
         requiredParams: ['message']
     },
@@ -133,25 +161,31 @@ export const NotificationEventConfig = Object.freeze({
     // ===== EXPENSES =====
     EXPENSE_CREATED: {
         channelId: 'exam',
-        sound: 'exam.wav',
+        sound: 'default.wav',
         titleTemplate: 'Expense Submitted',
         bodyTemplate: '{{message}}',
+        titleTemplate_te: 'ఖర్చు సమర్పించబడింది',
+        bodyTemplate_te: '{{message}}',
         deepLink: '/admin/expenses',
         requiredParams: ['message']
     },
     EXPENSE_APPROVED: {
         channelId: 'exam',
-        sound: 'exam.wav',
+        sound: 'default.wav',
         titleTemplate: 'Expense Approved',
         bodyTemplate: '{{message}}',
+        titleTemplate_te: 'ఖర్చు ఆమోదించబడింది',
+        bodyTemplate_te: '{{message}}',
         deepLink: '/accounts/expenses',
         requiredParams: ['message']
     },
     EXPENSE_REJECTED: {
         channelId: 'exam',
-        sound: 'exam.wav',
+        sound: 'default.wav',
         titleTemplate: 'Expense Rejected',
         bodyTemplate: '{{message}}',
+        titleTemplate_te: 'ఖర్చు తిరస్కరించబడింది',
+        bodyTemplate_te: '{{message}}',
         deepLink: '/accounts/expenses',
         requiredParams: ['message']
     },
@@ -159,10 +193,12 @@ export const NotificationEventConfig = Object.freeze({
     // ===== PAYROLL =====
     PAYROLL_SUCCESS: {
         channelId: 'exam',
-        sound: 'exam.wav',
+        sound: 'default.wav',
         titleTemplate: 'Salary Credited',
         bodyTemplate: '{{message}}',
-        deepLink: '/staff/payroll',
+        titleTemplate_te: 'జీతం జమ అయింది',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/staff/payslip',
         requiredParams: ['message']
     }
 

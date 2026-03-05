@@ -7,11 +7,10 @@ import 'dotenv/config';
 import sql from '../db.js';
 
 async function fixAdminPermissions() {
-    console.log('🔧 Fixing admin permissions...\n');
 
-    try {
-        // 1. Find all admin users
-        const adminUsers = await sql`
+  try {
+    // 1. Find all admin users
+    const adminUsers = await sql`
             SELECT u.id, p.display_name
             FROM users u
             JOIN persons p ON u.person_id = p.id
@@ -20,68 +19,50 @@ async function fixAdminPermissions() {
             WHERE r.code = 'admin'
         `;
 
-        if (adminUsers.length === 0) {
-            console.log('❌ No admin users found!');
-            console.log('   Run: node scripts/seedAdmin.js');
-            process.exit(1);
-        }
+    if (adminUsers.length === 0) {
 
-        console.log(`✅ Found ${adminUsers.length} admin user(s):`);
-        adminUsers.forEach(u => console.log(`   - ${u.display_name} (${u.id})`));
+      process.exit(1);
+    }
 
-        // 2. Get admin role
-        const [adminRole] = await sql`SELECT id FROM roles WHERE code = 'admin'`;
+    adminUsers.forEach((u) => {});
 
-        if (!adminRole) {
-            console.log('❌ Admin role not found in database!');
-            process.exit(1);
-        }
+    // 2. Get admin role
+    const [adminRole] = await sql`SELECT id FROM roles WHERE code = 'admin'`;
 
-        // 3. Get ALL permissions
-        const allPermissions = await sql`SELECT id, code FROM permissions ORDER BY code`;
+    if (!adminRole) {
 
-        console.log(`\n📋 Total permissions in system: ${allPermissions.length}`);
+      process.exit(1);
+    }
 
-        // 4. Assign ALL permissions to admin role
-        console.log('\n🔄 Assigning all permissions to admin role...');
+    // 3. Get ALL permissions
+    const allPermissions = await sql`SELECT id, code FROM permissions ORDER BY code`;
 
-        let assigned = 0;
-        for (const perm of allPermissions) {
-            await sql`
+    // 4. Assign ALL permissions to admin role
+
+    let assigned = 0;
+    for (const perm of allPermissions) {
+      await sql`
                 INSERT INTO role_permissions (role_id, permission_id)
                 VALUES (${adminRole.id}, ${perm.id})
                 ON CONFLICT (role_id, permission_id) DO NOTHING
             `;
-            assigned++;
-        }
+      assigned++;
+    }
 
-        console.log(`✅ Assigned ${assigned} permissions to admin role`);
-
-        // 5. Verify
-        const [verification] = await sql`
+    // 5. Verify
+    const [verification] = await sql`
             SELECT COUNT(*) as count
             FROM role_permissions rp
             JOIN roles r ON rp.role_id = r.id
             WHERE r.code = 'admin'
         `;
 
-        console.log(`\n✅ Admin role now has ${verification.count} permissions`);
+  } catch (error) {
 
-        console.log('\n═══════════════════════════════════════════');
-        console.log('✅ ADMIN PERMISSIONS FIXED');
-        console.log('═══════════════════════════════════════════');
-        console.log('Admin users can now:');
-        console.log('  ✓ Create accounts staff');
-        console.log('  ✓ Manage all users');
-        console.log('  ✓ Access all features');
-        console.log('═══════════════════════════════════════════');
+    process.exit(1);
+  }
 
-    } catch (error) {
-        console.error('❌ Error:', error.message);
-        process.exit(1);
-    }
-
-    process.exit(0);
+  process.exit(0);
 }
 
 fixAdminPermissions();

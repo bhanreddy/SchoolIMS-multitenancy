@@ -231,7 +231,7 @@ router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHand
   const safeDescription = description || '';
   const safeContentUrl = content_url || '';
   const safeFileSize = file_size ?? null; // Default to null if undefined
-  const safeDuration = duration ?? null;   // Default to null if undefined
+  const safeDuration = duration ?? null; // Default to null if undefined
   const safeIsPublished = is_published === true; // Default to false if undefined or not true
 
   const [material] = await sql`
@@ -277,7 +277,7 @@ router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHand
       `;
 
       if (recipients.length > 0) {
-        const userIds = recipients.map(r => r.id);
+        const userIds = recipients.map((r) => r.id);
         await sendNotificationToUsers(
           userIds,
           'LMS_CONTENT',
@@ -285,7 +285,7 @@ router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHand
         );
       }
     } catch (notifyErr) {
-      console.error('[Notification] LMS_CONTENT failed:', notifyErr);
+
     }
   })();
 
@@ -373,7 +373,7 @@ router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async
       `;
 
       if (recipients.length > 0) {
-        const userIds = recipients.map(r => r.id);
+        const userIds = recipients.map((r) => r.id);
         await sendNotificationToUsers(
           userIds,
           'LMS_CONTENT',
@@ -381,7 +381,7 @@ router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async
         );
       }
     } catch (notifyErr) {
-      console.error('[Notification] LMS_CONTENT update notify failed:', notifyErr);
+
     }
   })();
 
@@ -416,7 +416,6 @@ router.delete('/materials/:id', requirePermission('lms.create'), asyncHandler(as
 
   res.json({ message: 'Material deleted' });
 }));
-
 
 // Helper to get staff ID from internal user ID
 async function getStaffId(internalId) {

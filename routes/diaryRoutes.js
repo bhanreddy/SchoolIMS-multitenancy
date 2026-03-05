@@ -4,7 +4,7 @@ import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
 import fs from 'fs';
-import { translateToHybridTelugu } from '../services/translationService.js';
+import { translateFields } from '../services/geminiTranslator.js';
 
 const router = express.Router();
 
@@ -12,7 +12,7 @@ function logDebug(msg) {
   try {
     fs.appendFileSync('debug_log.txt', `${new Date().toISOString()} - ${msg}\n`);
   } catch (e) {
-    console.error('Log failed', e);
+
   }
 }
 
@@ -180,11 +180,11 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
   let title_te = null;
   let content_te = null;
   try {
-    const translations = await translateToHybridTelugu([title || '', content || '']);
-    if (title) title_te = translations[0];
-    if (content) content_te = translations[1];
+    const te = await translateFields({ title: title || '', content: content || '' });
+    if (title) title_te = te.title || null;
+    if (content) content_te = te.content || null;
   } catch (e) {
-    console.error('[Diary] Translation Error:', e);
+
   }
 
   let entry;
@@ -198,7 +198,7 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
     entry = result[0];
   } catch (dbErr) {
     logDebug(`[Diary] DB Insert Error: ${dbErr.message}`);
-    console.error('[Diary] DB Insert Error:', dbErr);
+
     throw dbErr;
   }
 
@@ -213,9 +213,9 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
         WHERE se.class_section_id = ${class_section_id}
           AND se.status = 'active'
           AND u.account_status = 'active'
-        
+
         UNION
-        
+
         SELECT DISTINCT u.id
         FROM users u
         JOIN parents p ON u.person_id = p.person_id
@@ -228,7 +228,7 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
       `;
 
       if (recipients.length > 0) {
-        const userIds = recipients.map(r => r.id);
+        const userIds = recipients.map((r) => r.id);
         await sendNotificationToUsers(
           userIds,
           'DIARY_UPDATED',
@@ -236,7 +236,7 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
         );
       }
     } catch (err) {
-      console.error('[Notification] Failed to trigger DIARY_UPDATED:', err);
+
     }
   })();
 
@@ -269,13 +269,14 @@ router.put('/:id', requirePermission('diary.create'), asyncHandler(async (req, r
 
   if (title || content) {
     try {
-      const transTitle = title || '';
-      const transContent = content || '';
-      const translations = await translateToHybridTelugu([transTitle, transContent]);
-      if (title) sql_title_te = sql`${translations[0]}`;
-      if (content) sql_content_te = sql`${translations[1]}`;
+      const fields = {};
+      if (title) fields.title = title;
+      if (content) fields.content = content;
+      const te = await translateFields(fields);
+      if (te.title) sql_title_te = sql`${te.title}`;
+      if (te.content) sql_content_te = sql`${te.content}`;
     } catch (e) {
-      console.error('[Diary] Translation Update Error:', e);
+
     }
   }
 
@@ -298,7 +299,7 @@ router.put('/:id', requirePermission('diary.create'), asyncHandler(async (req, r
     updated = result[0];
   } catch (dbErr) {
     logDebug(`[Diary] DB Update Error: ${dbErr.message}`);
-    console.error('[Diary] DB Update Error:', dbErr);
+
     throw dbErr;
   }
 

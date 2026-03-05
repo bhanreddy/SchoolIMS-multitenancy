@@ -4,10 +4,9 @@ import postgres from 'postgres';
 const sql = postgres(process.env.DATABASE_URL);
 
 async function run() {
-    console.log('Running transport migration as single batch...\n');
 
-    try {
-        await sql.unsafe(`
+  try {
+    await sql.unsafe(`
       -- 1. BUSES: Add driver_id FK
       ALTER TABLE buses ADD COLUMN IF NOT EXISTS driver_id UUID REFERENCES staff(id);
 
@@ -52,19 +51,17 @@ async function run() {
       CREATE INDEX IF NOT EXISTS idx_trip_stop_trip ON trip_stop_status(trip_id);
       CREATE INDEX IF NOT EXISTS idx_trip_stop_status ON trip_stop_status(status);
     `);
-        console.log('✓ Tables and indexes created');
 
-        // Partial unique index (separate because IF NOT EXISTS not supported for partial)
-        await sql.unsafe(`
+    // Partial unique index (separate because IF NOT EXISTS not supported for partial)
+    await sql.unsafe(`
       CREATE UNIQUE INDEX idx_trips_active_bus ON trips(bus_id) WHERE status = 'active'
-    `).catch(e => {
-            if (e.message.includes('already exists')) console.log('⊘ idx_trips_active_bus already exists');
-            else throw e;
-        });
-        console.log('✓ Partial unique index created');
+    `).catch((e) => {
+      if (e.message.includes('already exists')) {} else
+      throw e;
+    });
 
-        // 7. RLS
-        await sql.unsafe(`
+    // 7. RLS
+    await sql.unsafe(`
       ALTER TABLE trips ENABLE ROW LEVEL SECURITY;
       ALTER TABLE trip_stop_status ENABLE ROW LEVEL SECURITY;
 
@@ -95,15 +92,13 @@ async function run() {
       CREATE POLICY "Authenticated can view trip stops" ON trip_stop_status FOR SELECT
         TO authenticated USING (true);
     `);
-        console.log('✓ RLS policies created');
 
-        console.log('\n🎉 Transport migration complete!');
-    } catch (e) {
-        console.error('✗ Migration failed:', e.message);
-    }
+  } catch (e) {
 
-    await sql.end();
-    process.exit(0);
+  }
+
+  await sql.end();
+  process.exit(0);
 }
 
 run();

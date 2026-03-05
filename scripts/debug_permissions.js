@@ -1,53 +1,47 @@
 import sql, { supabaseAdmin } from '../db.js';
 
 async function debugPermissions() {
-    try {
-        console.log('--- DEBUG PERMISSIONS ---');
-        const email = 'kiran@gmail.com';
+  try {
 
-        // 1. Get User ID
-        const { data: { users }, error } = await supabaseAdmin.auth.admin.listUsers();
-        const authUser = users.find(u => u.email === email);
+    const email = 'kiran@gmail.com';
 
-        if (!authUser) {
-            console.log('Auth User NOT FOUND');
-            return;
-        }
-        const userId = authUser.id;
-        console.log('User ID:', userId);
+    // 1. Get User ID
+    const { data: { users }, error } = await supabaseAdmin.auth.admin.listUsers();
+    const authUser = users.find((u) => u.email === email);
 
-        // 2. Fetch User Record
-        const userRecord = await sql`SELECT * FROM users WHERE id = ${userId}`;
-        console.log('User Record:', userRecord[0]);
+    if (!authUser) {
 
-        // 3. Run the "isOwner" Query exactly as in the route
-        console.log('\nRunning isOwner Query...');
-        const ownerCheck = await sql`
+      return;
+    }
+    const userId = authUser.id;
+
+    // 2. Fetch User Record
+    const userRecord = await sql`SELECT * FROM users WHERE id = ${userId}`;
+
+    // 3. Run the "isOwner" Query exactly as in the route
+
+    const ownerCheck = await sql`
             SELECT s.id, s.admission_no, s.person_id as student_person_id, u.person_id as user_person_id
             FROM students s
             JOIN users u ON s.person_id = u.person_id
             WHERE u.id = ${userId}
         `;
 
-        if (ownerCheck.length === 0) {
-            console.log('❌ isOwner Query returned NO RESULTS');
+    if (ownerCheck.length === 0) {
 
-            // Debug why join failed
-            console.log('Debugging Join...');
-            const studentForPerson = await sql`SELECT * FROM students WHERE person_id = ${userRecord[0].person_id}`;
-            console.log('Student for this person_id:', studentForPerson);
+      // Debug why join failed
 
-        } else {
-            console.log('✅ isOwner Query Result:', ownerCheck[0]);
-        }
+      const studentForPerson = await sql`SELECT * FROM students WHERE person_id = ${userRecord[0].person_id}`;
 
-        console.log('--- FINISHED ---');
+    } else {
 
-    } catch (error) {
-        console.error('Error:', error);
-    } finally {
-        process.exit();
     }
+
+  } catch (error) {
+
+  } finally {
+    process.exit();
+  }
 }
 
 debugPermissions();

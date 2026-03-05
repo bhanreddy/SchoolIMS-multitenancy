@@ -37,12 +37,7 @@ const BASE_URL = 'http://localhost:3000/students'; // Adjust port if needed
 import sql from '../db.js';
 
 async function testCreation() {
-    console.log("--- Manual Verification Steps ---");
-    console.log("1. Open App > Add Student");
-    console.log("2. Try to save without Class/Section -> Should show alert.");
-    console.log("3. Fill all fields -> Should save and Auto-Enroll.");
-    console.log("");
-    console.log("Since auth is required, automated API testing is skipped in this script.");
+
 }
 
 testCreation();

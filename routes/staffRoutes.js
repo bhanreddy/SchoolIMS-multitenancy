@@ -6,22 +6,22 @@ import { asyncHandler } from '../utils/asyncHandler.js';
 const router = express.Router();
 
 function normalizeStaffPayload(body) {
-    return {
-        first_name: body.first_name?.trim(),
-        middle_name: body.middle_name?.trim() || null,
-        last_name: body.last_name?.trim(),
-        dob: body.dob || null,
-        gender_id: body.gender_id || null, // Default to null if missing
-        staff_code: body.staff_code?.trim(),
-        joining_date: body.joining_date,
-        status_id: body.status_id || 1, // Default to Active (1)
-        designation_id: body.designation_id || null, // Default to null if missing
-        salary: body.salary || null,
-        email: body.email?.trim() || null,
-        phone: body.phone?.trim() || null,
-        password: body.password || null,
-        role_code: body.role_code || null
-    };
+  return {
+    first_name: body.first_name?.trim(),
+    middle_name: body.middle_name?.trim() || null,
+    last_name: body.last_name?.trim(),
+    dob: body.dob || null,
+    gender_id: body.gender_id || null, // Default to null if missing
+    staff_code: body.staff_code?.trim(),
+    joining_date: body.joining_date,
+    status_id: body.status_id || 1, // Default to Active (1)
+    designation_id: body.designation_id || null, // Default to null if missing
+    salary: body.salary || null,
+    email: body.email?.trim() || null,
+    phone: body.phone?.trim() || null,
+    password: body.password || null,
+    role_code: body.role_code || null
+  };
 }
 
 /**
@@ -29,9 +29,9 @@ function normalizeStaffPayload(body) {
  * List all staff members
  */
 router.get('/', requirePermission('staff.view'), asyncHandler(async (req, res) => {
-    const { status, designation_id } = req.query;
+  const { status, designation_id } = req.query;
 
-    const staff = await sql`
+  const staff = await sql`
     SELECT 
       st.id, st.staff_code, st.joining_date, st.salary,
       p.first_name, p.middle_name, p.last_name, p.display_name, p.dob, p.photo_url,
@@ -53,7 +53,7 @@ router.get('/', requirePermission('staff.view'), asyncHandler(async (req, res) =
     ORDER BY p.display_name
   `;
 
-    res.json(staff);
+  res.json(staff);
 }));
 
 /**
@@ -61,9 +61,9 @@ router.get('/', requirePermission('staff.view'), asyncHandler(async (req, res) =
  * Get single staff member details
  */
 router.get('/:id', requirePermission('staff.view'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    const [staff] = await sql`
+  const [staff] = await sql`
     SELECT 
       st.id, st.staff_code, st.joining_date, st.salary, st.created_at,
       p.id as person_id, p.first_name, p.middle_name, p.last_name, p.display_name, p.dob, p.photo_url,
@@ -82,11 +82,11 @@ router.get('/:id', requirePermission('staff.view'), asyncHandler(async (req, res
     WHERE st.id = ${id} AND st.deleted_at IS NULL
   `;
 
-    if (!staff) {
-        return res.status(404).json({ error: 'Staff not found' });
-    }
+  if (!staff) {
+    return res.status(404).json({ error: 'Staff not found' });
+  }
 
-    res.json(staff);
+  res.json(staff);
 }));
 
 /**
@@ -94,105 +94,105 @@ router.get('/:id', requirePermission('staff.view'), asyncHandler(async (req, res
  * Create new staff member (and optionally user login)
  */
 router.post('/', requirePermission('staff.create'), asyncHandler(async (req, res) => {
-    const staffData = normalizeStaffPayload(req.body);
-    const {
-        first_name, middle_name, last_name, dob, gender_id,
-        staff_code, joining_date, status_id, designation_id, salary,
-        email, phone, password, role_code
-    } = staffData;
+  const staffData = normalizeStaffPayload(req.body);
+  const {
+    first_name, middle_name, last_name, dob, gender_id,
+    staff_code, joining_date, status_id, designation_id, salary,
+    email, phone, password, role_code
+  } = staffData;
 
-    if (!first_name || !last_name || !staff_code || !joining_date) {
-        return res.status(400).json({
-            error: 'VALIDATION_ERROR',
-            message: 'Missing required fields: first_name, last_name, staff_code, joining_date'
-        });
-    }
+  if (!first_name || !last_name || !staff_code || !joining_date) {
+    return res.status(400).json({
+      error: 'VALIDATION_ERROR',
+      message: 'Missing required fields: first_name, last_name, staff_code, joining_date'
+    });
+  }
 
-    // Check if user creation is requested but password missing
-    if (role_code && !password) {
-        return res.status(400).json({
-            error: 'VALIDATION_ERROR',
-            message: 'Password is required when creating a login user'
-        });
-    }
+  // Check if user creation is requested but password missing
+  if (role_code && !password) {
+    return res.status(400).json({
+      error: 'VALIDATION_ERROR',
+      message: 'Password is required when creating a login user'
+    });
+  }
 
-    try {
-        const result = await sql.begin(async sql => {
-            // 1. Create Person
-            const [person] = await sql`
+  try {
+    const result = await sql.begin(async (sql) => {
+      // 1. Create Person
+      const [person] = await sql`
                 INSERT INTO persons (first_name, middle_name, last_name, dob, gender_id)
                 VALUES (${first_name}, ${middle_name || null}, ${last_name}, ${dob || null}, ${gender_id})
                 RETURNING id
             `;
 
-            // 2. Create Staff
-            const [staff] = await sql`
+      // 2. Create Staff
+      const [staff] = await sql`
                 INSERT INTO staff (person_id, staff_code, joining_date, status_id, designation_id, salary)
                 VALUES (${person.id}, ${staff_code}, ${joining_date}, ${status_id || 1}, ${designation_id}, ${salary || null})
                 RETURNING *
             `;
 
-            // 3. Contacts
-            if (email) {
-                await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
+      // 3. Contacts
+      if (email) {
+        await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
                     VALUES (${person.id}, 'email', ${email}, true)`;
-            }
-            if (phone) {
-                await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
+      }
+      if (phone) {
+        await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
                     VALUES (${person.id}, 'phone', ${phone}, true)`;
-            }
+      }
 
-            // 4. Create User Login (Optional)
-            if (password && email) {
-                // Ensure Supabase Admin is available
-                if (!supabaseAdmin) {
-                    throw new Error('Server misconfiguration: Admin client not initialized');
-                }
+      // 4. Create User Login (Optional)
+      if (password && email) {
+        // Ensure Supabase Admin is available
+        if (!supabaseAdmin) {
+          throw new Error('Server misconfiguration: Admin client not initialized');
+        }
 
-                // Create Supabase User
-                const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
-                    email,
-                    password,
-                    email_confirm: true,
-                    user_metadata: { person_id: person.id }
-                });
+        // Create Supabase User
+        const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+          email,
+          password,
+          email_confirm: true,
+          user_metadata: { person_id: person.id }
+        });
 
-                if (authError) {
-                    throw new Error(`Supabase Auth Error: ${authError.message}`);
-                }
+        if (authError) {
+          throw new Error(`Supabase Auth Error: ${authError.message}`);
+        }
 
-                const supabaseUserId = authData.user.id;
+        const supabaseUserId = authData.user.id;
 
-                // Create Local User
-                const [user] = await sql`
+        // Create Local User
+        const [user] = await sql`
                     INSERT INTO users (id, person_id, account_status)
                     VALUES (${supabaseUserId}, ${person.id}, 'active')
                     RETURNING id
                 `;
 
-                // Assign Role (default to 'staff' if not provided)
-                const userRole = role_code || 'staff';
-                const [role] = await sql`SELECT id FROM roles WHERE code = ${userRole}`;
+        // Assign Role (default to 'staff' if not provided)
+        const userRole = role_code || 'staff';
+        const [role] = await sql`SELECT id FROM roles WHERE code = ${userRole}`;
 
-                if (role) {
-                    await sql`
+        if (role) {
+          await sql`
                         INSERT INTO user_roles (user_id, role_id, granted_by)
                         VALUES (${user.id}, ${role.id}, ${req.user?.internal_id || null})
                     `;
-                }
-            }
-
-            return staff;
-        });
-
-        res.status(201).json({ message: 'Staff created successfully', staff: result });
-    } catch (error) {
-        console.error('Error creating staff:', error);
-        if (error.message.includes('Supabase Auth Error')) {
-            return res.status(400).json({ error: error.message });
         }
-        res.status(500).json({ error: 'Failed to create staff', details: error.message });
+      }
+
+      return staff;
+    });
+
+    res.status(201).json({ message: 'Staff created successfully', staff: result });
+  } catch (error) {
+
+    if (error.message.includes('Supabase Auth Error')) {
+      return res.status(400).json({ error: error.message });
     }
+    res.status(500).json({ error: 'Failed to create staff', details: error.message });
+  }
 }));
 
 /**
@@ -200,22 +200,22 @@ router.post('/', requirePermission('staff.create'), asyncHandler(async (req, res
  * Update staff member
  */
 router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const {
-        first_name, middle_name, last_name, dob, gender_id,
-        staff_code, joining_date, status_id, designation_id, salary,
-        email, phone
-    } = req.body;
+  const { id } = req.params;
+  const {
+    first_name, middle_name, last_name, dob, gender_id,
+    staff_code, joining_date, status_id, designation_id, salary,
+    email, phone
+  } = req.body;
 
-    const result = await sql.begin(async sql => {
-        // 1. Get Person ID from Staff
-        const [staff] = await sql`SELECT person_id FROM staff WHERE id = ${id} AND deleted_at IS NULL`;
-        if (!staff) throw new Error('Staff not found');
+  const result = await sql.begin(async (sql) => {
+    // 1. Get Person ID from Staff
+    const [staff] = await sql`SELECT person_id FROM staff WHERE id = ${id} AND deleted_at IS NULL`;
+    if (!staff) throw new Error('Staff not found');
 
-        const personId = staff.person_id;
+    const personId = staff.person_id;
 
-        // 2. Update Person
-        await sql`
+    // 2. Update Person
+    await sql`
       UPDATE persons
       SET 
         first_name = COALESCE(${first_name}, first_name),
@@ -226,8 +226,8 @@ router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res
       WHERE id = ${personId}
     `;
 
-        // 3. Update Staff
-        const [updatedStaff] = await sql`
+    // 3. Update Staff
+    const [updatedStaff] = await sql`
       UPDATE staff
       SET 
         staff_code = COALESCE(${staff_code}, staff_code),
@@ -239,37 +239,37 @@ router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res
       RETURNING *
     `;
 
-        // 4. Update Contacts
-        if (email) {
-            const [existing] = await sql`
+    // 4. Update Contacts
+    if (email) {
+      const [existing] = await sql`
         SELECT id FROM person_contacts 
         WHERE person_id = ${personId} AND contact_type = 'email' AND is_primary = true
       `;
-            if (existing) {
-                await sql`UPDATE person_contacts SET contact_value = ${email} WHERE id = ${existing.id}`;
-            } else {
-                await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
+      if (existing) {
+        await sql`UPDATE person_contacts SET contact_value = ${email} WHERE id = ${existing.id}`;
+      } else {
+        await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
                   VALUES (${personId}, 'email', ${email}, true)`;
-            }
-        }
+      }
+    }
 
-        if (phone) {
-            const [existing] = await sql`
+    if (phone) {
+      const [existing] = await sql`
         SELECT id FROM person_contacts 
         WHERE person_id = ${personId} AND contact_type = 'phone' AND is_primary = true
       `;
-            if (existing) {
-                await sql`UPDATE person_contacts SET contact_value = ${phone} WHERE id = ${existing.id}`;
-            } else {
-                await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
+      if (existing) {
+        await sql`UPDATE person_contacts SET contact_value = ${phone} WHERE id = ${existing.id}`;
+      } else {
+        await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
                   VALUES (${personId}, 'phone', ${phone}, true)`;
-            }
-        }
+      }
+    }
 
-        return updatedStaff;
-    });
+    return updatedStaff;
+  });
 
-    res.json({ message: 'Staff updated successfully', staff: result });
+  res.json({ message: 'Staff updated successfully', staff: result });
 }));
 
 /**
@@ -277,17 +277,17 @@ router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res
  * Soft delete staff member
  */
 router.delete('/:id', requirePermission('staff.delete'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    const [result] = await sql`
+  const [result] = await sql`
     UPDATE staff SET deleted_at = NOW() WHERE id = ${id} AND deleted_at IS NULL RETURNING id
   `;
 
-    if (!result) {
-        return res.status(404).json({ error: 'Staff not found' });
-    }
+  if (!result) {
+    return res.status(404).json({ error: 'Staff not found' });
+  }
 
-    res.json({ message: 'Staff deleted successfully' });
+  res.json({ message: 'Staff deleted successfully' });
 }));
 
 // ============== SUB-ROUTES ==============
@@ -297,14 +297,14 @@ router.delete('/:id', requirePermission('staff.delete'), asyncHandler(async (req
  * Get classes assigned to staff (placeholder - needs class_teachers table)
  */
 router.get('/:id/classes', requirePermission('staff.view'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    // Placeholder - would need class_teachers junction table
-    res.json({
-        staff_id: id,
-        message: 'Class assignment feature requires class_teachers table',
-        classes: []
-    });
+  // Placeholder - would need class_teachers junction table
+  res.json({
+    staff_id: id,
+    message: 'Class assignment feature requires class_teachers table',
+    classes: []
+  });
 }));
 
 /**
@@ -312,14 +312,14 @@ router.get('/:id/classes', requirePermission('staff.view'), asyncHandler(async (
  * Get staff timetable (placeholder - needs timetable tables)
  */
 router.get('/:id/timetable', requirePermission('staff.view'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    // Placeholder - will be implemented in Phase 3
-    res.json({
-        staff_id: id,
-        message: 'Timetable will be implemented in Phase 3',
-        schedule: []
-    });
+  // Placeholder - will be implemented in Phase 3
+  res.json({
+    staff_id: id,
+    message: 'Timetable will be implemented in Phase 3',
+    schedule: []
+  });
 }));
 
 /**
@@ -327,25 +327,25 @@ router.get('/:id/timetable', requirePermission('staff.view'), asyncHandler(async
  * Get ALL staff payslips (list)
  */
 router.get('/:id/payslips', requireAuth, asyncHandler(async (req, res) => {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    // 1. Check permissions (Own Data OR Has Permission)
-    const [targetStaff] = await sql`SELECT person_id FROM staff WHERE id = ${id}`;
+  // 1. Check permissions (Own Data OR Has Permission)
+  const [targetStaff] = await sql`SELECT person_id FROM staff WHERE id = ${id}`;
 
-    if (!targetStaff) {
-        return res.status(404).json({ error: 'Staff not found' });
-    }
+  if (!targetStaff) {
+    return res.status(404).json({ error: 'Staff not found' });
+  }
 
-    // Allow if user is looking at their own data OR has staff.view permission
-    const isSelf = req.user.person_id === targetStaff.person_id;
-    const hasPermission = req.user.permissions && req.user.permissions.includes('staff.view');
+  // Allow if user is looking at their own data OR has staff.view permission
+  const isSelf = req.user.person_id === targetStaff.person_id;
+  const hasPermission = req.user.permissions && req.user.permissions.includes('staff.view');
 
-    if (!isSelf && !hasPermission) {
-        return res.status(403).json({ error: 'Forbidden: missing permission staff.view' });
-    }
+  if (!isSelf && !hasPermission) {
+    return res.status(403).json({ error: 'Forbidden: missing permission staff.view' });
+  }
 
-    // Get all payslips ordered by date desc
-    const payslips = await sql`
+  // Get all payslips ordered by date desc
+  const payslips = await sql`
         SELECT 
             sp.id,
             sp.payroll_month as month,
@@ -366,30 +366,30 @@ router.get('/:id/payslips', requireAuth, asyncHandler(async (req, res) => {
         ORDER BY sp.payroll_year DESC, sp.payroll_month DESC
     `;
 
-    // Format for frontend (matches Payslip interface in payslip.tsx)
-    const formattedPayslips = payslips.map(p => {
-        // Format currency helper
-        const formatCurrency = (amount) => {
-            return `₹${Number(amount || 0).toLocaleString('en-IN')}`;
-        };
+  // Format for frontend (matches Payslip interface in payslip.tsx)
+  const formattedPayslips = payslips.map((p) => {
+    // Format currency helper
+    const formatCurrency = (amount) => {
+      return `₹${Number(amount || 0).toLocaleString('en-IN')}`;
+    };
 
-        // Get month name
-        const date = new Date();
-        date.setMonth(p.month - 1);
-        const monthName = date.toLocaleString('default', { month: 'long' });
+    // Get month name
+    const date = new Date();
+    date.setMonth(p.month - 1);
+    const monthName = date.toLocaleString('default', { month: 'long' });
 
-        return {
-            id: p.id,
-            month: `${monthName} ${p.year}`,
-            status: p.status.charAt(0).toUpperCase() + p.status.slice(1), // Capitalize
-            earnings: formatCurrency(p.earnings),
-            deductions: formatCurrency(p.deductions),
-            net: formatCurrency(p.net),
-            payment_date: p.payment_date
-        };
-    });
+    return {
+      id: p.id,
+      month: `${monthName} ${p.year}`,
+      status: p.status.charAt(0).toUpperCase() + p.status.slice(1), // Capitalize
+      earnings: formatCurrency(p.earnings),
+      deductions: formatCurrency(p.deductions),
+      net: formatCurrency(p.net),
+      payment_date: p.payment_date
+    };
+  });
 
-    res.json(formattedPayslips);
+  res.json(formattedPayslips);
 }));
 
 /**
@@ -397,19 +397,19 @@ router.get('/:id/payslips', requireAuth, asyncHandler(async (req, res) => {
  * Get staff payslip (placeholder - needs payroll tables)
  */
 router.get('/:id/payslip', requirePermission('staff.view'), asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const { month, year } = req.query;
+  const { id } = req.params;
+  const { month, year } = req.query;
 
-    const targetDate = new Date();
-    const targetMonth = month ? parseInt(month) : targetDate.getMonth() + 1;
-    const targetYear = year ? parseInt(year) : targetDate.getFullYear();
+  const targetDate = new Date();
+  const targetMonth = month ? parseInt(month) : targetDate.getMonth() + 1;
+  const targetYear = year ? parseInt(year) : targetDate.getFullYear();
 
-    // Ensure payroll exists/is up-to-date
-    // effectively "lazy load" the payroll calculation if it's missing or outdated
-    // (Though triggers handle updates, this ensures existence if never calculated)
-    await sql`SELECT recalculate_staff_payroll(${id}, ${targetMonth}, ${targetYear})`;
+  // Ensure payroll exists/is up-to-date
+  // effectively "lazy load" the payroll calculation if it's missing or outdated
+  // (Though triggers handle updates, this ensures existence if never calculated)
+  await sql`SELECT recalculate_staff_payroll(${id}, ${targetMonth}, ${targetYear})`;
 
-    const [payroll] = await sql`
+  const [payroll] = await sql`
         SELECT 
             sp.*,
             st.staff_code,
@@ -424,11 +424,11 @@ router.get('/:id/payslip', requirePermission('staff.view'), asyncHandler(async (
         AND sp.payroll_year = ${targetYear}
     `;
 
-    if (!payroll) {
-        return res.status(404).json({ error: 'Payroll record not found' });
-    }
+  if (!payroll) {
+    return res.status(404).json({ error: 'Payroll record not found' });
+  }
 
-    res.json(payroll);
+  res.json(payroll);
 }));
 
 export default router;

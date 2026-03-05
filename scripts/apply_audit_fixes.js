@@ -7,22 +7,19 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 async function applyAuditFixes() {
-    try {
-        const migrationPath = path.join(__dirname, '../migrations/20260211_audit_fixes.sql');
-        const migrationSql = fs.readFileSync(migrationPath, 'utf8');
+  try {
+    const migrationPath = path.join(__dirname, '../migrations/20260211_audit_fixes.sql');
+    const migrationSql = fs.readFileSync(migrationPath, 'utf8');
 
-        console.log('Applying migration:', migrationPath);
+    await sql.begin(async (sql) => {
+      await sql.unsafe(migrationSql);
+    });
 
-        await sql.begin(async sql => {
-            await sql.unsafe(migrationSql);
-        });
+    process.exit(0);
+  } catch (err) {
 
-        console.log('Migration applied successfully.');
-        process.exit(0);
-    } catch (err) {
-        console.error('Failed to apply migration:', err);
-        process.exit(1);
-    }
+    process.exit(1);
+  }
 }
 
 applyAuditFixes();

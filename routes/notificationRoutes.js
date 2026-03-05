@@ -9,18 +9,21 @@ const router = express.Router();
 router.post('/register', async (req, res, next) => {
     try {
         // identifyUser middleware populates req.user
-        const { fcm_token, platform } = req.body;
+        const { fcm_token, platform, language_code } = req.body;
         const user_id = req.user?.id;
 
         if (!user_id) return res.status(401).json({ error: 'Unauthorized' });
         if (!fcm_token) return res.status(400).json({ error: 'Token required' });
 
+        // Validate language_code (only 'en' and 'te' supported)
+        const validLang = ['en', 'te'].includes(language_code) ? language_code : 'en';
+
         await withRetry(async () => {
             await sql`
-                INSERT INTO user_devices (user_id, fcm_token, platform, last_used_at)
-                VALUES (${user_id}, ${fcm_token}, ${platform || 'unknown'}, now())
+                INSERT INTO user_devices (user_id, fcm_token, platform, language_code, last_used_at)
+                VALUES (${user_id}, ${fcm_token}, ${platform || 'unknown'}, ${validLang}, now())
                 ON CONFLICT (user_id, fcm_token) 
-                DO UPDATE SET last_used_at = now(), platform = EXCLUDED.platform
+                DO UPDATE SET last_used_at = now(), platform = EXCLUDED.platform, language_code = EXCLUDED.language_code
             `;
         }, { retries: 2, delayMs: 1000 });
 
@@ -37,7 +40,7 @@ router.post('/unregister', async (req, res, next) => {
         const user_id = req.user?.id;
 
         if (!user_id) return res.status(401).json({ error: 'Unauthorized' });
-        if (!fcm_token) return res.status(200).json({ message: 'No token to unregister' }); // idempotent
+        if (!fcm_token) return res.status(400).json({ error: 'fcm_token is required' });
 
         await withRetry(async () => {
             await sql`

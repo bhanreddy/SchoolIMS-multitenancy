@@ -2,10 +2,9 @@
 import sql from '../db.js';
 
 async function fixFeeLedger() {
-    console.log('Starting Fee Ledger Correction...');
 
-    // 1. Get all student fees that have transactions
-    const feesToFix = await sql`
+  // 1. Get all student fees that have transactions
+  const feesToFix = await sql`
     SELECT sf.id, sf.student_id, sf.amount_due, sf.amount_paid, sf.discount, sf.status,
            COALESCE(SUM(t.amount), 0) as calculated_paid
     FROM student_fees sf
@@ -14,29 +13,26 @@ async function fixFeeLedger() {
     HAVING sf.amount_paid != COALESCE(SUM(t.amount), 0)
   `;
 
-    console.log(`Found ${feesToFix.length} records with discrepancies.`);
+  for (const fee of feesToFix) {
 
-    for (const fee of feesToFix) {
-        console.log(`Fixing Fee ID: ${fee.id} | Current Paid: ${fee.amount_paid} | Actual Paid: ${fee.calculated_paid}`);
+    // Determine new status
+    let newStatus = 'pending';
+    const remaining = Number(fee.amount_due) - Number(fee.discount) - Number(fee.calculated_paid);
 
-        // Determine new status
-        let newStatus = 'pending';
-        const remaining = Number(fee.amount_due) - Number(fee.discount) - Number(fee.calculated_paid);
+    if (remaining <= 0) {
+      newStatus = 'paid';
+    } else if (Number(fee.calculated_paid) > 0) {
+      newStatus = 'partial';
+    } else {
+      // If due date passed, it might be overdue, but let's stick to basic logic or keep existing if appropriate
+      // For simplicity, we re-evaluate 'overdue' if pending and past due date
+      // But here we will trust the simple logic: if 0 paid -> pending (trigger will update to overdue if needed on next update or cron)
+      // Actually, let's keep it simple.
+      newStatus = fee.status === 'overdue' && Number(fee.calculated_paid) === 0 ? 'overdue' : 'pending';
+    }
 
-        if (remaining <= 0) {
-            newStatus = 'paid';
-        } else if (Number(fee.calculated_paid) > 0) {
-            newStatus = 'partial';
-        } else {
-            // If due date passed, it might be overdue, but let's stick to basic logic or keep existing if appropriate
-            // For simplicity, we re-evaluate 'overdue' if pending and past due date
-            // But here we will trust the simple logic: if 0 paid -> pending (trigger will update to overdue if needed on next update or cron)
-            // Actually, let's keep it simple.
-            newStatus = (fee.status === 'overdue' && Number(fee.calculated_paid) === 0) ? 'overdue' : 'pending';
-        }
-
-        // Update the record
-        await sql`
+    // Update the record
+    await sql`
       UPDATE student_fees
       SET 
         amount_paid = ${fee.calculated_paid},
@@ -44,13 +40,12 @@ async function fixFeeLedger() {
         updated_at = NOW()
       WHERE id = ${fee.id}
     `;
-    }
+  }
 
-    console.log('Fee Ledger Correction Complete.');
-    process.exit(0);
+  process.exit(0);
 }
 
-fixFeeLedger().catch(err => {
-    console.error('Error fixing ledger:', err);
-    process.exit(1);
+fixFeeLedger().catch((err) => {
+
+  process.exit(1);
 });

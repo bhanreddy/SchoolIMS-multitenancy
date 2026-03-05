@@ -13,12 +13,12 @@ const router = express.Router();
  * Haversine distance in km between two lat/lon points
  */
 const calculateDistanceKm = (lat1, lon1, lat2, lon2) => {
-  const toRad = (deg) => (deg * Math.PI) / 180;
+  const toRad = (deg) => deg * Math.PI / 180;
   const R = 6371;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
   const a = Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
   return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 };
 
@@ -465,8 +465,8 @@ router.get('/trips/:tripId/status', asyncHandler(async (req, res) => {
   `;
 
   // Determine current stop (first non-completed/skipped)
-  const currentStop = stops.find(s => s.status === 'pending' || s.status === 'arrived');
-  const completedCount = stops.filter(s => s.status === 'completed' || s.status === 'skipped').length;
+  const currentStop = stops.find((s) => s.status === 'pending' || s.status === 'arrived');
+  const completedCount = stops.filter((s) => s.status === 'completed' || s.status === 'skipped').length;
 
   res.json({
     trip,
@@ -514,7 +514,7 @@ router.post('/trips/:tripId/stops/:stopId/arrive', asyncHandler(async (req, res)
   if (incomplete.length > 0) {
     return res.status(400).json({
       error: `Cannot arrive at stop ${targetStop.stop_order} — previous stops are incomplete`,
-      incompleteStops: incomplete.map(s => ({ stop_order: s.stop_order, status: s.status }))
+      incompleteStops: incomplete.map((s) => ({ stop_order: s.stop_order, status: s.status }))
     });
   }
 
@@ -686,7 +686,7 @@ router.post('/buses/:id/location', asyncHandler(async (req, res) => {
   const isAtSchool = distKm <= 0.1;
 
   if (isAtSchool) {
-    console.log(`[Geofence] Bus ${id} is within 100m of school.`);
+
   }
 
   // Upsert single realtime row
@@ -708,7 +708,7 @@ router.post('/buses/:id/location', asyncHandler(async (req, res) => {
   sql`
     INSERT INTO bus_trip_history (bus_id, latitude, longitude, speed, is_mocked, is_suspicious)
     VALUES (${id}, ${latitude}, ${longitude}, ${speed}, ${is_mocked}, ${is_suspicious})
-  `.catch(e => console.error('Trip history write failed:', e));
+  `.catch((e) => {});
 
   res.status(201).json({ ...location, geofence_arrived: isAtSchool });
 }));
@@ -839,7 +839,7 @@ router.get('/parent/bus-status/:busId', asyncHandler(async (req, res) => {
       WHERE tss.trip_id = ${activeTrip.id}
       ORDER BY tss.stop_order ASC
     `;
-    nextStop = stops.find(s => s.status === 'pending' || s.status === 'arrived') || null;
+    nextStop = stops.find((s) => s.status === 'pending' || s.status === 'arrived') || null;
   }
 
   res.json({
@@ -847,7 +847,7 @@ router.get('/parent/bus-status/:busId', asyncHandler(async (req, res) => {
     activeTrip: activeTrip || null,
     stops,
     nextStop,
-    busOnline: location ? ((new Date() - new Date(location.recorded_at)) / 1000 < 120) : false
+    busOnline: location ? (new Date() - new Date(location.recorded_at)) / 1000 < 120 : false
   });
 }));
 

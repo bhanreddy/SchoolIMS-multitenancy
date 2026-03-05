@@ -101,7 +101,7 @@ router.get('/', requirePermission('students.view'), async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error fetching students:', error);
+
     res.status(500).json({ error: 'Failed to fetch students', details: error.message });
   }
 });
@@ -112,7 +112,7 @@ router.get('/statuses', requirePermission('students.view'), async (req, res) => 
     const statuses = await sql`SELECT id, code as name FROM student_statuses ORDER BY id`;
     res.json(statuses);
   } catch (error) {
-    console.error('Error fetching student statuses:', error);
+
     res.status(500).json({ error: 'Failed to fetch student statuses' });
   }
 });
@@ -205,7 +205,7 @@ router.get('/profile/me', requireAuth, async (req, res) => {
     res.json(student[0]);
 
   } catch (error) {
-    console.error('Error fetching profile:', error);
+
     res.status(500).json({ error: 'Failed to fetch profile' });
   }
 });
@@ -252,7 +252,7 @@ router.get('/unenrolled', requirePermission('students.view'), async (req, res) =
 
     res.json(unenrolledStudents);
   } catch (error) {
-    console.error('Error fetching unenrolled students:', error);
+
     res.status(500).json({ error: 'Failed to fetch unenrolled students' });
   }
 });
@@ -300,7 +300,7 @@ router.get('/:id', requirePermission('students.view'), async (req, res) => {
 
     res.json(student[0]);
   } catch (error) {
-    console.error('Error fetching student:', error);
+
     res.status(500).json({ error: 'Failed to fetch student' });
   }
 });
@@ -321,7 +321,6 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
 
     // RecalcParams already declared above
 
-
     // Basic Validation
     if (!first_name || !last_name || !admission_no || !admission_date || !status_id || !gender_id || !class_id || !section_id) {
       return res.status(400).json({ error: 'Missing required fields: Name, Admission No, Status, Gender, Class, and Section are mandatory.' });
@@ -333,7 +332,7 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
       return res.status(400).json({ error: `Admission Number '${admission_no}' already exists.` });
     }
 
-    const result = await sql.begin(async sql => {
+    const result = await sql.begin(async (sql) => {
       // 1. Create Person
       const [person] = await sql`
         INSERT INTO persons (first_name, middle_name, last_name, dob, gender_id, display_name)
@@ -380,14 +379,14 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
         });
 
         if (authError) {
-          console.log('Use Creation Auth Error:', authError.message);
+
           // If user already exists, try to reuse the ID (Orphaned Auth User case)
           if (authError.message.includes('already been registered')) {
-            console.log('User already exists in Auth, attempting to link...');
+
             const { data: { users }, error: listError } = await supabaseAdmin.auth.admin.listUsers();
             if (listError) throw new Error('Auth List Error: ' + listError.message);
 
-            const existingUser = users.find(u => u.email === email);
+            const existingUser = users.find((u) => u.email === email);
             if (!existingUser) throw new Error('User reported existing but not found in list');
 
             authUserId = existingUser.id;
@@ -434,7 +433,7 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
       }
 
       if (!targetAcademicYearId) {
-        console.warn('Active academic year not found. Marking enrollment as pending.');
+
         enrollmentStatus = 'pending';
       }
 
@@ -453,7 +452,7 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
             `;
 
           if (!cs) {
-            console.warn('Selected Class and Section are not configured for the active Academic Year. Marking pending.');
+
             enrollmentStatus = 'pending';
           } else {
             targetClassSectionId = cs.id;
@@ -470,12 +469,10 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
             nextRoll = rollData ? rollData.next_roll : 1;
           }
         } catch (enrollError) {
-          console.error('Auto-enrollment logic failed:', enrollError);
+
           enrollmentStatus = 'failed';
         }
       }
-
-      console.log(`Enrolling student: ${student.id}, Status: ${enrollmentStatus}, CS: ${targetClassSectionId}, AY: ${targetAcademicYearId}, Roll: ${nextRoll}`);
 
       // Insert Enrollment Record (Even if pending/failed)
       // Note: We need academic_year_id for potential future reconciliation, even if pending.
@@ -488,13 +485,7 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
             VALUES (${student.id}, ${targetClassSectionId}, ${targetAcademicYearId}, ${enrollmentStatus}, ${admission_date}, ${nextRoll})
          `;
       } else {
-        console.error('CRITICAL: Cannot create even a pending enrollment without Academic Year.');
-        // If we really can't find an AY, perhaps we should just create the student without enrollment?
-        // OR we can create a dummy "Unknown" AY?
-        // For now, let's assume AY is resolved or we fail.
-        // User requirement: "Enrollment record is ALWAYS created". 
-        // If no AY, we can't satisfty FK. 
-        // But getting current AY is very robust.
+
       }
 
       // 6. Create Parents (New Feature)
@@ -552,7 +543,7 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
       try {
         await sql`SELECT recalculate_section_rolls(${recalcParams.classSectionId}, ${recalcParams.academicYearId})`;
       } catch (e) {
-        console.error('Post-transaction recalculation failed:', e);
+
       }
     }
 
@@ -584,7 +575,7 @@ router.post('/recalculate-rolls', requirePermission('students.create'), async (r
 
     res.json({ message: 'Roll numbers recalculated successfully' });
   } catch (error) {
-    console.error('Error recalculating rolls:', error);
+
     res.status(500).json({ error: 'Failed to recalculate rolls' });
   }
 });
@@ -599,7 +590,7 @@ router.put('/:id', requirePermission('students.edit'), async (req, res) => {
       email, phone
     } = req.body;
 
-    const result = await sql.begin(async sql => {
+    const result = await sql.begin(async (sql) => {
       // 1. Get Person ID from Student
       const [student] = await sql`SELECT person_id FROM students WHERE id = ${id}`;
       if (!student) throw new Error('Student not found');
@@ -680,7 +671,7 @@ router.put('/:id', requirePermission('students.edit'), async (req, res) => {
       student: result
     });
   } catch (error) {
-    console.error('Error updating student:', error);
+
     res.status(500).json({ error: 'Failed to update student', details: error.message });
   }
 });
@@ -704,14 +695,12 @@ router.delete('/:id', requirePermission('students.delete'), async (req, res) => 
 
     res.json({ message: 'Student deleted successfully' });
   } catch (error) {
-    console.error('Error deleting student:', error);
+
     res.status(500).json({ error: 'Failed to delete student', details: error.message });
   }
 });
 
 // ============== SUB-ROUTES ==============
-
-
 
 /**
  * POST /students/:id/enrollments
@@ -782,7 +771,7 @@ router.post('/:id/enrollments', requirePermission('students.edit'), async (req, 
     res.status(201).json({ message: 'Enrollment created', enrollment });
 
   } catch (error) {
-    console.error('Error creating enrollment:', error);
+
     res.status(500).json({ error: 'Failed to create enrollment' });
   }
 });
@@ -819,7 +808,7 @@ router.get('/:id/enrollments', requirePermission('students.view'), async (req, r
 
     res.json(enrollments);
   } catch (error) {
-    console.error('Error fetching enrollments:', error);
+
     res.status(500).json({ error: 'Failed to fetch enrollments' });
   }
 });
@@ -911,7 +900,7 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
       records: attendance
     });
   } catch (error) {
-    console.error('Error fetching attendance:', error);
+
     res.status(500).json({ error: 'Failed to fetch attendance' });
   }
 });
@@ -993,7 +982,7 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
       fees
     });
   } catch (error) {
-    console.error('Error fetching fees:', error);
+
     res.status(500).json({ error: 'Failed to fetch fees' });
   }
 });
@@ -1071,7 +1060,7 @@ router.get('/:id/results', requireAuth, async (req, res) => {
       results
     });
   } catch (error) {
-    console.error('Error fetching results:', error);
+
     res.status(500).json({ error: 'Failed to fetch results' });
   }
 });
@@ -1113,7 +1102,7 @@ router.get('/:id/parents', requirePermission('students.view'), async (req, res) 
 
     res.json(parents);
   } catch (error) {
-    console.error('Error fetching parents:', error);
+
     res.status(500).json({ error: 'Failed to fetch parents' });
   }
 });
@@ -1139,7 +1128,7 @@ router.post('/:id/parents', requirePermission('students.edit'), async (req, res)
 
     res.status(201).json({ message: 'Parent linked successfully', link });
   } catch (error) {
-    console.error('Error linking parent:', error);
+
     res.status(500).json({ error: 'Failed to link parent', details: error.message });
   }
 });

@@ -9,22 +9,21 @@ import sql from '../db.js';
 const ADMIN_EMAIL = 'admin@school.com';
 
 async function checkPermissions() {
-    console.log('🔍 Checking admin permissions...\n');
 
-    try {
-        // Find admin user by email
-        const [contact] = await sql`
+  try {
+    // Find admin user by email
+    const [contact] = await sql`
             SELECT person_id FROM person_contacts 
             WHERE contact_value = ${ADMIN_EMAIL} AND contact_type = 'email'
         `;
 
-        if (!contact) {
-            console.log('❌ Admin email not found');
-            return;
-        }
+    if (!contact) {
 
-        // Get user info with roles and permissions
-        const [userInfo] = await sql`
+      return;
+    }
+
+    // Get user info with roles and permissions
+    const [userInfo] = await sql`
             SELECT 
                 u.id,
                 u.account_status,
@@ -41,47 +40,35 @@ async function checkPermissions() {
             GROUP BY u.id, p.display_name
         `;
 
-        if (!userInfo) {
-            console.log('❌ User not found in database');
-            return;
-        }
+    if (!userInfo) {
 
-        console.log('✅ User Found:');
-        console.log(`   Name: ${userInfo.display_name}`);
-        console.log(`   ID: ${userInfo.id}`);
-        console.log(`   Status: ${userInfo.account_status}`);
-        console.log(`\n📋 Roles: ${userInfo.roles?.join(', ') || 'None'}`);
-        console.log(`\n🔑 Permissions (${userInfo.permissions?.length || 0} total):`);
-
-        if (userInfo.permissions && userInfo.permissions.length > 0) {
-            userInfo.permissions.forEach(perm => {
-                console.log(`   - ${perm}`);
-            });
-        } else {
-            console.log('   ❌ NO PERMISSIONS ASSIGNED!');
-        }
-
-        // Check for users.create and staff.create permission
-        const hasUserCreate = userInfo.permissions?.includes('users.create');
-        const hasStaffCreate = userInfo.permissions?.includes('staff.create');
-        const isAdmin = userInfo.roles?.includes('admin');
-
-        console.log('\n🎯 Access Check:');
-        console.log(`   Is Admin Role: ${isAdmin ? '✅' : '❌'}`);
-        console.log(`   Has users.create: ${hasUserCreate ? '✅' : '❌'}`);
-        console.log(`   Has staff.create: ${hasStaffCreate ? '✅' : '❌'}`);
-
-        if (isAdmin || (hasUserCreate && hasStaffCreate)) {
-            console.log('\n✅ User CAN create staff & users');
-        } else {
-            console.log('\n❌ User CANNOT create staff - Missing permissions!');
-        }
-
-    } catch (error) {
-        console.error('❌ Error:', error.message);
+      return;
     }
 
-    process.exit(0);
+    if (userInfo.permissions && userInfo.permissions.length > 0) {
+      userInfo.permissions.forEach((perm) => {
+
+      });
+    } else {
+
+    }
+
+    // Check for users.create and staff.create permission
+    const hasUserCreate = userInfo.permissions?.includes('users.create');
+    const hasStaffCreate = userInfo.permissions?.includes('staff.create');
+    const isAdmin = userInfo.roles?.includes('admin');
+
+    if (isAdmin || hasUserCreate && hasStaffCreate) {
+
+    } else {
+
+    }
+
+  } catch (error) {
+
+  }
+
+  process.exit(0);
 }
 
 checkPermissions();

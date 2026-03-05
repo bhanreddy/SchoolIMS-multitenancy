@@ -1,22 +1,20 @@
 import sql from '../db.js';
 
 async function listStudents() {
-    console.log('--- Student Statuses ---');
-    const statuses = await sql`SELECT * FROM student_statuses`;
-    console.table(statuses);
 
-    console.log('\n--- Students without Active Enrollment ---');
-    // Using current date to find active AY
-    const [ay] = await sql`SELECT id, code FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
-    console.log('Current Academic Year:', ay);
+  const statuses = await sql`SELECT * FROM student_statuses`;
+  console.table(statuses);
 
-    if (!ay) {
-        console.log('No active academic year found!');
-        process.exit(1);
-    }
+  // Using current date to find active AY
+  const [ay] = await sql`SELECT id, code FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
 
-    // Diagnostic Queries
-    const diagnostics = await sql`
+  if (!ay) {
+
+    process.exit(1);
+  }
+
+  // Diagnostic Queries
+  const diagnostics = await sql`
         SELECT
             (SELECT COUNT(*) FROM students) as total_students_all,
             (SELECT COUNT(*) FROM students WHERE deleted_at IS NULL) as total_active_students,
@@ -24,8 +22,8 @@ async function listStudents() {
             (SELECT COUNT(*) FROM student_enrollments WHERE status = 'failed') as failed_enrollments_count
     `;
 
-    // Check for students with NO active enrollment in current AY
-    const potentially_unenrolled = await sql`
+  // Check for students with NO active enrollment in current AY
+  const potentially_unenrolled = await sql`
         SELECT s.id, p.display_name, st.code as status
         FROM students s
         JOIN persons p ON s.person_id = p.id
@@ -40,8 +38,8 @@ async function listStudents() {
         )
     `;
 
-    // Check for Soft Deleted Students
-    const deleted_students = await sql`
+  // Check for Soft Deleted Students
+  const deleted_students = await sql`
         SELECT s.id, p.display_name, s.deleted_at
         FROM students s
         JOIN persons p ON s.person_id = p.id
@@ -49,7 +47,7 @@ async function listStudents() {
         LIMIT 5
     `;
 
-    const students = await sql`
+  const students = await sql`
         SELECT
             s.id, p.display_name, st.code as student_status,
             (SELECT COUNT(*) FROM student_enrollments se WHERE se.student_id = s.id) as total_enrollments,
@@ -61,18 +59,18 @@ async function listStudents() {
         WHERE s.deleted_at IS NULL
     `;
 
-    const result = {
-        ay,
-        diagnostics: diagnostics[0],
-        unenrolled_list: potentially_unenrolled,
-        deleted_sample: deleted_students,
-        all_students: students
-    };
-    import('fs').then(fs => {
-        fs.writeFileSync('debug_results.json', JSON.stringify(result, null, 2));
-        console.log('Results written to debug_results.json');
-        process.exit(0);
-    });
+  const result = {
+    ay,
+    diagnostics: diagnostics[0],
+    unenrolled_list: potentially_unenrolled,
+    deleted_sample: deleted_students,
+    all_students: students
+  };
+  import('fs').then((fs) => {
+    fs.writeFileSync('debug_results.json', JSON.stringify(result, null, 2));
+
+    process.exit(0);
+  });
 }
 
 listStudents().catch(console.error);

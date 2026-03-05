@@ -31,7 +31,19 @@ ON CONFLICT (key) DO UPDATE SET value = '1.1', applied_at = now();
 
 -- SECTION 01: EXTENSIONS (single creation, extensions schema)
 CREATE SCHEMA IF NOT EXISTS extensions;
-GRANT USAGE ON SCHEMA extensions TO postgres, anon, authenticated, service_role;
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'anon') THEN
+        GRANT USAGE ON SCHEMA extensions TO anon;
+    END IF;
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'authenticated') THEN
+        GRANT USAGE ON SCHEMA extensions TO authenticated;
+    END IF;
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'service_role') THEN
+        GRANT USAGE ON SCHEMA extensions TO service_role;
+    END IF;
+END
+$$;
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA extensions;
 CREATE EXTENSION IF NOT EXISTS btree_gist SCHEMA extensions;
@@ -1129,6 +1141,7 @@ CREATE TABLE IF NOT EXISTS marks (
     marks_obtained DECIMAL(5,2),
     is_absent BOOLEAN NOT NULL DEFAULT FALSE,
     remarks TEXT,
+    remarks_te TEXT,
     entered_by UUID REFERENCES users(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1165,6 +1178,8 @@ BEFORE INSERT OR UPDATE ON marks
 FOR EACH ROW EXECUTE FUNCTION validate_marks_entry();
 
 
+ALTER TABLE marks ADD COLUMN IF NOT EXISTS remarks_te TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_marks_enrollment ON marks(student_enrollment_id);
 CREATE INDEX IF NOT EXISTS idx_marks_exam_subject ON marks(exam_subject_id);
 
@@ -1188,7 +1203,9 @@ CREATE TABLE IF NOT EXISTS complaints (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     ticket_no VARCHAR(30) UNIQUE,
     title VARCHAR(200) NOT NULL,
+    title_te TEXT,
     description TEXT NOT NULL,
+    description_te TEXT,
     category VARCHAR(50), 
     priority complaint_priority_enum NOT NULL DEFAULT 'medium',
     status complaint_status_enum NOT NULL DEFAULT 'open',
@@ -1196,11 +1213,16 @@ CREATE TABLE IF NOT EXISTS complaints (
     raised_for_student_id UUID REFERENCES students(id), 
     assigned_to UUID REFERENCES users(id),
     resolution TEXT,
+    resolution_te TEXT,
     resolved_by UUID REFERENCES users(id),
     resolved_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS title_te TEXT;
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS description_te TEXT;
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS resolution_te TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints(status);
 CREATE INDEX IF NOT EXISTS idx_complaints_raised_by ON complaints(raised_by);
@@ -1238,7 +1260,9 @@ END $$;
 CREATE TABLE IF NOT EXISTS notices (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     title VARCHAR(200) NOT NULL,
+    title_te TEXT,
     content TEXT NOT NULL,
+    content_te TEXT,
     audience notice_audience_enum NOT NULL DEFAULT 'all',
     target_class_id UUID REFERENCES classes(id), 
     priority complaint_priority_enum NOT NULL DEFAULT 'medium',
@@ -1249,6 +1273,9 @@ CREATE TABLE IF NOT EXISTS notices (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE notices ADD COLUMN IF NOT EXISTS title_te TEXT;
+ALTER TABLE notices ADD COLUMN IF NOT EXISTS content_te TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_notices_audience ON notices(audience);
 CREATE INDEX IF NOT EXISTS idx_notices_publish ON notices(publish_at);
@@ -1316,14 +1343,19 @@ CREATE TABLE IF NOT EXISTS leave_applications (
     start_date DATE NOT NULL,
     end_date DATE NOT NULL,
     reason TEXT NOT NULL,
+    reason_te TEXT,
     status leave_status_enum NOT NULL DEFAULT 'pending',
     reviewed_by UUID REFERENCES users(id),
     reviewed_at TIMESTAMPTZ,
     review_remarks TEXT,
+    review_remarks_te TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT chk_leave_dates CHECK (end_date >= start_date)
 );
+
+ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reason_te TEXT;
+ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS review_remarks_te TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_leaves_applicant ON leave_applications(applicant_id);
 CREATE INDEX IF NOT EXISTS idx_leaves_status ON leave_applications(status);
@@ -1339,7 +1371,9 @@ CREATE TABLE IF NOT EXISTS diary_entries (
     subject_id UUID REFERENCES subjects(id) ON DELETE RESTRICT,
     entry_date DATE NOT NULL,
     title VARCHAR(200),
+    title_te TEXT,
     content TEXT NOT NULL,
+    content_te TEXT,
     homework_due_date DATE,
     attachments JSONB, 
     created_by UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
@@ -1352,6 +1386,8 @@ CREATE TABLE IF NOT EXISTS diary_entries (
 );
 
 ALTER TABLE diary_entries ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE diary_entries ADD COLUMN IF NOT EXISTS title_te TEXT;
+ALTER TABLE diary_entries ADD COLUMN IF NOT EXISTS content_te TEXT;
 
 
 CREATE INDEX IF NOT EXISTS idx_diary_class ON diary_entries(class_section_id);
@@ -1651,7 +1687,9 @@ END $$;
 CREATE TABLE IF NOT EXISTS events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     title VARCHAR(200) NOT NULL,
+    title_te TEXT,
     description TEXT,
+    description_te TEXT,
     event_type event_type_enum NOT NULL DEFAULT 'other',
     start_date DATE NOT NULL,
     end_date DATE,
@@ -1667,6 +1705,9 @@ CREATE TABLE IF NOT EXISTS events (
     deleted_at TIMESTAMPTZ,
     CONSTRAINT chk_event_dates CHECK (end_date IS NULL OR end_date >= start_date)
 );
+
+ALTER TABLE events ADD COLUMN IF NOT EXISTS title_te TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS description_te TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_events_dates ON events(start_date, end_date);
 
@@ -1797,7 +1838,10 @@ INSERT INTO permissions (code, name) VALUES
 ('notices.view', 'View Notices'), ('notices.create', 'Create Notices'), ('notices.manage', 'Manage Notices'),
 ('leaves.view', 'View Leaves'), ('leaves.apply', 'Apply for Leave'), ('leaves.approve', 'Approve Leaves'),
 ('diary.view', 'View Diary'), ('diary.create', 'Create Diary Entries'),
-('timetable.view', 'View Timetable'), ('timetable.manage', 'Manage Timetable')
+('timetable.view', 'View Timetable'), ('timetable.manage', 'Manage Timetable'),
+('dashboard.view', 'View Dashboard'),
+('results.publish', 'Publish Results'),
+('diary.manage', 'Manage Diary')
 ON CONFLICT (code) DO NOTHING;
 
 -- 18.1 ROLES
@@ -1806,7 +1850,8 @@ INSERT INTO roles (code, name, is_system) VALUES
 ('staff', 'Staff/Teacher', true),
 ('student', 'Student', true),
 ('accounts', 'Accounts Manager', true),
-('principal', 'Principal', true)
+('principal', 'Principal', true),
+('driver', 'Driver', true)
 ON CONFLICT (code) DO NOTHING;
 
 -- 18.2 ROLE-PERMISSION MAPPING (Production RBAC)
@@ -1839,9 +1884,123 @@ INSERT INTO role_permissions (role_id, permission_id)
 SELECT r.id, p.id FROM roles r, permissions p 
 WHERE r.code = 'accounts' AND p.code IN (
     'fees.view', 'fees.manage', 'fees.collect', 'transactions.view', 
-    'receipts.generate', 'reports.financial', 'notices.view', 'staff.view'
+    'receipts.generate', 'reports.financial', 'notices.view', 'staff.view',
+    'dashboard.view'
 )
 ON CONFLICT DO NOTHING;
+
+-- Principal: Full Access (same as Admin)
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id FROM roles r, permissions p WHERE r.code = 'principal'
+ON CONFLICT DO NOTHING;
+
+-- Driver: Transport-only Access
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id FROM roles r, permissions p 
+WHERE r.code = 'driver' AND p.code IN (
+    'transport.view', 'notices.view'
+)
+ON CONFLICT DO NOTHING;
+
+-- ============================================================
+-- 19. NOTIFICATION INFRASTRUCTURE
+-- ============================================================
+
+-- 19.1 User Devices (FCM Push Token Storage)
+CREATE TABLE IF NOT EXISTS user_devices (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    fcm_token     TEXT NOT NULL,
+    platform      VARCHAR(20) NOT NULL DEFAULT 'unknown',
+    device_name   TEXT,
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+    last_used_at  TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_user_device_token UNIQUE (user_id, fcm_token)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_devices_fcm_token ON user_devices(fcm_token);
+CREATE INDEX IF NOT EXISTS idx_user_devices_active ON user_devices(user_id, is_active);
+
+-- Idempotent column adds for existing deployments
+ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS device_name TEXT;
+ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS language_code VARCHAR(5) NOT NULL DEFAULT 'en';
+
+-- 19.2 Notification Configuration (Kill Switch + Settings)
+CREATE TABLE IF NOT EXISTS notification_config (
+    key         TEXT PRIMARY KEY,
+    value       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at  TIMESTAMPTZ
+);
+
+-- Seed defaults
+INSERT INTO notification_config (key, value) VALUES
+    ('kill_switch',              '{"global": false, "types": {}}'::jsonb),
+    ('max_batch_size',           '{"value": 500}'::jsonb),
+    ('fee_reminder_daily_limit', '{"value": 1}'::jsonb)
+ON CONFLICT (key) DO NOTHING;
+
+-- 19.3 Notification Logs (Delivery Audit Trail)
+CREATE TABLE IF NOT EXISTS notification_logs (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id           UUID REFERENCES users(id) ON DELETE SET NULL,
+    batch_id          UUID,
+    notification_type TEXT NOT NULL,
+    role              TEXT,
+    channel_id        TEXT,
+    push_provider     TEXT DEFAULT 'fcm',
+    tokens_targeted   INTEGER NOT NULL DEFAULT 0,
+    tokens_sent       INTEGER NOT NULL DEFAULT 0,
+    tokens_failed     INTEGER NOT NULL DEFAULT 0,
+    error_message     TEXT,
+    provider_response JSONB,
+    status            TEXT CHECK (status IN ('success', 'failed', 'partial')),
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at        TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_logs_type_date ON notification_logs(notification_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_logs_batch_id ON notification_logs(batch_id);
+CREATE INDEX IF NOT EXISTS idx_notification_logs_user_type_date ON notification_logs(user_id, notification_type, created_at);
+
+-- 19.4 Notification Batches (Bulk Send Tracking)
+CREATE TABLE IF NOT EXISTS notification_batches (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    admin_id        UUID REFERENCES users(id),
+    type            TEXT NOT NULL,
+    filters         JSONB DEFAULT '{}',
+    status          TEXT CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'aborted')) DEFAULT 'pending',
+    total_targets   INTEGER DEFAULT 0,
+    sent_count      INTEGER DEFAULT 0,
+    failure_count   INTEGER DEFAULT 0,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_batches_status ON notification_batches(status);
+CREATE INDEX IF NOT EXISTS idx_notification_batches_type_created ON notification_batches(type, created_at);
+
+-- Idempotent column adds for existing deployments (merged from Section 20/21)
+ALTER TABLE notification_config ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE notification_logs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE notification_batches ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+-- Constraints merged from Section 20/21
+DO $$ BEGIN
+    ALTER TABLE notification_batches ADD CONSTRAINT chk_notification_batches_type 
+    CHECK (type IN ('FEES', 'GENERAL', 'EXAM', 'EMERGENCY', 'DIARY', 'RESULTS', 'NOTICE', 'TEST_TRIGGER'));
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
+
+-- Enable Row Level Security (merged from Section 20/21)
+ALTER TABLE notification_config ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notification_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notification_batches ENABLE ROW LEVEL SECURITY;
 
 -- Views
 CREATE OR REPLACE VIEW active_students AS
@@ -1886,8 +2045,16 @@ ALTER TABLE student_fees
 ADD CONSTRAINT chk_no_negative_paid CHECK (amount_paid >= 0);
 
 -- Guard 3: Prevent Overpayment (Paid > Due - Discount)
--- Already in schema, just ensuring it exists
--- ALTER TABLE student_fees ADD CONSTRAINT chk_paid_not_exceed ...
+-- chk_paid_not_exceed is defined in the CREATE TABLE student_fees block (line ~827).
+-- No standalone ALTER needed — constraint is already active.
+
+-- Guard 4: Prevent Discount Exceeding Amount Due
+ALTER TABLE student_fees
+DROP CONSTRAINT IF EXISTS chk_discount_not_exceed_due;
+
+ALTER TABLE student_fees
+ADD CONSTRAINT chk_discount_not_exceed_due CHECK (discount <= amount_due);
+
 -- (Removed Legacy Timetable Logic - See lines 1513+ for new implementation)
 -- Function: promote_students_academic_year
 -- Logic: Move students from current AY to next AY, incrementing class.
@@ -2008,7 +2175,11 @@ $$ LANGUAGE plpgsql;
 -- Drop table to ensure clean slate if re-running
 DROP TABLE IF EXISTS timetable_slots CASCADE;
 
--- Create Enum for Days (already defined above, no duplicate needed)
+-- Create Enum for Days
+DO $$ BEGIN
+    CREATE TYPE day_of_week_enum AS ENUM ('monday','tuesday','wednesday','thursday','friday','saturday','sunday');
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
 
 CREATE TABLE timetable_slots (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2016,11 +2187,12 @@ CREATE TABLE timetable_slots (
     academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
     class_section_id UUID NOT NULL REFERENCES class_sections(id) ON DELETE RESTRICT,
     
+    day_of_week day_of_week_enum NOT NULL,
     period_number SMALLINT NOT NULL,
     
     subject_id UUID NOT NULL REFERENCES subjects(id) ON DELETE RESTRICT,
     teacher_id UUID REFERENCES staff(id) ON DELETE RESTRICT,
-    room_no VARCHAR(50), -- Added 2026-02-11
+    room_no VARCHAR(50),
     
     start_time TIME NOT NULL,
     end_time TIME NOT NULL,
@@ -2033,7 +2205,7 @@ CREATE TABLE timetable_slots (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_timetable_slots_active 
-ON timetable_slots (class_section_id, academic_year_id, period_number) 
+ON timetable_slots (class_section_id, academic_year_id, day_of_week, period_number) 
 WHERE deleted_at IS NULL;
 
 
@@ -3537,61 +3709,9 @@ CREATE TRIGGER trg_leave_payroll
 AFTER INSERT OR UPDATE ON leave_applications
 FOR EACH ROW EXECUTE FUNCTION trg_recalc_payroll_on_leave();
 
--- 20. NOTIFICATION BATCHES
--- Part 1: Fee Reminder Batch System Schema
-CREATE TABLE IF NOT EXISTS notification_batches (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    admin_id UUID REFERENCES users(id),
-    type TEXT NOT NULL CHECK (type IN ('FEES', 'GENERAL', 'EXAM', 'EMERGENCY')), -- Extendable
-    filters JSONB DEFAULT '{}',
-    status TEXT CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'aborted')) DEFAULT 'pending',
-    total_targets INTEGER DEFAULT 0,
-    sent_count INTEGER DEFAULT 0,
-    failure_count INTEGER DEFAULT 0,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-ALTER TABLE notification_batches ENABLE ROW LEVEL SECURITY;
-
--- Index for rate limiting (finding last batch by type/created_at)
-CREATE INDEX IF NOT EXISTS idx_notification_batches_type_created ON notification_batches(type, created_at);
-
--- 21. NOTIFICATION HARDENING
--- Part 1: Delivery Observability
-CREATE TABLE IF NOT EXISTS notification_logs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    role TEXT,
-    notification_type TEXT NOT NULL,
-    channel_id TEXT,
-    push_provider TEXT DEFAULT 'fcm',
-    provider_response JSONB,
-    status TEXT CHECK (status IN ('success', 'failed', 'partial')),
-    error_message TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-ALTER TABLE notification_logs ENABLE ROW LEVEL SECURITY;
-
--- Part 3: Rate Limiting (Optional: can use Redis, but DB is fine for this scale)
--- We will query notification_logs for rate limiting, so we need good indexes.
-CREATE INDEX IF NOT EXISTS idx_notification_logs_user_type_date ON notification_logs(user_id, notification_type, created_at);
-
--- Part 6: Incident Kill Switch
-CREATE TABLE IF NOT EXISTS notification_config (
-    key TEXT PRIMARY KEY,
-    value JSONB,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-ALTER TABLE notification_config ENABLE ROW LEVEL SECURITY;
-
--- Seed default config if not exists
-INSERT INTO notification_config (key, value)
-VALUES 
-    ('kill_switch', '{"global": false, "types": {}}')
-ON CONFLICT (key) DO NOTHING;
+-- NOTE: Notification table definitions (user_devices, notification_config,
+-- notification_logs, notification_batches) are defined in Section 19.
+-- See lines ~1869–1941.
 
 -- Trigger to propagate fee structure changes to student fees
 
@@ -4378,9 +4498,137 @@ COMMIT;
 
 
 -- ========================================== 
+-- 29. GIRL SAFETY
+-- ========================================== 
+CREATE TABLE IF NOT EXISTS girl_safety_complaints (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    ticket_no VARCHAR(20) UNIQUE NOT NULL,
+    student_id UUID REFERENCES students(id) ON DELETE SET NULL,
+    category VARCHAR(50) NOT NULL,
+    description TEXT NOT NULL,
+    description_te TEXT,
+    incident_date TIMESTAMPTZ,
+    attachments JSONB DEFAULT '[]'::jsonb,
+    is_anonymous BOOLEAN DEFAULT false,
+    status VARCHAR(20) DEFAULT 'pending',
+    assigned_to UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS girl_safety_complaint_threads (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    complaint_id UUID REFERENCES girl_safety_complaints(id) ON DELETE CASCADE,
+    sender_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    sender_role VARCHAR(20) NOT NULL,
+    message TEXT NOT NULL,
+    message_te TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ========================================== 
+-- 30. SCHOOL SETTINGS & CONFIG
+-- ========================================== 
+CREATE TABLE IF NOT EXISTS school_settings (
+    key         VARCHAR(100) PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TIMESTAMPTZ DEFAULT now()
+);
+
+INSERT INTO school_settings (key, value) VALUES
+    ('school_name',      'Default School Name'),
+    ('school_timezone',  'Asia/Kolkata'),
+    ('school_hours_start', '08:00'),
+    ('school_hours_end',   '17:00'),
+    ('admin_email',      'admin@school.local')
+ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS admin_notifications (
+    id          SERIAL PRIMARY KEY,
+    type        VARCHAR(50) NOT NULL,
+    message     TEXT NOT NULL,
+    user_id     UUID,
+    ip_address  VARCHAR(45),
+    created_at  TIMESTAMPTZ DEFAULT now()
+);
+
+-- ========================================== 
+-- 31. OUT-OF-HOURS ACCESS CONTROL
+-- ========================================== 
+CREATE TABLE IF NOT EXISTS access_requests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    requested_by UUID REFERENCES users(id) ON DELETE CASCADE,
+    department TEXT NOT NULL,
+    request_note TEXT,
+    status TEXT DEFAULT 'pending' NOT NULL,
+    reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    reviewed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS temp_access_grants (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    department TEXT NOT NULL,
+    granted_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    requested_by UUID REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    is_active BOOLEAN DEFAULT true NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE access_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE temp_access_grants ENABLE ROW LEVEL SECURITY;
+
+GRANT ALL ON access_requests TO anon, authenticated, service_role;
+GRANT ALL ON temp_access_grants TO anon, authenticated, service_role;
+
+CREATE POLICY "Users can view their own requests" 
+ON access_requests FOR SELECT 
+USING (auth.uid() = requested_by);
+
+CREATE POLICY "Users can insert their own requests" 
+ON access_requests FOR INSERT 
+WITH CHECK (auth.uid() = requested_by);
+
+CREATE POLICY "Users can view their own grants" 
+ON temp_access_grants FOR SELECT 
+USING (auth.uid() = requested_by);
+
+CREATE OR REPLACE FUNCTION is_admin() RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1 FROM user_roles ur
+        JOIN roles r ON ur.role_id = r.id
+        WHERE ur.user_id = auth.uid() AND r.code = 'admin'
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE POLICY "Admins can view all requests" 
+ON access_requests FOR SELECT 
+USING (is_admin());
+
+CREATE POLICY "Admins can update requests" 
+ON access_requests FOR UPDATE 
+USING (is_admin());
+
+CREATE POLICY "Admins can view all grants" 
+ON temp_access_grants FOR SELECT 
+USING (is_admin());
+
+CREATE POLICY "Admins can insert grants" 
+ON temp_access_grants FOR INSERT 
+WITH CHECK (is_admin());
+
+CREATE POLICY "Admins can update grants" 
+ON temp_access_grants FOR UPDATE 
+USING (is_admin());
+
+COMMIT;
+
 -- SUPABASE AUTH CONFIGURATION (1-Year Sessions 
 -- ========================================== 
 -- Required for React Native mobile app persistence to survive 1-year offline 
 ALTER ROLE authenticator SET app.settings.sessions.timebox = '31536000'; 
-ALTER ROLE authenticator SET app.settings.sessions.inactivity_timeout = '0'; 
-
+ALTER ROLE authenticator SET app.settings.sessions.inactivity_timeout = '0';

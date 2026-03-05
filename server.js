@@ -25,12 +25,12 @@ app.use(helmet());
 
 // Rate Limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: config.nodeEnv === 'production' ? 100 : 1000,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' },
-  skip: (req) => req.path === '/api/v1/health' // Allow monitoring without rate limit
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: config.nodeEnv === 'production' ? 100 : 1000,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please try again later.' },
+    skip: (req) => req.path === '/api/v1/health' // Allow monitoring without rate limit
 });
 app.use('/api/', limiter);
 
@@ -39,9 +39,9 @@ app.use(morgan(config.nodeEnv === 'production' ? 'combined' : 'dev'));
 
 // CORS - Allow all origins for mobile app (Restrict in production if possible)
 app.use(cors({
-  origin: config.nodeEnv === 'production' ? process.env.ALLOWED_ORIGINS?.split(',') || '*' : '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-request-id']
+    origin: config.nodeEnv === 'production' ? process.env.ALLOWED_ORIGINS?.split(',') || '*' : '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-request-id']
 }));
 
 // Middleware
@@ -83,51 +83,51 @@ import schoolSettingsRouter from './routes/schoolSettingsRoutes.js';
 
 // Health check endpoint
 app.get('/api/v1/health', async (req, res) => {
-  try {
-    // Check DB connectivity
-    await sql`SELECT 1`;
-    res.json({
-      status: 'healthy',
-      timestamp: new Date().toISOString(),
-      uptime: process.uptime(),
-      database: 'connected'
-    });
-  } catch (error) {
-    res.status(503).json({
-      status: 'unhealthy',
-      timestamp: new Date().toISOString(),
-      error: 'Database connection failed'
-    });
-  }
+    try {
+        // Check DB connectivity
+        await sql`SELECT 1`;
+        res.json({
+            status: 'healthy',
+            timestamp: new Date().toISOString(),
+            uptime: process.uptime(),
+            database: 'connected'
+        });
+    } catch (error) {
+        res.status(503).json({
+            status: 'unhealthy',
+            timestamp: new Date().toISOString(),
+            error: 'Database connection failed'
+        });
+    }
 });
 
 // Root route
 app.get('/', (req, res) => {
-  res.json({
-    message: 'School Management System API',
-    version: '2.0.0',
-    endpoints: {
-      auth: '/api/v1/auth',
-      admin: '/api/v1/admin',
-      students: '/api/v1/students',
-      staff: '/api/v1/staff',
-      users: '/api/v1/users',
-      academics: '/api/v1/academics',
-      attendance: '/api/v1/attendance',
-      fees: '/api/v1/fees',
-      results: '/api/v1/results',
-      complaints: '/api/v1/complaints',
-      notices: '/api/v1/notices',
-      leaves: '/api/v1/leaves',
-      diary: '/api/v1/diary',
-      timetable: '/api/v1/timetable',
-      transport: '/api/v1/transport',
-      hostel: '/api/v1/hostel',
-      events: '/api/v1/events',
-      lms: '/api/v1/lms',
-      health: '/api/v1/health'
-    }
-  });
+    res.json({
+        message: 'School Management System API',
+        version: '2.0.0',
+        endpoints: {
+            auth: '/api/v1/auth',
+            admin: '/api/v1/admin',
+            students: '/api/v1/students',
+            staff: '/api/v1/staff',
+            users: '/api/v1/users',
+            academics: '/api/v1/academics',
+            attendance: '/api/v1/attendance',
+            fees: '/api/v1/fees',
+            results: '/api/v1/results',
+            complaints: '/api/v1/complaints',
+            notices: '/api/v1/notices',
+            leaves: '/api/v1/leaves',
+            diary: '/api/v1/diary',
+            timetable: '/api/v1/timetable',
+            transport: '/api/v1/transport',
+            hostel: '/api/v1/hostel',
+            events: '/api/v1/events',
+            lms: '/api/v1/lms',
+            health: '/api/v1/health'
+        }
+    });
 });
 
 // API v1 Routes
@@ -169,34 +169,34 @@ app.use('/academics', academicsRouter);
 
 // 404 Handler
 app.use((req, res) => {
-  res.status(404).json({ error: 'Not Found', path: req.path });
+    res.status(404).json({ error: 'Not Found', path: req.path });
 });
 
 // Global Error Handler
 app.use((err, req, res, next) => {
-  console.error(`[${new Date().toISOString()}] [ERROR] ${req.method} ${req.url} - ${err.stack || err.message}`);
+    console.error(`[${new Date().toISOString()}] [ERROR] ${req.method} ${req.url} - ${err.stack || err.message}`);
 
-  // Call the original errorHandler utility
-  errorHandler(err, req, res, next);
+    // Call the original errorHandler utility
+    errorHandler(err, req, res, next);
 });
 
 // Prevent server crash on unhandled promise rejection (e.g. transient DB ECONNRESET)
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('[unhandledRejection]', reason);
+    console.error('[unhandledRejection]', reason);
 });
 process.on('uncaughtException', (err) => {
-  console.error('[uncaughtException]', err);
-  // Do NOT exit — let the server keep running for transient errors
+    console.error('[uncaughtException]', err);
+    // Do NOT exit — let the server keep running for transient errors
 });
 
 app.listen(port, async () => {
-  console.log(`🚀 Server listening on port ${port}`);
-  console.log(`📚 API Docs: http://localhost:${port}/`);
+    console.log(`🚀 Server listening on port ${port}`);
+    console.log(`📚 API Docs: http://localhost:${port}/`);
 
-  try {
-    await sql`SELECT 1`;
-    console.log('✅ Database connection successful');
-  } catch (error) {
-    console.error('❌ Database connection failed at startup:', error);
-  }
+    try {
+        await sql`SELECT 1`;
+        console.log('✅ Database connection successful');
+    } catch (error) {
+        console.error('❌ Database connection failed at startup:', error);
+    }
 });

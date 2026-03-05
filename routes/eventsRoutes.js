@@ -2,6 +2,7 @@ import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { translateFields } from '../services/geminiTranslator.js';
 
 const router = express.Router();
 
@@ -17,7 +18,7 @@ router.get('/', requirePermission('events.view'), asyncHandler(async (req, res) 
   if (upcoming_only === 'true') {
     events = await sql`
       SELECT 
-        id, title, description, event_type, start_date, end_date,
+        id, title, title_te, description, description_te, event_type, start_date, end_date,
         start_time, end_time, location, is_all_day, is_public
       FROM events
       WHERE start_date >= CURRENT_DATE
@@ -28,7 +29,7 @@ router.get('/', requirePermission('events.view'), asyncHandler(async (req, res) 
   } else {
     events = await sql`
       SELECT 
-        id, title, description, event_type, start_date, end_date,
+        id, title, title_te, description, description_te, event_type, start_date, end_date,
         start_time, end_time, location, is_all_day, is_public
       FROM events
       WHERE TRUE
@@ -104,9 +105,22 @@ router.post('/', requirePermission('events.manage'), asyncHandler(async (req, re
     return res.status(400).json({ error: 'title and start_date are required' });
   }
 
+  // Translate text fields
+  let title_te = null;
+  let description_te = null;
+  try {
+    const fields = { title };
+    if (description) fields.description = description;
+    const te = await translateFields(fields);
+    title_te = te.title || null;
+    description_te = te.description || null;
+  } catch (e) {
+
+  }
+
   const [event] = await sql`
-    INSERT INTO events (title, description, event_type, start_date, end_date, start_time, end_time, location, is_all_day, is_public, target_audience, created_by)
-    VALUES (${title}, ${description}, ${event_type || 'other'}, ${start_date}, ${end_date}, 
+    INSERT INTO events (title, title_te, description, description_te, event_type, start_date, end_date, start_time, end_time, location, is_all_day, is_public, target_audience, created_by)
+    VALUES (${title}, ${title_te}, ${description}, ${description_te}, ${event_type || 'other'}, ${start_date}, ${end_date}, 
             ${start_time}, ${end_time}, ${location}, ${is_all_day || false}, ${is_public !== false}, 
             ${target_audience || 'all'}, ${req.user?.internal_id})
     RETURNING *
@@ -123,11 +137,29 @@ router.put('/:id', requirePermission('events.manage'), asyncHandler(async (req, 
   const { id } = req.params;
   const { title, description, event_type, start_date, end_date, start_time, end_time, location, is_all_day, is_public } = req.body;
 
+  // Translate text fields if changed
+  let sql_title_te = sql`title_te`;
+  let sql_description_te = sql`description_te`;
+  if (title || description) {
+    try {
+      const fields = {};
+      if (title) fields.title = title;
+      if (description) fields.description = description;
+      const te = await translateFields(fields);
+      if (te.title) sql_title_te = sql`${te.title}`;
+      if (te.description) sql_description_te = sql`${te.description}`;
+    } catch (e) {
+
+    }
+  }
+
   const [updated] = await sql`
     UPDATE events
     SET 
       title = COALESCE(${title}, title),
+      title_te = ${sql_title_te},
       description = COALESCE(${description}, description),
+      description_te = ${sql_description_te},
       event_type = COALESCE(${event_type}, event_type),
       start_date = COALESCE(${start_date}, start_date),
       end_date = COALESCE(${end_date}, end_date),

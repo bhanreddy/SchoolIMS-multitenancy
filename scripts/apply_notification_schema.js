@@ -2,12 +2,11 @@
 import sql from '../db.js';
 
 async function applyMigration() {
-  console.log('🚀 Applying Notification Schema Migration...');
 
   try {
     // 1. Add preferred_language to users
     // We check existence first to avoid errors on re-run
-    console.log('Checking users table...');
+
     await sql`
       DO $$ 
       BEGIN 
@@ -21,7 +20,7 @@ async function applyMigration() {
     `;
 
     // 2. Create user_devices table
-    console.log('Creating user_devices table...');
+
     await sql`
       CREATE TABLE IF NOT EXISTS user_devices (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -35,14 +34,13 @@ async function applyMigration() {
     `;
 
     // 3. Indexes
-    console.log('Applying indexes...');
+
     await sql`CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id)`;
     await sql`CREATE INDEX IF NOT EXISTS idx_user_devices_token ON user_devices(fcm_token)`;
 
-    console.log('✅ Migration applied successfully.');
     process.exit(0);
   } catch (error) {
-    console.error('❌ Migration failed:', error);
+
     process.exit(1);
   }
 }
