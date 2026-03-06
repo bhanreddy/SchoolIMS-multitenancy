@@ -200,6 +200,40 @@ export const NotificationEventConfig = Object.freeze({
         bodyTemplate_te: '{{message}}',
         deepLink: '/staff/payslip',
         requiredParams: ['message']
+    },
+
+    // ===== ACCESS CONTROL =====
+    ACCESS_RESPONSE: {
+        channelId: 'voice_alert',
+        sound: 'voice_alert.wav',
+        titleTemplate: 'Access Request Update',
+        bodyTemplate: '{{message}}',
+        titleTemplate_te: 'యాక్సెస్ అభ్యర్థన నవీకరణ',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/access',
+        requiredParams: ['message']
+    },
+
+    // ===== GIRL SAFETY =====
+    GIRL_SAFETY_RECEIVED: {
+        channelId: 'emergency',
+        sound: 'emergency.wav',
+        titleTemplate: 'Safety Alert',
+        bodyTemplate: '{{message}}',
+        titleTemplate_te: 'భద్రతా హెచ్చరిక',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/girl-safety',
+        requiredParams: ['message']
+    },
+    GIRL_SAFETY_UPDATE: {
+        channelId: 'emergency',
+        sound: 'emergency.wav',
+        titleTemplate: 'Safety Update',
+        bodyTemplate: '{{message}}',
+        titleTemplate_te: 'భద్రతా నవీకరణ',
+        bodyTemplate_te: '{{message}}',
+        deepLink: '/Screen/girl-safety',
+        requiredParams: ['message']
     }
 
 });

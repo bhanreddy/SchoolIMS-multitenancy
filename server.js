@@ -10,6 +10,10 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import morgan from 'morgan';
 import config from './config/env.js';
+// Accept self-signed certificates in local development
+if (config.nodeEnv !== 'production') {
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+}
 // Forced restart to pick up route changes
 import { identifyUser } from './middleware/auth.js';
 import { auditLogger } from './middleware/audit.js';

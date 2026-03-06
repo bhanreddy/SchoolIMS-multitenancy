@@ -292,14 +292,13 @@ router.post('/marks/upload', requirePermission('marks.enter'), asyncHandler(asyn
     try {
       // Upsert marks
       const [result] = await sql`
-        INSERT INTO marks (exam_subject_id, student_enrollment_id, marks_obtained, is_absent, remarks, remarks_te, entered_by)
-        VALUES (${exam_subject_id}, ${student_enrollment_id}, ${is_absent ? null : marks_obtained}, ${is_absent || false}, ${remarks}, ${remarks_te}, ${enteredBy})
+        INSERT INTO marks (exam_subject_id, student_enrollment_id, marks_obtained, is_absent, remarks, entered_by)
+        VALUES (${exam_subject_id}, ${student_enrollment_id}, ${is_absent ? null : marks_obtained}, ${is_absent || false}, ${remarks}, ${enteredBy})
         ON CONFLICT (exam_subject_id, student_enrollment_id) 
         DO UPDATE SET 
           marks_obtained = EXCLUDED.marks_obtained,
           is_absent = EXCLUDED.is_absent,
           remarks = EXCLUDED.remarks,
-          remarks_te = EXCLUDED.remarks_te,
           entered_by = EXCLUDED.entered_by
         RETURNING id
       `;
@@ -336,8 +335,8 @@ router.post('/marks/upload', requirePermission('marks.enter'), asyncHandler(asyn
 
       // b. Identify Affected Students (Only NEW inserts)
       const successEnrollmentIds = results.
-      filter((r) => r.success && r.isNew).
-      map((r) => r.student_enrollment_id);
+        filter((r) => r.success && r.isNew).
+        map((r) => r.student_enrollment_id);
 
       if (successEnrollmentIds.length === 0) return;
 
@@ -408,7 +407,7 @@ router.get('/marks/student/:studentId', requirePermission('marks.view'), asyncHa
   } else {
     marksQuery = await sql`
       SELECT 
-        m.id, m.marks_obtained, m.is_absent, m.remarks, m.remarks_te,
+        m.id, m.marks_obtained, m.is_absent, m.remarks,
         s.name as subject_name,
         es.max_marks, es.passing_marks,
         e.name as exam_name, e.exam_type,
@@ -441,7 +440,7 @@ router.get('/marks/class/:classId/exam/:examId', requirePermission('marks.view')
     // Marks for specific subject
     marks = await sql`
       SELECT 
-        m.id, m.marks_obtained, m.is_absent, m.remarks, m.remarks_te,
+        m.id, m.marks_obtained, m.is_absent, m.remarks,
         s.id as student_id, s.admission_no,
         p.display_name as student_name,
         sub.name as subject_name,
@@ -495,7 +494,7 @@ router.get('/marks/class/:classId/exam/:examId', requirePermission('marks.view')
  */
 router.put('/marks/:id', requirePermission('marks.enter'), asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { marks_obtained, is_absent, remarks, remarks_te } = req.body;
+  const { marks_obtained, is_absent, remarks } = req.body;
 
   const [updated] = await sql`
     UPDATE marks
@@ -503,7 +502,6 @@ router.put('/marks/:id', requirePermission('marks.enter'), asyncHandler(async (r
       marks_obtained = ${is_absent ? null : marks_obtained},
       is_absent = COALESCE(${is_absent}, is_absent),
       remarks = COALESCE(${remarks}, remarks),
-      remarks_te = COALESCE(${remarks_te}, remarks_te),
       entered_by = ${req.user?.internal_id}
     WHERE id = ${id}
     RETURNING *
@@ -556,7 +554,6 @@ router.get('/student/:studentId', requirePermission('results.view'), asyncHandle
           'passing_marks', es.passing_marks,
           'is_absent', m.is_absent,
           'remarks', m.remarks,
-          'remarks_te', m.remarks_te,
           'percentage', CASE WHEN m.is_absent THEN 0 ELSE ROUND((m.marks_obtained / es.max_marks) * 100, 2) END,
           'passed', CASE WHEN m.is_absent THEN false ELSE m.marks_obtained >= es.passing_marks END
         ) ORDER BY sub.name) as subjects,
@@ -638,7 +635,6 @@ router.get('/generate', requirePermission('results.generate'), asyncHandler(asyn
         'marks_obtained', m.marks_obtained,
         'is_absent', m.is_absent,
         'remarks', m.remarks,
-        'remarks_te', m.remarks_te,
         'max_marks', es.max_marks
       ) ORDER BY sub.name) as subjects,
       SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) as total_obtained,
@@ -798,8 +794,7 @@ router.get('/marks', requirePermission('marks.view'), asyncHandler(async (req, r
       se.student_id,
       m.marks_obtained,
       m.is_absent,
-      m.remarks,
-      m.remarks_te
+      m.remarks
     FROM student_enrollments se
     JOIN marks m ON m.student_enrollment_id = se.id
     WHERE se.class_section_id = ${class_section_id}
@@ -961,8 +956,8 @@ router.post('/upload', requirePermission('marks.enter'), asyncHandler(async (req
       const { sendNotificationToUsers } = await import('../services/notificationService.js');
 
       const successEnrollmentIds = processedResults.
-      filter((r) => r.success && r.isNew).
-      map((r) => r.enrollment_id);
+        filter((r) => r.success && r.isNew).
+        map((r) => r.enrollment_id);
 
       if (successEnrollmentIds.length === 0) return;
 

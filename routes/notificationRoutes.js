@@ -19,6 +19,9 @@ router.post('/register', async (req, res, next) => {
         const validLang = ['en', 'te'].includes(language_code) ? language_code : 'en';
 
         await withRetry(async () => {
+            // Remove token from any other user to prevent cross-account notifications
+            await sql`DELETE FROM user_devices WHERE fcm_token = ${fcm_token} AND user_id != ${user_id}`;
+
             await sql`
                 INSERT INTO user_devices (user_id, fcm_token, platform, language_code, last_used_at)
                 VALUES (${user_id}, ${fcm_token}, ${platform || 'unknown'}, ${validLang}, now())

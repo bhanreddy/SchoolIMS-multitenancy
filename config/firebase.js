@@ -28,8 +28,9 @@ if (!admin.apps.length) {
       })
     });
 
+    console.log('✅ Firebase Admin SDK initialized successfully (project:', projectId, ')');
   } catch (error) {
-
+    console.error('❌ Firebase Admin SDK initialization FAILED:', error.message);
   }
 }
 
