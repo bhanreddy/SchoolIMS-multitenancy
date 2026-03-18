@@ -1,29 +1,23 @@
 import express from 'express';
 import sql from '../db.js';
-import { requirePermission, requireAuth } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = express.Router();
 
 // ============== CLASSES ==============
 
-/**
- * GET /academics/classes
- * List all classes
- */
 router.get('/classes', requirePermission('academics.view'), asyncHandler(async (req, res) => {
   const classes = await sql`
     SELECT id, name, code
     FROM classes
+    WHERE school_id = ${req.schoolId}
     ORDER BY name
   `;
-  res.json(classes);
+  return sendSuccess(res, req.schoolId, classes);
 }));
 
-/**
- * POST /academics/classes
- * Create a new class
- */
 router.post('/classes', requirePermission('academics.manage'), asyncHandler(async (req, res) => {
   const { name, code } = req.body;
 
@@ -32,74 +26,53 @@ router.post('/classes', requirePermission('academics.manage'), asyncHandler(asyn
   }
 
   const [newClass] = await sql`
-    INSERT INTO classes (name, code)
-    VALUES (${name}, ${code})
+    INSERT INTO classes (school_id, name, code)
+    VALUES (${req.schoolId}, ${name}, ${code})
     RETURNING *
   `;
 
-  res.status(201).json({ message: 'Class created', class: newClass });
+  return sendSuccess(res, req.schoolId, { message: 'Class created', class: newClass }, 201);
 }));
 
-/**
- * DELETE /academics/classes/:id
- * Delete a class (if no sections/students linked)
- */
 router.delete('/classes/:id', requirePermission('academics.manage'), asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const schoolId = req.schoolId;
 
-  // 1. Check for sections Mapping
-  const [hasSections] = await sql`SELECT 1 FROM class_sections WHERE class_id = ${id} LIMIT 1`;
-  if (hasSections) {
-    return res.status(400).json({ error: 'Cannot delete class: Linked to active class-sections' });
-  }
+  // Ownership check
+  const [cls] = await sql`SELECT id FROM classes WHERE id = ${id} AND school_id = ${schoolId}`;
+  if (!cls) return res.status(404).json({ error: 'Class not found' });
 
-  // 2. Check for Fee Structures
-  const [hasFees] = await sql`SELECT 1 FROM fee_structures WHERE class_id = ${id} LIMIT 1`;
-  if (hasFees) {
-    return res.status(400).json({ error: 'Cannot delete class: Financial fee structures are defined for this class' });
-  }
+  const [hasSections] = await sql`SELECT 1 FROM class_sections WHERE class_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasSections) return res.status(400).json({ error: 'Cannot delete class: Linked to active class-sections' });
 
-  // 3. Check for Exams
-  const [hasExams] = await sql`SELECT 1 FROM exam_subjects WHERE class_id = ${id} LIMIT 1`;
-  if (hasExams) {
-    return res.status(400).json({ error: 'Cannot delete class: Linked to exam subjects' });
-  }
+  const [hasFees] = await sql`SELECT 1 FROM fee_structures WHERE class_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasFees) return res.status(400).json({ error: 'Cannot delete class: Financial fee structures are defined for this class' });
 
-  // 4. Check for LMS Courses
-  const [hasLMS] = await sql`SELECT 1 FROM lms_courses WHERE class_id = ${id} LIMIT 1`;
-  if (hasLMS) {
-    return res.status(400).json({ error: 'Cannot delete class: Linked to LMS courses' });
-  }
+  const [hasExams] = await sql`SELECT 1 FROM exam_subjects WHERE class_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasExams) return res.status(400).json({ error: 'Cannot delete class: Linked to exam subjects' });
 
-  // 5. Check for targeted Notices
-  const [hasNotices] = await sql`SELECT 1 FROM notices WHERE target_class_id = ${id} LIMIT 1`;
-  if (hasNotices) {
-    return res.status(400).json({ error: 'Cannot delete class: Targeted in active announcements' });
-  }
+  const [hasLMS] = await sql`SELECT 1 FROM lms_courses WHERE class_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasLMS) return res.status(400).json({ error: 'Cannot delete class: Linked to LMS courses' });
 
-  await sql`DELETE FROM classes WHERE id = ${id}`;
-  res.json({ message: 'Class deleted successfully' });
+  const [hasNotices] = await sql`SELECT 1 FROM notices WHERE target_class_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasNotices) return res.status(400).json({ error: 'Cannot delete class: Targeted in active announcements' });
+
+  await sql`DELETE FROM classes WHERE id = ${id} AND school_id = ${schoolId} AND school_id = ${req.schoolId}`;
+  return sendSuccess(res, req.schoolId, { message: 'Class deleted successfully' });
 }));
 
 // ============== SECTIONS ==============
 
-/**
- * GET /academics/sections
- * List all sections
- */
 router.get('/sections', requirePermission('academics.view'), asyncHandler(async (req, res) => {
   const sections = await sql`
     SELECT id, name, code
     FROM sections
+    WHERE school_id = ${req.schoolId}
     ORDER BY name
   `;
-  res.json(sections);
+  return sendSuccess(res, req.schoolId, sections);
 }));
 
-/**
- * POST /academics/sections
- * Create a new section
- */
 router.post('/sections', requirePermission('academics.manage'), asyncHandler(async (req, res) => {
   const { name, code } = req.body;
 
@@ -108,50 +81,42 @@ router.post('/sections', requirePermission('academics.manage'), asyncHandler(asy
   }
 
   const [newSection] = await sql`
-    INSERT INTO sections (name, code)
-    VALUES (${name}, ${code})
+    INSERT INTO sections (school_id, name, code)
+    VALUES (${req.schoolId}, ${name}, ${code})
     RETURNING *
   `;
 
-  res.status(201).json({ message: 'Section created', section: newSection });
+  return sendSuccess(res, req.schoolId, { message: 'Section created', section: newSection }, 201);
 }));
 
-/**
- * DELETE /academics/sections/:id
- * Delete a section (if no class-sections linked)
- */
 router.delete('/sections/:id', requirePermission('academics.manage'), asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const schoolId = req.schoolId;
 
-  const [hasMappings] = await sql`SELECT 1 FROM class_sections WHERE section_id = ${id} LIMIT 1`;
-  if (hasMappings) {
-    return res.status(400).json({ error: 'Cannot delete section: Linked to active class-sections in one or more academic years' });
-  }
+  // Ownership check
+  const [sec] = await sql`SELECT id FROM sections WHERE id = ${id} AND school_id = ${schoolId}`;
+  if (!sec) return res.status(404).json({ error: 'Section not found' });
 
-  await sql`DELETE FROM sections WHERE id = ${id}`;
-  res.json({ message: 'Section deleted successfully' });
+  const [hasMappings] = await sql`SELECT 1 FROM class_sections WHERE section_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasMappings) return res.status(400).json({ error: 'Cannot delete section: Linked to active class-sections in one or more academic years' });
+
+  await sql`DELETE FROM sections WHERE id = ${id} AND school_id = ${schoolId} AND school_id = ${req.schoolId}`;
+  return sendSuccess(res, req.schoolId, { message: 'Section deleted successfully' });
 }));
 
 // ============== ACADEMIC YEARS ==============
 
-/**
- * GET /academics/academic-years
- * List all academic years
- */
 router.get('/academic-years', requirePermission('academics.view'), asyncHandler(async (req, res) => {
   const years = await sql`
-        SELECT id, code, start_date, end_date,
-               CASE WHEN NOW() BETWEEN start_date AND end_date THEN true ELSE false END as is_current
-        FROM academic_years
-        ORDER BY start_date DESC
-    `;
-  res.json(years);
+    SELECT id, code, start_date, end_date,
+           CASE WHEN NOW() BETWEEN start_date AND end_date THEN true ELSE false END as is_current
+    FROM academic_years
+    WHERE school_id = ${req.schoolId}
+    ORDER BY start_date DESC
+  `;
+  return sendSuccess(res, req.schoolId, years);
 }));
 
-/**
- * POST /academics/academic-years
- * Create a new academic year
- */
 router.post('/academic-years', requirePermission('academics.manage'), asyncHandler(async (req, res) => {
   const { code, start_date, end_date } = req.body;
 
@@ -160,74 +125,58 @@ router.post('/academic-years', requirePermission('academics.manage'), asyncHandl
   }
 
   const [newYear] = await sql`
-    INSERT INTO academic_years (code, start_date, end_date)
-    VALUES (${code}, ${start_date}, ${end_date})
+    INSERT INTO academic_years (school_id, code, start_date, end_date)
+    VALUES (${req.schoolId}, ${code}, ${start_date}, ${end_date})
     RETURNING *
   `;
 
-  res.status(201).json({ message: 'Academic year created', academic_year: newYear });
+  return sendSuccess(res, req.schoolId, { message: 'Academic year created', academic_year: newYear }, 201);
 }));
 
-/**
- * DELETE /academics/academic-years/:id
- * Delete an academic year (if no enrollments/fees linked)
- */
 router.delete('/academic-years/:id', requirePermission('academics.manage'), asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const schoolId = req.schoolId;
 
-  // 1. Check for Class-Section Mappings
-  const [hasMappings] = await sql`SELECT 1 FROM class_sections WHERE academic_year_id = ${id} LIMIT 1`;
-  if (hasMappings) {
-    return res.status(400).json({ error: 'Cannot delete academic year: Class mappings exist for this year' });
-  }
+  // Ownership check
+  const [yr] = await sql`SELECT id FROM academic_years WHERE id = ${id} AND school_id = ${schoolId}`;
+  if (!yr) return res.status(404).json({ error: 'Academic year not found' });
 
-  // 2. Check for enrollments (redundant but safe)
-  const [hasEnrollments] = await sql`SELECT 1 FROM student_enrollments WHERE academic_year_id = ${id} LIMIT 1`;
-  if (hasEnrollments) {
-    return res.status(400).json({ error: 'Cannot delete academic year: Existing student enrollments found' });
-  }
+  const [hasMappings] = await sql`SELECT 1 FROM class_sections WHERE academic_year_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasMappings) return res.status(400).json({ error: 'Cannot delete academic year: Class mappings exist for this year' });
 
-  // 3. Check for fees
-  const [hasFees] = await sql`SELECT 1 FROM fee_structures WHERE academic_year_id = ${id} LIMIT 1`;
-  if (hasFees) {
-    return res.status(400).json({ error: 'Cannot delete academic year: Linked fee structures exist' });
-  }
+  const [hasEnrollments] = await sql`SELECT 1 FROM student_enrollments WHERE academic_year_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasEnrollments) return res.status(400).json({ error: 'Cannot delete academic year: Existing student enrollments found' });
 
-  // 4. Check for Exams
-  const [hasExams] = await sql`SELECT 1 FROM exams WHERE academic_year_id = ${id} LIMIT 1`;
-  if (hasExams) {
-    return res.status(400).json({ error: 'Cannot delete academic year: Linked exams exist' });
-  }
+  const [hasFees] = await sql`SELECT 1 FROM fee_structures WHERE academic_year_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasFees) return res.status(400).json({ error: 'Cannot delete academic year: Linked fee structures exist' });
 
-  // 5. Check for Transport
-  const [hasTransport] = await sql`SELECT 1 FROM student_transport WHERE academic_year_id = ${id} LIMIT 1`;
-  if (hasTransport) {
-    return res.status(400).json({ error: 'Cannot delete academic year: Linked transport assignments exist' });
-  }
+  const [hasExams] = await sql`SELECT 1 FROM exams WHERE academic_year_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasExams) return res.status(400).json({ error: 'Cannot delete academic year: Linked exams exist' });
 
-  // 6. Check for Hostel
-  const [hasHostel] = await sql`SELECT 1 FROM hostel_allocations WHERE academic_year_id = ${id} LIMIT 1`;
-  if (hasHostel) {
-    return res.status(400).json({ error: 'Cannot delete academic year: Linked hostel allocations exist' });
-  }
+  const [hasTransport] = await sql`SELECT 1 FROM student_transport WHERE academic_year_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasTransport) return res.status(400).json({ error: 'Cannot delete academic year: Linked transport assignments exist' });
 
-  await sql`DELETE FROM academic_years WHERE id = ${id}`;
-  res.json({ message: 'Academic year deleted successfully' });
+  const [hasHostel] = await sql`SELECT 1 FROM hostel_allocations WHERE academic_year_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasHostel) return res.status(400).json({ error: 'Cannot delete academic year: Linked hostel allocations exist' });
+
+  await sql`DELETE FROM academic_years WHERE id = ${id} AND school_id = ${schoolId} AND school_id = ${req.schoolId}`;
+  return sendSuccess(res, req.schoolId, { message: 'Academic year deleted successfully' });
 }));
 
 // ============== CLASS SECTIONS ==============
 
 /**
  * GET /academics/class-sections
- * List all class-section mappings (optionally by academic year)
+ * AC1: Both query branches now filter by school_id via academic_years join.
  */
 router.get('/class-sections', requirePermission('academics.view'), asyncHandler(async (req, res) => {
   const { academic_year_id } = req.query;
+  const schoolId = req.schoolId;
 
   let classSections;
   if (academic_year_id) {
     classSections = await sql`
-      SELECT cs.id, c.name as class_name, c.id as class_id, 
+      SELECT cs.id, c.name as class_name, c.id as class_id,
              s.name as section_name, s.id as section_id,
              ay.code as academic_year, ay.id as academic_year_id,
              cs.class_teacher_id, p_teacher.display_name as class_teacher_name
@@ -238,11 +187,12 @@ router.get('/class-sections', requirePermission('academics.view'), asyncHandler(
       LEFT JOIN staff st ON cs.class_teacher_id = st.id
       LEFT JOIN persons p_teacher ON st.person_id = p_teacher.id
       WHERE cs.academic_year_id = ${academic_year_id}
+        AND cs.school_id = ${schoolId}
       ORDER BY c.name, s.name
     `;
   } else {
     classSections = await sql`
-      SELECT cs.id, c.name as class_name, c.id as class_id, 
+      SELECT cs.id, c.name as class_name, c.id as class_id,
              s.name as section_name, s.id as section_id,
              ay.code as academic_year, ay.id as academic_year_id,
              cs.class_teacher_id, p_teacher.display_name as class_teacher_name
@@ -252,17 +202,14 @@ router.get('/class-sections', requirePermission('academics.view'), asyncHandler(
       JOIN academic_years ay ON cs.academic_year_id = ay.id
       LEFT JOIN staff st ON cs.class_teacher_id = st.id
       LEFT JOIN persons p_teacher ON st.person_id = p_teacher.id
+      WHERE cs.school_id = ${schoolId}
       ORDER BY ay.start_date DESC, c.name, s.name
     `;
   }
 
-  res.json(classSections);
+  return sendSuccess(res, req.schoolId, classSections);
 }));
 
-/**
- * POST /academics/class-sections
- * Create a class-section mapping for an academic year
- */
 router.post('/class-sections', requirePermission('academics.manage'), asyncHandler(async (req, res) => {
   const { class_id, section_id, academic_year_id, class_teacher_id } = req.body;
 
@@ -271,50 +218,79 @@ router.post('/class-sections', requirePermission('academics.manage'), asyncHandl
   }
 
   const [newMapping] = await sql`
-    INSERT INTO class_sections (class_id, section_id, academic_year_id, class_teacher_id)
-    VALUES (${class_id}, ${section_id}, ${academic_year_id}, ${class_teacher_id || null})
+    INSERT INTO class_sections (school_id, class_id, section_id, academic_year_id, class_teacher_id)
+    VALUES (${req.schoolId}, ${class_id}, ${section_id}, ${academic_year_id}, ${class_teacher_id || null})
     RETURNING *
   `;
 
-  res.status(201).json({ message: 'Class-section created', class_section: newMapping });
+  return sendSuccess(res, req.schoolId, { message: 'Class-section created', class_section: newMapping }, 201);
+}));
+
+/**
+ * DELETE /academics/class-sections/:id
+ * AC2: Ownership check — verify the class_section belongs to this school before deleting.
+ */
+router.delete('/class-sections/:id', requirePermission('academics.manage'), asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const schoolId = req.schoolId;
+
+  // AC2: Ownership check
+  const [cs] = await sql`SELECT id FROM class_sections WHERE id = ${id} AND school_id = ${schoolId}`;
+  if (!cs) return res.status(404).json({ error: 'Class-section not found' });
+
+  const [hasEnrollments] = await sql`SELECT 1 FROM student_enrollments WHERE class_section_id = ${id} AND school_id = ${req.schoolId} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasEnrollments) return res.status(400).json({ error: 'Cannot delete mapping: Students are enrolled in this class-section' });
+
+  const [hasSubjects] = await sql`SELECT 1 FROM class_subjects WHERE class_section_id = ${id} AND school_id = ${req.schoolId} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasSubjects) return res.status(400).json({ error: 'Cannot delete mapping: Subjects are assigned to this class-section' });
+
+  const [hasDiary] = await sql`SELECT 1 FROM diary_entries WHERE class_section_id = ${id} AND school_id = ${req.schoolId} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasDiary) return res.status(400).json({ error: 'Cannot delete mapping: Diary/Homework entries exist for this class-section' });
+
+  const [hasTimetable] = await sql`SELECT 1 FROM timetable_slots WHERE class_section_id = ${id} AND school_id = ${req.schoolId} AND school_id = ${req.schoolId} LIMIT 1`;
+  if (hasTimetable) return res.status(400).json({ error: 'Cannot delete mapping: Timetable slots are defined for this class-section' });
+
+  await sql`DELETE FROM class_sections WHERE id = ${id} AND school_id = ${schoolId} AND school_id = ${req.schoolId}`;
+  return sendSuccess(res, req.schoolId, { message: 'Class-section mapping deleted successfully' });
 }));
 
 /**
  * GET /academics/class-sections/:id/students
- * Get students enrolled in a specific class-section
+ * AC3: Verify class_section belongs to this school before returning students.
  */
 router.get('/class-sections/:id/students', requirePermission('academics.view'), asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const schoolId = req.schoolId;
+
+  // AC3: Ownership check
+  const [cs] = await sql`SELECT id FROM class_sections WHERE id = ${id} AND school_id = ${schoolId}`;
+  if (!cs) return res.status(404).json({ error: 'Class-section not found' });
 
   const students = await sql`
-    SELECT 
+    SELECT
       s.id, s.admission_no,
       p.first_name, p.last_name, p.display_name, p.photo_url,
       se.status as enrollment_status, se.start_date, se.end_date
     FROM student_enrollments se
     JOIN students s ON se.student_id = s.id
     JOIN persons p ON s.person_id = p.id
-    WHERE se.class_section_id = ${id}
+    WHERE se.class_section_id = ${id} AND school_id = ${req.schoolId}
       AND se.status = 'active'
       AND se.deleted_at IS NULL
       AND s.deleted_at IS NULL
     ORDER BY p.first_name, p.last_name
   `;
 
-  res.json(students);
+  return sendSuccess(res, req.schoolId, students);
 }));
 
 // ============== ENROLLMENTS ==============
 
-/**
- * GET /academics/enrollments
- * List enrollments with filters
- */
 router.get('/enrollments', requirePermission('academics.view'), asyncHandler(async (req, res) => {
   const { student_id, class_section_id, academic_year_id, status } = req.query;
 
   let query = sql`
-    SELECT 
+    SELECT
       se.id, se.status, se.start_date, se.end_date, se.created_at,
       s.id as student_id, s.admission_no,
       p.display_name as student_name,
@@ -328,21 +304,17 @@ router.get('/enrollments', requirePermission('academics.view'), asyncHandler(asy
     JOIN sections sec ON cs.section_id = sec.id
     JOIN academic_years ay ON se.academic_year_id = ay.id
     WHERE se.deleted_at IS NULL
+      AND s.school_id = ${req.schoolId}
   `;
 
-  // Apply filters (simple approach for now)
   if (student_id) {
-    query = sql`${query} AND se.student_id = ${student_id}`;
+    query = sql`${query} AND se.student_id = ${student_id} AND s.school_id = ${req.schoolId}`;
   }
 
   const enrollments = await query;
-  res.json(enrollments);
+  return sendSuccess(res, req.schoolId, enrollments);
 }));
 
-/**
- * POST /academics/enrollments
- * Enroll a student in a class-section
- */
 router.post('/enrollments', requirePermission('academics.manage'), asyncHandler(async (req, res) => {
   const { student_id, class_section_id, academic_year_id, start_date } = req.body;
 
@@ -353,23 +325,24 @@ router.post('/enrollments', requirePermission('academics.manage'), asyncHandler(
   }
 
   const [enrollment] = await sql`
-    INSERT INTO student_enrollments (student_id, class_section_id, academic_year_id, start_date, status)
-    VALUES (${student_id}, ${class_section_id}, ${academic_year_id}, ${start_date}, 'active')
+    INSERT INTO student_enrollments (school_id, student_id, class_section_id, academic_year_id, start_date, status)
+    VALUES (${req.schoolId}, ${student_id}, ${class_section_id}, ${academic_year_id}, ${start_date}, 'active')
     RETURNING *
   `;
 
-  res.status(201).json({ message: 'Student enrolled successfully', enrollment });
+  return sendSuccess(res, req.schoolId, { message: 'Student enrolled successfully', enrollment }, 201);
 }));
 
 /**
  * GET /academics/enrollments/:id
- * Get enrollment details
+ * AC3: Ownership check via students.school_id.
  */
 router.get('/enrollments/:id', requirePermission('academics.view'), asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const schoolId = req.schoolId;
 
   const [enrollment] = await sql`
-    SELECT 
+    SELECT
       se.*,
       s.admission_no, p.display_name as student_name,
       c.name as class_name, sec.name as section_name,
@@ -382,30 +355,41 @@ router.get('/enrollments/:id', requirePermission('academics.view'), asyncHandler
     JOIN sections sec ON cs.section_id = sec.id
     JOIN academic_years ay ON se.academic_year_id = ay.id
     WHERE se.id = ${id}
+      AND s.school_id = ${schoolId}
   `;
 
   if (!enrollment) {
     return res.status(404).json({ error: 'Enrollment not found' });
   }
 
-  res.json(enrollment);
+  return sendSuccess(res, req.schoolId, enrollment);
 }));
 
 /**
  * PUT /academics/enrollments/:id
- * Update enrollment (e.g., transfer, withdraw)
+ * AC3: Ownership check via students.school_id before update.
  */
 router.put('/enrollments/:id', requirePermission('academics.manage'), asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { status, end_date, class_section_id } = req.body;
+  const schoolId = req.schoolId;
+
+  // AC3: Ownership check
+  const [existing] = await sql`
+    SELECT se.id FROM student_enrollments se
+    JOIN students s ON se.student_id = s.id
+    WHERE se.id = ${id} AND s.school_id = ${schoolId}
+  `;
+  if (!existing) return res.status(404).json({ error: 'Enrollment not found' });
 
   const [updated] = await sql`
     UPDATE student_enrollments
-    SET 
-      status = COALESCE(${status}, status),
-      end_date = COALESCE(${end_date}, end_date),
-      class_section_id = COALESCE(${class_section_id}, class_section_id)
+    SET
+      status = COALESCE(${status ?? null}, status),
+      end_date = COALESCE(${end_date ?? null}, end_date),
+      class_section_id = COALESCE(${class_section_id ?? null}, class_section_id)
     WHERE id = ${id}
+      AND school_id = ${req.schoolId}
     RETURNING *
   `;
 
@@ -413,7 +397,7 @@ router.put('/enrollments/:id', requirePermission('academics.manage'), asyncHandl
     return res.status(404).json({ error: 'Enrollment not found' });
   }
 
-  res.json({ message: 'Enrollment updated', enrollment: updated });
+  return sendSuccess(res, req.schoolId, { message: 'Enrollment updated', enrollment: updated });
 }));
 
 export default router;

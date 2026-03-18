@@ -1,6 +1,7 @@
 import express from 'express';
 import sql, { supabaseAdmin } from '../db.js';
 import { requirePermission, requireAuth } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = express.Router();
@@ -48,12 +49,13 @@ router.get('/', requirePermission('staff.view'), asyncHandler(async (req, res) =
     LEFT JOIN staff_designations sd ON st.designation_id = sd.id
     LEFT JOIN staff_statuses ss ON st.status_id = ss.id
     WHERE st.deleted_at IS NULL
+      AND st.school_id = ${req.schoolId}
       ${status ? sql`AND ss.code = ${status}` : sql``}
       ${designation_id ? sql`AND st.designation_id = ${designation_id}` : sql``}
     ORDER BY p.display_name
   `;
 
-  res.json(staff);
+  return sendSuccess(res, req.schoolId, staff);
 }));
 
 /**
@@ -79,14 +81,14 @@ router.get('/:id', requirePermission('staff.view'), asyncHandler(async (req, res
     LEFT JOIN staff_designations sd ON st.designation_id = sd.id
     LEFT JOIN staff_statuses ss ON st.status_id = ss.id
     LEFT JOIN users u ON u.person_id = p.id
-    WHERE st.id = ${id} AND st.deleted_at IS NULL
+    WHERE st.id = ${id} AND st.deleted_at IS NULL AND st.school_id = ${req.schoolId}
   `;
 
   if (!staff) {
     return res.status(404).json({ error: 'Staff not found' });
   }
 
-  res.json(staff);
+  return sendSuccess(res, req.schoolId, staff);
 }));
 
 /**
@@ -120,26 +122,26 @@ router.post('/', requirePermission('staff.create'), asyncHandler(async (req, res
     const result = await sql.begin(async (sql) => {
       // 1. Create Person
       const [person] = await sql`
-                INSERT INTO persons (first_name, middle_name, last_name, dob, gender_id)
-                VALUES (${first_name}, ${middle_name || null}, ${last_name}, ${dob || null}, ${gender_id})
+                INSERT INTO persons (school_id, first_name, middle_name, last_name, dob, gender_id)
+                VALUES (${req.schoolId}, ${first_name}, ${middle_name || null}, ${last_name}, ${dob || null}, ${gender_id})
                 RETURNING id
             `;
 
       // 2. Create Staff
       const [staff] = await sql`
-                INSERT INTO staff (person_id, staff_code, joining_date, status_id, designation_id, salary)
-                VALUES (${person.id}, ${staff_code}, ${joining_date}, ${status_id || 1}, ${designation_id}, ${salary || null})
+                INSERT INTO staff (school_id, person_id, staff_code, joining_date, status_id, designation_id, salary)
+                VALUES (${req.schoolId}, ${person.id}, ${staff_code}, ${joining_date}, ${status_id || 1}, ${designation_id}, ${salary || null})
                 RETURNING *
             `;
 
       // 3. Contacts
       if (email) {
-        await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
-                    VALUES (${person.id}, 'email', ${email}, true)`;
+        await sql`INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary) 
+                    VALUES (${req.schoolId}, ${person.id}, 'email', ${email}, true)`;
       }
       if (phone) {
-        await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
-                    VALUES (${person.id}, 'phone', ${phone}, true)`;
+        await sql`INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary) 
+                    VALUES (${req.schoolId}, ${person.id}, 'phone', ${phone}, true)`;
       }
 
       // 4. Create User Login (Optional)
@@ -165,19 +167,19 @@ router.post('/', requirePermission('staff.create'), asyncHandler(async (req, res
 
         // Create Local User
         const [user] = await sql`
-                    INSERT INTO users (id, person_id, account_status)
-                    VALUES (${supabaseUserId}, ${person.id}, 'active')
+                    INSERT INTO users (id, school_id, person_id, account_status)
+                    VALUES (${supabaseUserId}, ${req.schoolId}, ${person.id}, 'active')
                     RETURNING id
                 `;
 
         // Assign Role (default to 'staff' if not provided)
         const userRole = role_code || 'staff';
-        const [role] = await sql`SELECT id FROM roles WHERE code = ${userRole}`;
+        const [role] = await sql`SELECT id FROM roles WHERE code = ${userRole} AND school_id = ${req.schoolId}`;
 
         if (role) {
           await sql`
-                        INSERT INTO user_roles (user_id, role_id, granted_by)
-                        VALUES (${user.id}, ${role.id}, ${req.user?.internal_id || null})
+                        INSERT INTO user_roles (user_id, role_id, school_id, granted_by)
+                        VALUES (${user.id}, ${role.id}, ${req.schoolId}, ${req.user?.internal_id || null})
                     `;
         }
       }
@@ -185,13 +187,13 @@ router.post('/', requirePermission('staff.create'), asyncHandler(async (req, res
       return staff;
     });
 
-    res.status(201).json({ message: 'Staff created successfully', staff: result });
+    return sendSuccess(res, req.schoolId, { message: 'Staff created successfully', staff: result }, 201);
   } catch (error) {
-
+    console.error('Error creating staff:', error);
     if (error.message.includes('Supabase Auth Error')) {
       return res.status(400).json({ error: error.message });
     }
-    res.status(500).json({ error: 'Failed to create staff', details: error.message });
+    res.status(500).json({ error: 'Failed to create staff: ' + (error.detail || error.message), details: error.message });
   }
 }));
 
@@ -207,49 +209,61 @@ router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res
     email, phone
   } = req.body;
 
+  // Ownership check must short-circuit as 404, not throw into catch/500.
+  const [staffCheck] = await sql`
+    SELECT person_id
+    FROM staff
+    WHERE id = ${id}
+      AND deleted_at IS NULL
+      AND school_id = ${req.schoolId}
+  `;
+
+  if (!staffCheck) {
+    return res.status(404).json({ error: 'Staff not found' });
+  }
+
+  const personId = staffCheck.person_id;
+
   const result = await sql.begin(async (sql) => {
-    // 1. Get Person ID from Staff
-    const [staff] = await sql`SELECT person_id FROM staff WHERE id = ${id} AND deleted_at IS NULL`;
-    if (!staff) throw new Error('Staff not found');
-
-    const personId = staff.person_id;
-
-    // 2. Update Person
+    // 1. Update Person
     await sql`
       UPDATE persons
       SET 
-        first_name = COALESCE(${first_name}, first_name),
-        middle_name = COALESCE(${middle_name}, middle_name),
-        last_name = COALESCE(${last_name}, last_name),
-        dob = COALESCE(${dob}, dob),
-        gender_id = COALESCE(${gender_id}, gender_id)
+        first_name = COALESCE(${first_name ?? null}, first_name),
+        middle_name = COALESCE(${middle_name ?? null}, middle_name),
+        last_name = COALESCE(${last_name ?? null}, last_name),
+        dob = COALESCE(${dob ?? null}, dob),
+        gender_id = COALESCE(${gender_id ?? null}, gender_id)
       WHERE id = ${personId}
+        AND school_id = ${req.schoolId}
     `;
 
-    // 3. Update Staff
+    // 2. Update Staff
     const [updatedStaff] = await sql`
       UPDATE staff
       SET 
-        staff_code = COALESCE(${staff_code}, staff_code),
-        joining_date = COALESCE(${joining_date}, joining_date),
-        status_id = COALESCE(${status_id}, status_id),
-        designation_id = COALESCE(${designation_id}, designation_id),
-        salary = COALESCE(${salary}, salary)
+        staff_code = COALESCE(${staff_code ?? null}, staff_code),
+        joining_date = COALESCE(${joining_date ?? null}, joining_date),
+        status_id = COALESCE(${status_id ?? null}, status_id),
+        designation_id = COALESCE(${designation_id ?? null}, designation_id),
+        salary = COALESCE(${salary ?? null}, salary)
       WHERE id = ${id}
+        AND school_id = ${req.schoolId}
       RETURNING *
     `;
 
-    // 4. Update Contacts
+    // 3. Update Contacts
     if (email) {
       const [existing] = await sql`
         SELECT id FROM person_contacts 
         WHERE person_id = ${personId} AND contact_type = 'email' AND is_primary = true
       `;
       if (existing) {
-        await sql`UPDATE person_contacts SET contact_value = ${email} WHERE id = ${existing.id}`;
+        await sql`UPDATE person_contacts SET contact_value = ${email} WHERE id = ${existing.id}
+      AND school_id = ${req.schoolId}`;
       } else {
-        await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
-                  VALUES (${personId}, 'email', ${email}, true)`;
+        await sql`INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary) 
+                  VALUES (${req.schoolId}, ${personId}, 'email', ${email}, true)`;
       }
     }
 
@@ -259,17 +273,18 @@ router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res
         WHERE person_id = ${personId} AND contact_type = 'phone' AND is_primary = true
       `;
       if (existing) {
-        await sql`UPDATE person_contacts SET contact_value = ${phone} WHERE id = ${existing.id}`;
+        await sql`UPDATE person_contacts SET contact_value = ${phone} WHERE id = ${existing.id}
+      AND school_id = ${req.schoolId}`;
       } else {
-        await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
-                  VALUES (${personId}, 'phone', ${phone}, true)`;
+        await sql`INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary) 
+                  VALUES (${req.schoolId}, ${personId}, 'phone', ${phone}, true)`;
       }
     }
 
     return updatedStaff;
   });
 
-  res.json({ message: 'Staff updated successfully', staff: result });
+  return sendSuccess(res, req.schoolId, { message: 'Staff updated successfully', staff: result });
 }));
 
 /**
@@ -280,14 +295,14 @@ router.delete('/:id', requirePermission('staff.delete'), asyncHandler(async (req
   const { id } = req.params;
 
   const [result] = await sql`
-    UPDATE staff SET deleted_at = NOW() WHERE id = ${id} AND deleted_at IS NULL RETURNING id
+    UPDATE staff SET deleted_at = NOW() WHERE id = ${id} AND deleted_at IS NULL AND school_id = ${req.schoolId} RETURNING id
   `;
 
   if (!result) {
     return res.status(404).json({ error: 'Staff not found' });
   }
 
-  res.json({ message: 'Staff deleted successfully' });
+  return sendSuccess(res, req.schoolId, { message: 'Staff deleted successfully' });
 }));
 
 // ============== SUB-ROUTES ==============
@@ -300,7 +315,7 @@ router.get('/:id/classes', requirePermission('staff.view'), asyncHandler(async (
   const { id } = req.params;
 
   // Placeholder - would need class_teachers junction table
-  res.json({
+  return sendSuccess(res, req.schoolId, {
     staff_id: id,
     message: 'Class assignment feature requires class_teachers table',
     classes: []
@@ -315,7 +330,7 @@ router.get('/:id/timetable', requirePermission('staff.view'), asyncHandler(async
   const { id } = req.params;
 
   // Placeholder - will be implemented in Phase 3
-  res.json({
+  return sendSuccess(res, req.schoolId, {
     staff_id: id,
     message: 'Timetable will be implemented in Phase 3',
     schedule: []
@@ -330,7 +345,7 @@ router.get('/:id/payslips', requireAuth, asyncHandler(async (req, res) => {
   const { id } = req.params;
 
   // 1. Check permissions (Own Data OR Has Permission)
-  const [targetStaff] = await sql`SELECT person_id FROM staff WHERE id = ${id}`;
+  const [targetStaff] = await sql`SELECT person_id FROM staff WHERE id = ${id} AND school_id = ${req.schoolId}`;
 
   if (!targetStaff) {
     return res.status(404).json({ error: 'Staff not found' });
@@ -359,7 +374,7 @@ router.get('/:id/payslips', requireAuth, asyncHandler(async (req, res) => {
             p.display_name as staff_name,
             sd.name as designation
         FROM staff_payroll sp
-        JOIN staff st ON sp.staff_id = st.id
+        JOIN staff st ON sp.staff_id = st.id AND st.school_id = ${req.schoolId}
         JOIN persons p ON st.person_id = p.id
         LEFT JOIN staff_designations sd ON st.designation_id = sd.id
         WHERE sp.staff_id = ${id}
@@ -389,7 +404,7 @@ router.get('/:id/payslips', requireAuth, asyncHandler(async (req, res) => {
     };
   });
 
-  res.json(formattedPayslips);
+  return sendSuccess(res, req.schoolId, formattedPayslips);
 }));
 
 /**
@@ -416,7 +431,7 @@ router.get('/:id/payslip', requirePermission('staff.view'), asyncHandler(async (
             p.display_name as staff_name,
             sd.name as designation
         FROM staff_payroll sp
-        JOIN staff st ON sp.staff_id = st.id
+        JOIN staff st ON sp.staff_id = st.id AND st.school_id = ${req.schoolId}
         JOIN persons p ON st.person_id = p.id
         LEFT JOIN staff_designations sd ON st.designation_id = sd.id
         WHERE sp.staff_id = ${id}
@@ -428,7 +443,7 @@ router.get('/:id/payslip', requirePermission('staff.view'), asyncHandler(async (
     return res.status(404).json({ error: 'Payroll record not found' });
   }
 
-  res.json(payroll);
+  return sendSuccess(res, req.schoolId, payroll);
 }));
 
 export default router;

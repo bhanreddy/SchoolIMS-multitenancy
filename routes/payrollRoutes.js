@@ -2,6 +2,7 @@
 import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
 
@@ -16,6 +17,12 @@ router.post('/process', requirePermission('payroll.process'), asyncHandler(async
 
   if (!staff_id || !month || !year) {
     return res.status(400).json({ error: 'staff_id, month, and year are required' });
+  }
+
+  // P1 FIX: Verify staff belongs to this school before processing payroll
+  const [staffCheck] = await sql`SELECT id FROM staff WHERE id = ${staff_id} AND school_id = ${req.schoolId}`;
+  if (!staffCheck) {
+    return res.status(404).json({ error: 'Staff not found' });
   }
 
   // 1. Calculate/Ensure Payroll Exists
@@ -34,6 +41,7 @@ router.post('/process', requirePermission('payroll.process'), asyncHandler(async
     WHERE staff_id = ${staff_id}
       AND payroll_month = ${month}
       AND payroll_year = ${year}
+      AND staff_id IN (SELECT id FROM staff WHERE school_id = ${req.schoolId})
     RETURNING *
   `;
 
@@ -65,7 +73,7 @@ router.post('/process', requirePermission('payroll.process'), asyncHandler(async
     }
   })();
 
-  res.json({ message: 'Payroll processed successfully', payroll });
+  return sendSuccess(res, req.schoolId, { message: 'Payroll processed successfully', payroll });
 }));
 
 /**
@@ -76,13 +84,23 @@ router.put('/:id/pay', requirePermission('payroll.process'), asyncHandler(async 
   const { id } = req.params;
   const payment_date = new Date();
 
+  // P2 FIX: Ownership check via staff.school_id
+  const [payrollCheck] = await sql`
+    SELECT sp.id FROM staff_payroll sp
+    JOIN staff s ON sp.staff_id = s.id
+    WHERE sp.id = ${id} AND s.school_id = ${req.schoolId}
+  `;
+  if (!payrollCheck) {
+    return res.status(404).json({ error: 'Payroll record not found' });
+  }
+
   const [payroll] = await sql`
     UPDATE staff_payroll
     SET 
       status = 'paid',
       payment_date = ${payment_date},
       updated_at = now()
-    WHERE id = ${id}
+    WHERE id = ${id} AND staff_id IN (SELECT id FROM staff WHERE school_id = ${req.schoolId})
     RETURNING *
   `;
 
@@ -113,7 +131,7 @@ router.put('/:id/pay', requirePermission('payroll.process'), asyncHandler(async 
     }
   })();
 
-  res.json({ message: 'Payroll marked as paid', payroll });
+  return sendSuccess(res, req.schoolId, { message: 'Payroll marked as paid', payroll });
 }));
 
 export default router;

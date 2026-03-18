@@ -1,6 +1,7 @@
 import express from 'express';
 import sql from '../db.js';
 import { requirePermission, requireAuth } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { translateFields } from '../services/geminiTranslator.js';
 
@@ -29,7 +30,7 @@ router.get('/', requirePermission('complaints.view'), asyncHandler(async (req, r
       JOIN persons raiser ON u.person_id = raiser.id
       LEFT JOIN users au ON c.assigned_to = au.id
       LEFT JOIN persons assignee ON au.person_id = assignee.id
-      WHERE TRUE
+      WHERE c.school_id = ${req.schoolId}
         ${status ? sql`AND c.status = ${status}` : sql``}
         ${category ? sql`AND c.category = ${category}` : sql``}
       ORDER BY c.created_at DESC
@@ -56,14 +57,15 @@ router.get('/', requirePermission('complaints.view'), asyncHandler(async (req, r
       FROM complaints c
       JOIN users u ON c.raised_by = u.id
       JOIN persons raiser ON u.person_id = raiser.id
-      WHERE (c.raised_by = ${req.user.internal_id} ${studentId ? sql`OR c.raised_for_student_id = ${studentId}` : sql``})
+      WHERE c.school_id = ${req.schoolId}
+        AND (c.raised_by = ${req.user.internal_id} ${studentId ? sql`OR c.raised_for_student_id = ${studentId}` : sql``})
         ${status ? sql`AND c.status = ${status}` : sql``}
       ORDER BY c.created_at DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
   }
 
-  res.json(complaints);
+  return sendSuccess(res, req.schoolId, complaints);
 }));
 
 /**
@@ -90,7 +92,7 @@ router.get('/:id', requirePermission('complaints.view'), asyncHandler(async (req
     LEFT JOIN persons resolver ON ru.person_id = resolver.id
     LEFT JOIN students s ON c.raised_for_student_id = s.id
     LEFT JOIN persons sp ON s.person_id = sp.id
-    WHERE c.id = ${id}
+    WHERE c.id = ${id} AND c.school_id = ${req.schoolId}
   `;
 
   if (!complaint) {
@@ -103,7 +105,7 @@ router.get('/:id', requirePermission('complaints.view'), asyncHandler(async (req
     return res.status(403).json({ error: 'Access denied' });
   }
 
-  res.json(complaint);
+  return sendSuccess(res, req.schoolId, complaint);
 }));
 
 /**
@@ -121,12 +123,13 @@ router.post('/', requirePermission('complaints.create'), asyncHandler(async (req
   const isAdmin = req.user?.roles.includes('admin');
 
   if (!isAdmin) {
-    // 1. Get the current active class section of the student
+    // 1. Get the current active class section of the student (B2: school_id scoped)
     const [enrollment] = await sql`
         SELECT cs.class_teacher_id 
         FROM student_enrollments se
-        JOIN class_sections cs ON se.class_section_id = cs.id
+        JOIN class_sections cs ON se.class_section_id = cs.id AND cs.school_id = ${req.schoolId}
         WHERE se.student_id = ${raised_for_student_id} 
+          AND se.school_id = ${req.schoolId}
           AND se.status = 'active'
           AND se.deleted_at IS NULL
         LIMIT 1
@@ -136,8 +139,8 @@ router.post('/', requirePermission('complaints.create'), asyncHandler(async (req
       return res.status(400).json({ error: 'Student is not enrolled in any active class' });
     }
 
-    // 2. Get the current user's Staff ID
-    const [staff] = await sql`SELECT id FROM staff WHERE person_id = ${req.user.person_id} LIMIT 1`;
+    // 2. Get the current user's Staff ID (B2: school_id scoped)
+    const [staff] = await sql`SELECT id FROM staff WHERE person_id = ${req.user.person_id} AND school_id = ${req.schoolId} LIMIT 1`;
 
     // 3. Verify Match
     if (!staff || enrollment.class_teacher_id !== staff.id) {
@@ -157,8 +160,8 @@ router.post('/', requirePermission('complaints.create'), asyncHandler(async (req
   }
 
   const [complaint] = await sql`
-    INSERT INTO complaints (title, title_te, description, description_te, category, priority, raised_by, raised_for_student_id)
-    VALUES (${title}, ${title_te}, ${description}, ${description_te}, ${category || 'other'}, ${priority || 'medium'}, 
+    INSERT INTO complaints (school_id, title, title_te, description, description_te, category, priority, raised_by, raised_for_student_id)
+    VALUES (${req.schoolId}, ${title}, ${title_te}, ${description}, ${description_te}, ${category || 'other'}, ${priority || 'medium'}, 
             ${req.user.internal_id}, ${raised_for_student_id})
     RETURNING *
   `;
@@ -197,19 +200,20 @@ router.post('/', requirePermission('complaints.create'), asyncHandler(async (req
     }
   })();
 
-  res.status(201).json({ message: 'Complaint submitted', complaint });
+  return sendSuccess(res, req.schoolId, { message: 'Complaint submitted', complaint }, 201);
 }));
 
 /**
  * PUT /complaints/:id
  * Update complaint (status, assignment, resolution)
  */
-router.put('/:id', asyncHandler(async (req, res) => {
+// C1 FIX: Add requireAuth middleware — this route had no auth at all
+router.put('/:id', requireAuth, asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { status, priority, assigned_to, resolution } = req.body;
 
-  // Check if user can manage or is owner
-  const [existing] = await sql`SELECT raised_by, status FROM complaints WHERE id = ${id}`;
+  // C2 FIX: Add school_id filter to complaint ownership check
+  const [existing] = await sql`SELECT raised_by, status FROM complaints WHERE id = ${id} AND school_id = ${req.schoolId}`;
   if (!existing) {
     return res.status(404).json({ error: 'Complaint not found' });
   }
@@ -247,14 +251,14 @@ router.put('/:id', asyncHandler(async (req, res) => {
   const [updated] = await sql`
     UPDATE complaints
     SET 
-      status = COALESCE(${status}, status),
-      priority = COALESCE(${priority}, priority),
-      assigned_to = COALESCE(${assigned_to}, assigned_to),
-      resolution = COALESCE(${resolution}, resolution),
+      status = COALESCE(${status ?? null}, status),
+      priority = COALESCE(${priority ?? null}, priority),
+      assigned_to = COALESCE(${assigned_to ?? null}, assigned_to),
+      resolution = COALESCE(${resolution ?? null}, resolution),
       resolution_te = ${sql_resolution_te},
-      resolved_by = COALESCE(${resolved_by}, resolved_by),
+      resolved_by = COALESCE(${resolved_by ?? null}, resolved_by),
       resolved_at = ${status === 'resolved' || status === 'closed' ? sql`NOW()` : sql`resolved_at`}
-    WHERE id = ${id}
+    WHERE id = ${id} AND school_id = ${req.schoolId}
     RETURNING *
   `;
 
@@ -290,7 +294,7 @@ router.put('/:id', asyncHandler(async (req, res) => {
     })();
   }
 
-  res.json({ message: 'Complaint updated', complaint: updated });
+  return sendSuccess(res, req.schoolId, { message: 'Complaint updated', complaint: updated });
 }));
 
 /**

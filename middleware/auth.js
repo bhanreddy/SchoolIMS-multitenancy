@@ -2,31 +2,38 @@ import { supabase, supabaseAdmin } from '../db.js';
 import sql from '../db.js';
 import { withRetry } from '../utils/retry.js';
 import { toZonedTime } from 'date-fns-tz';
+import config from '../config/env.js';
 
-// --- CONFIG CACHE FOR SCHOOL HOURS ---
-let schoolHoursCache = null;
-let schoolHoursCacheTime = 0;
+// --- CONFIG CACHE FOR SCHOOL HOURS (per-school) ---
+const schoolHoursCache = new Map(); // keyed by schoolId
 const SCHOOL_HOURS_CACHE_TTL = 60 * 1000; // 60 seconds
 
-async function getSchoolHoursConfig() {
-  if (schoolHoursCache && Date.now() - schoolHoursCacheTime < SCHOOL_HOURS_CACHE_TTL) {
-    return schoolHoursCache;
+async function getSchoolHoursConfig(schoolId) {
+  const cached = schoolHoursCache.get(schoolId);
+  if (cached && Date.now() - cached.timestamp < SCHOOL_HOURS_CACHE_TTL) {
+    return cached.data;
   }
   const rows = await sql`
         SELECT key, value FROM school_settings 
-        WHERE key IN ('school_hours_start', 'school_hours_end', 'school_timezone')
+        WHERE school_id = ${schoolId}
+          AND key IN ('school_hours_start', 'school_hours_end', 'school_timezone')
     `;
   const config = {};
   for (const row of rows) {
     config[row.key] = row.value;
   }
-  schoolHoursCache = {
+  const data = {
     school_hours_start: config.school_hours_start || '08:00',
     school_hours_end: config.school_hours_end || '17:00',
     school_timezone: config.school_timezone || 'Asia/Kolkata'
   };
-  schoolHoursCacheTime = Date.now();
-  return schoolHoursCache;
+  schoolHoursCache.set(schoolId, { data, timestamp: Date.now() });
+  // Evict stale entries if map grows too large
+  if (schoolHoursCache.size > 100) {
+    const oldest = schoolHoursCache.keys().next().value;
+    schoolHoursCache.delete(oldest);
+  }
+  return data;
 }
 
 // ── In-Memory Token Cache ──────────────────────────────────────────────
@@ -86,7 +93,7 @@ export const identifyUser = async (req, res, next) => {
         const { data, error } = await supabase.auth.getUser(token);
         if (error) throw error;
         return data;
-      }, { retries: 2, delayMs: 800 });
+      }, { retries: 3, delayMs: 1000 });
       user = result.user;
     } catch (authErr) {
       // Distinguish network failure from invalid tokeny
@@ -167,6 +174,7 @@ export const identifyUser = async (req, res, next) => {
         return await sql`
                     SELECT 
                         u.id, 
+                        u.school_id,
                         u.account_status,
                         u.person_id,
                         u.last_login_at,
@@ -178,6 +186,7 @@ export const identifyUser = async (req, res, next) => {
                     LEFT JOIN role_permissions rp ON r.id = rp.role_id
                     LEFT JOIN permissions p ON rp.permission_id = p.id
                     WHERE u.id = ${user.id}
+                    AND u.deleted_at IS NULL
                     GROUP BY u.id, u.person_id
                 `;
       }, { retries: 1, delayMs: 500 });
@@ -208,7 +217,7 @@ export const identifyUser = async (req, res, next) => {
     // FIX #2: TIME-RESTRICTED ACCESS FOR ACCOUNTS ROLE
     if (dbUser.roles && dbUser.roles.includes('accounts')) {
       // 1. Fetch school hours from DB (cache for 60s to avoid per-request DB hits)
-      const { school_hours_start, school_hours_end, school_timezone } = await getSchoolHoursConfig();
+      const { school_hours_start, school_hours_end, school_timezone } = await getSchoolHoursConfig(dbUser.school_id);
 
       // 2. Get current time in school timezone
       const now = toZonedTime(new Date(), school_timezone);
@@ -245,8 +254,9 @@ export const identifyUser = async (req, res, next) => {
           // 4. Log violation to admin_notifications
           try {
             await sql`
-                          INSERT INTO admin_notifications (type, message, user_id, ip_address)
+                          INSERT INTO admin_notifications (school_id, type, message, user_id, ip_address)
                           VALUES (
+                              ${dbUser.school_id},
                               'accounts_off_hours_access',
                               ${'Accounts user ' + dbUser.id + ' attempted access outside school hours'},
                               ${dbUser.id},
@@ -287,6 +297,7 @@ export const identifyUser = async (req, res, next) => {
     // Attach to req
     req.user = {
       ...user,
+      schoolId: dbUser.school_id,
       roles: dbUser.roles || [],
       permissions: dbUser.permissions || [],
       internal_id: dbUser.id,
@@ -299,7 +310,8 @@ export const identifyUser = async (req, res, next) => {
     next();
 
   } catch (err) {
-
+    console.error("identifyUser error:", err);
+    // Only pass through if it's not a critical error; for now, log and proceed with null user
     req.user = null;
     next();
   }

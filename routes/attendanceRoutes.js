@@ -1,6 +1,7 @@
 import express from 'express';
 import sql from '../db.js';
 import { requirePermission, requireAuth } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = express.Router();
@@ -12,7 +13,7 @@ import { sendNotificationToUsers } from '../services/notificationService.js';
  * Query params: date, class_section_id, student_id, from_date, to_date
  */
 router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, res) => {
-  const { date, class_section_id, student_id, from_date, to_date, page = 1, limit = 50 } = req.query;
+  const { date, class_section_id, student_id, from_date, to_date, lastSyncedAt, page = 1, limit = 50 } = req.query;
 
   const offset = (page - 1) * limit;
 
@@ -35,10 +36,12 @@ router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, r
         AND da.deleted_at IS NULL
       LEFT JOIN users u ON da.marked_by = u.id
       LEFT JOIN persons marker ON u.person_id = marker.id
-      WHERE se.class_section_id = ${class_section_id}
+      WHERE se.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
         AND se.status = 'active'
         AND se.deleted_at IS NULL
         AND s.deleted_at IS NULL
+        AND s.school_id = ${req.schoolId}
+        ${lastSyncedAt ? sql`AND (da.updated_at >= ${lastSyncedAt} OR da.marked_at >= ${lastSyncedAt})` : sql``}
       ORDER BY p.display_name
     `;
   } else if (student_id && from_date && to_date) {
@@ -55,6 +58,7 @@ router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, r
       WHERE se.student_id = ${student_id}
         AND da.attendance_date BETWEEN ${from_date} AND ${to_date}
         AND da.deleted_at IS NULL
+        ${lastSyncedAt ? sql`AND (da.updated_at >= ${lastSyncedAt} OR da.marked_at >= ${lastSyncedAt})` : sql``}
       ORDER BY da.attendance_date DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -75,6 +79,7 @@ router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, r
       JOIN sections sec ON cs.section_id = sec.id
       WHERE da.attendance_date = ${date}
         AND da.deleted_at IS NULL
+        AND s.school_id = ${req.schoolId}
       ORDER BY c.name, sec.name, p.display_name
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -84,7 +89,7 @@ router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, r
     });
   }
 
-  res.json(attendance);
+  return sendSuccess(res, req.schoolId, attendance);
 }));
 
 /**
@@ -106,8 +111,8 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
 
   // 1. Automatic Detection for Teachers
   if (!class_section_id && !isAdmin) {
-    const [staff] = await sql`SELECT id FROM staff WHERE person_id = ${req.user.person_id}`;
-    const [currentYear] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
+    const [staff] = await sql`SELECT id FROM staff WHERE person_id = ${req.user.person_id} AND school_id = ${req.schoolId}`;
+    const [currentYear] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date AND school_id = ${req.schoolId} LIMIT 1`;
 
     if (staff && currentYear) {
       // Try Timetable Period 1 first
@@ -117,6 +122,7 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
         WHERE teacher_id = ${staff.id} 
           AND academic_year_id = ${currentYear.id} 
           AND period_number = 1
+          AND school_id = ${req.schoolId}
         LIMIT 1
       `;
 
@@ -126,6 +132,7 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
           SELECT id FROM class_sections 
           WHERE class_teacher_id = ${staff.id} 
           AND academic_year_id = ${currentYear.id} 
+          AND school_id = ${req.schoolId}
           LIMIT 1
         `;
       }
@@ -145,11 +152,13 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
     const [isAuthorized] = await sql`
         SELECT 1 FROM class_sections cs
         WHERE cs.id = ${class_section_id}
-          AND cs.class_teacher_id = (SELECT id FROM staff WHERE person_id = ${req.user.person_id})
+          AND cs.school_id = ${req.schoolId}
+          AND cs.class_teacher_id = (SELECT id FROM staff WHERE person_id = ${req.user.person_id} AND school_id = ${req.schoolId})
         UNION ALL
         SELECT 1 FROM timetable_slots ts
-        WHERE ts.class_section_id = ${class_section_id}
-          AND ts.teacher_id = (SELECT id FROM staff WHERE person_id = ${req.user.person_id})
+        WHERE ts.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
+          AND ts.school_id = ${req.schoolId}
+          AND ts.teacher_id = (SELECT id FROM staff WHERE person_id = ${req.user.person_id} AND school_id = ${req.schoolId})
           AND ts.period_number = 1
         LIMIT 1
       `;
@@ -186,8 +195,8 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
 
       // Upsert attendance using ON CONFLICT (requires unique constraint on student_enrollment_id, attendance_date)
       const [upserted] = await sql`
-        INSERT INTO daily_attendance (student_enrollment_id, attendance_date, status, marked_by, updated_at, deleted_at)
-        VALUES (${enrollment.id}, ${date}, ${status}, ${markedBy}, NOW(), NULL)
+        INSERT INTO daily_attendance (school_id, student_enrollment_id, attendance_date, status, marked_by, updated_at, deleted_at)
+    VALUES (${req.schoolId}, ${enrollment.id}, ${date}, ${status}, ${markedBy}, NOW(), NULL)
         ON CONFLICT (student_enrollment_id, attendance_date)
         WHERE deleted_at IS NULL -- Handle partial index compatibility if unique constraint is partial
         DO UPDATE SET 
@@ -290,11 +299,11 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
     }
   })();
 
-  res.status(201).json({
+  return sendSuccess(res, req.schoolId, {
     message: 'Attendance marked successfully',
     count: results.length,
     records: results
-  });
+  }, 201);
 }));
 
 /**
@@ -303,7 +312,7 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
  */
 router.put('/:id', requirePermission('attendance.edit'), asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { status } = req.body;
+  const { status, remarks } = req.body;
 
   if (!status) {
     return res.status(400).json({ error: 'Status is required' });
@@ -314,10 +323,28 @@ router.put('/:id', requirePermission('attendance.edit'), asyncHandler(async (req
     return res.status(400).json({ error: `Status must be one of: ${validStatuses.join(', ')}` });
   }
 
+  const [attendanceCheck] = await sql`
+    SELECT id
+    FROM daily_attendance
+    WHERE id = ${id}
+      AND school_id = ${req.schoolId}
+      AND deleted_at IS NULL
+  `;
+
+  if (!attendanceCheck) {
+    return res.status(404).json({ error: 'Attendance record not found' });
+  }
+
   const [updated] = await sql`
     UPDATE daily_attendance
-    SET status = ${status}, marked_by = ${req.user?.internal_id}
-    WHERE id = ${id} AND deleted_at IS NULL
+    SET
+      status = ${status},
+      remarks = COALESCE(${remarks ?? null}, remarks),
+      marked_by = ${req.user?.internal_id},
+      updated_at = NOW()
+    WHERE id = ${id}
+      AND school_id = ${req.schoolId}
+      AND deleted_at IS NULL
     RETURNING *
   `;
 
@@ -325,7 +352,7 @@ router.put('/:id', requirePermission('attendance.edit'), asyncHandler(async (req
     return res.status(404).json({ error: 'Attendance record not found' });
   }
 
-  res.json({ message: 'Attendance updated', attendance: updated });
+  return sendSuccess(res, req.schoolId, { message: 'Attendance updated', attendance: updated });
 }));
 
 /**
@@ -357,7 +384,7 @@ router.get('/summary', requirePermission('attendance.view'), asyncHandler(async 
         ${to_date ? sql`AND da.attendance_date <= ${to_date}` : sql``}
     `;
 
-    res.json(summary[0]);
+    return sendSuccess(res, req.schoolId, summary[0]);
   } else if (class_section_id) {
     // Class attendance summary for a date range
     const summary = await sql`
@@ -369,7 +396,7 @@ router.get('/summary', requirePermission('attendance.view'), asyncHandler(async 
         COUNT(*) as total
       FROM daily_attendance da
       JOIN student_enrollments se ON da.student_enrollment_id = se.id
-      WHERE se.class_section_id = ${class_section_id}
+      WHERE se.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
         AND da.deleted_at IS NULL
         ${from_date ? sql`AND da.attendance_date >= ${from_date}` : sql``}
         ${to_date ? sql`AND da.attendance_date <= ${to_date}` : sql``}
@@ -377,7 +404,7 @@ router.get('/summary', requirePermission('attendance.view'), asyncHandler(async 
       ORDER BY da.attendance_date DESC
     `;
 
-    res.json(summary);
+    return sendSuccess(res, req.schoolId, summary);
   } else {
     return res.status(400).json({
       error: 'Please provide student_id or class_section_id'
@@ -391,13 +418,13 @@ router.get('/summary', requirePermission('attendance.view'), asyncHandler(async 
  */
 router.get('/my-class', requireAuth, asyncHandler(async (req, res) => {
   // 1. Get staff profile for current user
-  const [staff] = await sql`SELECT id FROM staff WHERE person_id = ${req.user.person_id}`;
+  const [staff] = await sql`SELECT id FROM staff WHERE person_id = ${req.user.person_id} AND school_id = ${req.schoolId}`;
   if (!staff) {
     return res.status(404).json({ error: 'Staff profile not found' });
   }
 
   // 2. Get current academic year
-  const [currentYear] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
+  const [currentYear] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date AND school_id = ${req.schoolId} LIMIT 1`;
   if (!currentYear) {
     return res.status(404).json({ error: 'No active academic year found' });
   }
@@ -411,6 +438,7 @@ router.get('/my-class', requireAuth, asyncHandler(async (req, res) => {
     WHERE teacher_id = ${staff.id} 
       AND academic_year_id = ${currentYear.id} 
       AND period_number = 1
+      AND school_id = ${req.schoolId}
     LIMIT 1
   `;
 
@@ -420,6 +448,7 @@ router.get('/my-class', requireAuth, asyncHandler(async (req, res) => {
       FROM class_sections 
       WHERE class_teacher_id = ${staff.id} 
       AND academic_year_id = ${currentYear.id} 
+      AND school_id = ${req.schoolId}
       LIMIT 1
     `;
   }
@@ -444,7 +473,8 @@ router.get('/my-class', requireAuth, asyncHandler(async (req, res) => {
     LEFT JOIN daily_attendance da ON da.student_enrollment_id = se.id 
       AND da.attendance_date = ${date}
       AND da.deleted_at IS NULL
-    WHERE se.class_section_id = ${classSection.id}
+    WHERE se.class_section_id = ${classSection.id} AND school_id = ${req.schoolId}
+      AND se.school_id = ${req.schoolId}
       AND se.status = 'active'
       AND se.deleted_at IS NULL
       AND s.deleted_at IS NULL
@@ -456,10 +486,10 @@ router.get('/my-class', requireAuth, asyncHandler(async (req, res) => {
     FROM class_sections cs
     JOIN classes c ON cs.class_id = c.id
     JOIN sections s ON cs.section_id = s.id
-    WHERE cs.id = ${classSection.id}
+    WHERE cs.id = ${classSection.id} AND cs.school_id = ${req.schoolId}
   `;
 
-  res.json({
+  return sendSuccess(res, req.schoolId, {
     date,
     class_section_id: classSection.id,
     class_name: classInfo?.class_name,
@@ -483,8 +513,8 @@ router.get('/class/:classSectionId', requirePermission('attendance.view'), async
     const isAdmin = req.user?.roles.includes('admin');
     if (!isAdmin) {
       // Auto-detect for teacher
-      const [staff] = await sql`SELECT id FROM staff WHERE person_id = ${req.user.person_id}`;
-      const [currentYear] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
+      const [staff] = await sql`SELECT id FROM staff WHERE person_id = ${req.user.person_id} AND school_id = ${req.schoolId}`;
+      const [currentYear] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date AND school_id = ${req.schoolId} LIMIT 1`;
 
       if (staff && currentYear) {
         // Priority 1: Timetable Period 1
@@ -529,7 +559,8 @@ router.get('/class/:classSectionId', requirePermission('attendance.view'), async
     LEFT JOIN daily_attendance da ON da.student_enrollment_id = se.id 
       AND da.attendance_date = ${date}
       AND da.deleted_at IS NULL
-    WHERE se.class_section_id = ${classSectionId}
+    WHERE se.class_section_id = ${classSectionId} AND school_id = ${req.schoolId}
+      AND se.school_id = ${req.schoolId}
       AND se.status = 'active'
       AND se.deleted_at IS NULL
       AND s.deleted_at IS NULL
@@ -542,10 +573,10 @@ router.get('/class/:classSectionId', requirePermission('attendance.view'), async
     FROM class_sections cs
     JOIN classes c ON cs.class_id = c.id
     JOIN sections s ON cs.section_id = s.id
-    WHERE cs.id = ${classSectionId}
+    WHERE cs.id = ${classSectionId} AND cs.school_id = ${req.schoolId}
   `;
 
-  res.json({
+  return sendSuccess(res, req.schoolId, {
     date,
     class_section_id: classSectionId,
     class_name: classInfo?.class_name,
@@ -581,11 +612,12 @@ router.get('/staff', requirePermission('attendance.view'), asyncHandler(async (r
             AND sa.attendance_date = ${date}
             AND sa.deleted_at IS NULL
         WHERE s.deleted_at IS NULL
+          AND s.school_id = ${req.schoolId}
           AND s.status_id = 1 -- Only active staff
         ORDER BY p.display_name
     `;
 
-  res.json(attendance);
+  return sendSuccess(res, req.schoolId, attendance);
 }));
 
 /**
@@ -603,6 +635,29 @@ router.post('/staff', requirePermission('attendance.mark'), asyncHandler(async (
   }
 
   const markedBy = req.user?.internal_id || null;
+  const staffIds = attendance
+    .filter((record) => record?.staff_id && record?.status)
+    .map((record) => record.staff_id);
+
+  if (staffIds.length === 0) {
+    return res.status(400).json({ error: 'No valid staff attendance records provided' });
+  }
+
+  const validStaff = await sql`
+    SELECT id
+    FROM staff
+    WHERE id IN ${sql(staffIds)}
+      AND school_id = ${req.schoolId}
+      AND deleted_at IS NULL
+  `;
+
+  if (validStaff.length !== staffIds.length) {
+    return res.status(400).json({
+      error: 'One or more staff IDs not found in this school',
+      expected: staffIds.length,
+      found: validStaff.length
+    });
+  }
 
   // Process attendance
   const results = await sql.begin(async (sql) => {
@@ -614,10 +669,11 @@ router.post('/staff', requirePermission('attendance.mark'), asyncHandler(async (
       if (!staff_id || !status) continue;
 
       const [result] = await sql`
-                INSERT INTO staff_attendance (staff_id, attendance_date, status, marked_by)
-                VALUES (${staff_id}, ${date}, ${status}, ${markedBy})
+            INSERT INTO staff_attendance (school_id, staff_id, attendance_date, status, marked_by)
+            VALUES (${req.schoolId}, ${staff_id}, ${date}, ${status}, ${markedBy})
                 ON CONFLICT (staff_id, attendance_date)
                 DO UPDATE SET 
+              school_id = EXCLUDED.school_id,
                     status = EXCLUDED.status,
                     marked_by = EXCLUDED.marked_by,
                     updated_at = NOW(),
@@ -630,11 +686,41 @@ router.post('/staff', requirePermission('attendance.mark'), asyncHandler(async (
     return inserted;
   });
 
-  res.status(201).json({
+  return sendSuccess(res, req.schoolId, {
     message: 'Staff attendance marked successfully',
     count: results.length,
     records: results
-  });
+  }, 201);
+}));
+
+
+/**
+ * GET /attendance/staff/me
+ * Get current staff member's attendance history
+ * Query params: from_date, to_date
+ */
+router.get('/staff/me', requireAuth, asyncHandler(async (req, res) => {
+  // 1. Identify staff based on person_id from auth token
+  const [staff] = await sql`SELECT id FROM staff WHERE person_id = ${req.user.person_id} AND school_id = ${req.schoolId}`;
+  if (!staff) {
+    return res.status(404).json({ error: 'Staff profile not found' });
+  }
+
+  const { from_date, to_date } = req.query;
+
+  // 2. Fetch history
+  const history = await sql`
+    SELECT 
+      sa.id, sa.attendance_date, sa.status, sa.marked_at
+    FROM staff_attendance sa
+    WHERE sa.staff_id = ${staff.id}
+      AND sa.deleted_at IS NULL
+      ${from_date ? sql`AND sa.attendance_date >= ${from_date}` : sql``}
+      ${to_date ? sql`AND sa.attendance_date <= ${to_date}` : sql``}
+    ORDER BY sa.attendance_date DESC
+  `;
+
+  return sendSuccess(res, req.schoolId, history);
 }));
 
 export default router;

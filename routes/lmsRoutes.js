@@ -1,19 +1,30 @@
 import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
 
 const router = express.Router();
 
+// Helper to get staff ID from user's internal_id
+async function getStaffId(internalId) {
+  const [res] = await sql`
+    SELECT s.id FROM staff s
+    JOIN users u ON s.person_id = u.person_id
+    WHERE u.id = ${internalId}
+  `;
+  return res?.id;
+}
+
 // ============== COURSES ==============
 
 /**
  * GET /lms/all-materials
- * Get a flat feed of all materials (filtered by student's class if needed, here getting all public/latest)
+ * LM4: Scoped to school_id
  */
 router.get('/all-materials', requirePermission('lms.view'), asyncHandler(async (req, res) => {
-  // Try to determine the user's class if they are a student
+  const schoolId = req.schoolId;
   let studentClassId = null;
 
   if (req.user?.roles.includes('student')) {
@@ -25,13 +36,14 @@ router.get('/all-materials', requirePermission('lms.view'), asyncHandler(async (
       JOIN class_sections cs ON se.class_section_id = cs.id
       WHERE u.id = ${req.user.internal_id}
         AND se.status = 'active'
+        AND s.school_id = ${schoolId}
       LIMIT 1
     `;
     studentClassId = enrollment?.class_id || null;
   }
 
   const materials = await sql`
-    SELECT 
+    SELECT
       m.id, m.title, m.description, m.content_url, m.duration, m.material_type, m.created_at,
       c.title as course_title,
       cl.name as class_name,
@@ -41,24 +53,26 @@ router.get('/all-materials', requirePermission('lms.view'), asyncHandler(async (
     LEFT JOIN classes cl ON c.class_id = cl.id
     LEFT JOIN staff st ON c.instructor_id = st.id
     LEFT JOIN persons instructor ON st.person_id = instructor.id
-    WHERE m.is_published = true 
+    WHERE m.is_published = true
       AND c.is_published = true
+      AND c.school_id = ${schoolId}
       ${studentClassId ? sql`AND c.class_id = ${studentClassId}` : sql``}
     ORDER BY m.created_at DESC
     LIMIT 100
   `;
-  res.json(materials);
+  return sendSuccess(res, req.schoolId, materials);
 }));
 
 /**
  * GET /lms/courses
- * List courses (filter by subject, class, instructor)
+ * LM1: Scoped to school_id
  */
 router.get('/courses', requirePermission('lms.view'), asyncHandler(async (req, res) => {
   const { subject_id, class_id, instructor_id, published_only } = req.query;
+  const schoolId = req.schoolId;
 
   const courses = await sql`
-    SELECT 
+    SELECT
       c.id, c.title, c.description, c.is_published, c.created_at,
       s.name as subject_name,
       cl.name as class_name,
@@ -70,7 +84,7 @@ router.get('/courses', requirePermission('lms.view'), asyncHandler(async (req, r
     LEFT JOIN staff st ON c.instructor_id = st.id
     LEFT JOIN persons instructor ON st.person_id = instructor.id
     LEFT JOIN lms_materials m ON c.id = m.course_id
-    WHERE TRUE
+    WHERE c.school_id = ${schoolId}
       ${subject_id ? sql`AND c.subject_id = ${subject_id}` : sql``}
       ${class_id ? sql`AND c.class_id = ${class_id}` : sql``}
       ${instructor_id ? sql`AND c.instructor_id = ${instructor_id}` : sql``}
@@ -79,19 +93,20 @@ router.get('/courses', requirePermission('lms.view'), asyncHandler(async (req, r
     ORDER BY c.created_at DESC
   `;
 
-  res.json(courses);
+  return sendSuccess(res, req.schoolId, courses);
 }));
 
 /**
  * GET /lms/courses/:id
- * Get course with materials
+ * LM1: Ownership check via school_id
  */
 router.get('/courses/:id', requirePermission('lms.view'), asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const schoolId = req.schoolId;
 
   const [course] = await sql`
-    SELECT 
-      c.*, 
+    SELECT
+      c.*,
       s.name as subject_name,
       cl.name as class_name,
       instructor.display_name as instructor_name
@@ -101,6 +116,7 @@ router.get('/courses/:id', requirePermission('lms.view'), asyncHandler(async (re
     LEFT JOIN staff st ON c.instructor_id = st.id
     LEFT JOIN persons instructor ON st.person_id = instructor.id
     WHERE c.id = ${id}
+      AND c.school_id = ${schoolId}
   `;
 
   if (!course) {
@@ -114,71 +130,76 @@ router.get('/courses/:id', requirePermission('lms.view'), asyncHandler(async (re
     ORDER BY sort_order
   `;
 
-  res.json({ ...course, materials });
+  return sendSuccess(res, req.schoolId, { ...course, materials });
 }));
 
 /**
  * POST /lms/courses
- * Create a course
+ * LM2: school_id included in INSERT
  */
 router.post('/courses', requirePermission('lms.create'), asyncHandler(async (req, res) => {
   const { title, description, subject_id, class_id, is_published } = req.body;
+  const schoolId = req.schoolId;
 
   if (!title) {
     return res.status(400).json({ error: 'Course title is required' });
   }
 
-  // Get instructor from current user's staff record
   const [staff] = await sql`
     SELECT s.id FROM staff s
     JOIN users u ON s.person_id = u.person_id
     WHERE u.id = ${req.user?.internal_id}
+      AND s.school_id = ${schoolId}
   `;
 
   if (!staff) return res.status(403).json({ error: 'User is not a staff member' });
 
-  // Authorization: Verify Teacher is assigned to this Subject in this Class (any section)
-  // unless Admin
   const isAdmin = req.user?.roles.includes('admin');
   if (!isAdmin) {
     const [assignment] = await sql`
-        SELECT 1 
-        FROM class_subjects cs
-        JOIN class_sections sec ON cs.class_section_id = sec.id
-        WHERE sec.class_id = ${class_id}
-          AND cs.subject_id = ${subject_id}
-          AND cs.teacher_id = ${staff.id}
-        LIMIT 1
-      `;
+      SELECT 1
+      FROM class_subjects cs
+      JOIN class_sections sec ON cs.class_section_id = sec.id
+      WHERE sec.class_id = ${class_id}
+        AND cs.subject_id = ${subject_id}
+        AND cs.teacher_id = ${staff.id}
+        AND sec.school_id = ${schoolId}
+      LIMIT 1
+    `;
 
     if (!assignment) {
       return res.status(403).json({ error: 'You are not assigned to teach this subject in this class' });
     }
   }
 
+  // LM2: school_id in INSERT
   const [course] = await sql`
-    INSERT INTO lms_courses (title, description, subject_id, class_id, instructor_id, is_published)
-    VALUES (${title}, ${description}, ${subject_id}, ${class_id}, ${staff?.id}, ${is_published || false})
+    INSERT INTO lms_courses (school_id, title, description, subject_id, class_id, instructor_id, is_published)
+    VALUES (${schoolId}, ${title}, ${description}, ${subject_id}, ${class_id}, ${staff?.id}, ${is_published || false})
     RETURNING *
   `;
 
-  res.status(201).json({ message: 'Course created', course });
+  return sendSuccess(res, req.schoolId, { message: 'Course created', course }, 201);
 }));
 
 /**
  * PUT /lms/courses/:id
- * Update course
+ * LM3: school_id ownership check added
  */
-router.put('/:id', requirePermission('lms.create'), asyncHandler(async (req, res) => {
+router.put('/courses/:id', requirePermission('lms.create'), asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { title, description, subject_id, class_id, is_published } = req.body;
+  const schoolId = req.schoolId;
 
-  const [course] = await sql`SELECT instructor_id FROM lms_courses WHERE id = ${id}`;
+  // LM3: Ownership check must include school_id
+  const [course] = await sql`
+    SELECT instructor_id FROM lms_courses WHERE id = ${id} AND school_id = ${schoolId}
+  `;
   if (!course) return res.status(404).json({ error: 'Course not found' });
 
-  // Authorization: Owner or Admin
   const isAdmin = req.user?.roles.includes('admin');
-  const isOwner = course.instructor_id === (await getStaffId(req.user.internal_id));
+  const staffId = await getStaffId(req.user.internal_id);
+  const isOwner = course.instructor_id === staffId;
 
   if (!isAdmin && !isOwner) {
     return res.status(403).json({ error: 'Only the instructor or admin can edit this course' });
@@ -186,14 +207,15 @@ router.put('/:id', requirePermission('lms.create'), asyncHandler(async (req, res
 
   const [updated] = await sql`
     UPDATE lms_courses
-    SET 
-      title = COALESCE(${title}, title),
-      description = COALESCE(${description}, description),
-      subject_id = COALESCE(${subject_id}, subject_id),
-      class_id = COALESCE(${class_id}, class_id),
-      is_published = COALESCE(${is_published}, is_published),
+    SET
+      title = COALESCE(${title ?? null}, title),
+      description = COALESCE(${description ?? null}, description),
+      subject_id = COALESCE(${subject_id ?? null}, subject_id),
+      class_id = COALESCE(${class_id ?? null}, class_id),
+      is_published = COALESCE(${is_published ?? null}, is_published),
       updated_at = NOW()
     WHERE id = ${id}
+      AND school_id = ${req.schoolId}
     RETURNING *
   `;
 
@@ -201,18 +223,18 @@ router.put('/:id', requirePermission('lms.create'), asyncHandler(async (req, res
     return res.status(404).json({ error: 'Course not found' });
   }
 
-  res.json({ message: 'Course updated', course: updated });
+  return sendSuccess(res, req.schoolId, { message: 'Course updated', course: updated });
 }));
 
 // ============== MATERIALS ==============
 
 /**
- * POST /lms/courses/:id/materials
- * Add material to course
+ * POST /lms/courses/:id/materials — Add material to course
  */
 router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { title, description, material_type, content_url, file_size, duration, sort_order, is_published } = req.body;
+  const schoolId = req.schoolId;
 
   if (!title || !material_type) {
     return res.status(400).json({ error: 'title and material_type are required' });
@@ -223,33 +245,30 @@ router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHand
     return res.status(400).json({ error: `material_type must be one of: ${validTypes.join(', ')}` });
   }
 
-  /*
-   * Handle optional parameters to prevent UNDEFINED_VALUE errors
-   * The postgres driver throws if direct parameters are undefined.
-   */
+  // Ownership check: course must belong to this school
+  const [courseCheck] = await sql`SELECT id FROM lms_courses WHERE id = ${id} AND school_id = ${schoolId}`;
+  if (!courseCheck) return res.status(404).json({ error: 'Course not found' });
+
   const safeTitle = title || '';
   const safeDescription = description || '';
   const safeContentUrl = content_url || '';
-  const safeFileSize = file_size ?? null; // Default to null if undefined
-  const safeDuration = duration ?? null; // Default to null if undefined
-  const safeIsPublished = is_published === true; // Default to false if undefined or not true
+  const safeFileSize = file_size ?? null;
+  const safeDuration = duration ?? null;
+  const safeIsPublished = is_published === true;
 
   const [material] = await sql`
-    INSERT INTO lms_materials (course_id, title, description, material_type, content_url, file_size, duration, sort_order, is_published)
-    VALUES (${id}, ${safeTitle}, ${safeDescription}, ${material_type}, ${safeContentUrl}, ${safeFileSize}, ${safeDuration}, ${sort_order || 0}, ${safeIsPublished})
+    INSERT INTO lms_materials (school_id, course_id, title, description, material_type, content_url, file_size, duration, sort_order, is_published)
+    VALUES (${req.schoolId}, ${id}, ${safeTitle}, ${safeDescription}, ${material_type}, ${safeContentUrl}, ${safeFileSize}, ${safeDuration}, ${sort_order || 0}, ${safeIsPublished})
     RETURNING *
   `;
 
-  // Notification Logic (Async)
+  // Notification — scoped to school
   (async () => {
     try {
-      // Only notify if published
       if (!safeIsPublished) return;
 
-      // Fetch Course Class ID
       const [courseInfo] = await sql`SELECT class_id FROM lms_courses WHERE id = ${id}`;
       const targetClassId = courseInfo?.class_id;
-
       if (!targetClassId) return;
 
       const recipients = await sql`
@@ -261,6 +280,7 @@ router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHand
         WHERE cs.class_id = ${targetClassId}
           AND se.status = 'active'
           AND u.account_status = 'active'
+          AND s.school_id = ${schoolId}
 
         UNION
 
@@ -274,44 +294,42 @@ router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHand
         WHERE cs.class_id = ${targetClassId}
           AND se.status = 'active'
           AND u.account_status = 'active'
+          AND s.school_id = ${schoolId}
       `;
 
       if (recipients.length > 0) {
         const userIds = recipients.map((r) => r.id);
-        await sendNotificationToUsers(
-          userIds,
-          'LMS_CONTENT',
-          { message: `New study material uploaded: ${safeTitle}` }
-        );
+        await sendNotificationToUsers(userIds, 'LMS_CONTENT', { message: `New study material uploaded: ${safeTitle}` });
       }
-    } catch (notifyErr) {
-
-    }
+    } catch (notifyErr) {}
   })();
 
-  res.status(201).json({ message: 'Material added', material });
+  return sendSuccess(res, req.schoolId, { message: 'Material added', material }, 201);
 }));
 
 /**
  * PUT /lms/materials/:id
- * Update material
+ * LM3: school_id ownership check added
  */
 router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { title, description, content_url, file_size, duration, sort_order, is_published } = req.body;
+  const schoolId = req.schoolId;
 
-  // Authorization: Check Course Owner
+  // LM3: Ownership check includes school_id scope
   const [material] = await sql`
-    SELECT c.instructor_id 
+    SELECT c.instructor_id
     FROM lms_materials m
     JOIN lms_courses c ON m.course_id = c.id
     WHERE m.id = ${id}
+      AND c.school_id = ${schoolId}
   `;
 
   if (!material) return res.status(404).json({ error: 'Material not found' });
 
   const isAdmin = req.user?.roles.includes('admin');
-  const isOwner = material.instructor_id === (await getStaffId(req.user.internal_id));
+  const staffId = await getStaffId(req.user.internal_id);
+  const isOwner = material.instructor_id === staffId;
 
   if (!isAdmin && !isOwner) {
     return res.status(403).json({ error: 'Only the course instructor or admin can edit this material' });
@@ -319,33 +337,31 @@ router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async
 
   const [updated] = await sql`
     UPDATE lms_materials
-    SET 
-      title = COALESCE(${title}, title),
-      description = COALESCE(${description}, description),
-      content_url = COALESCE(${content_url}, content_url),
-      file_size = COALESCE(${file_size}, file_size),
-      duration = COALESCE(${duration}, duration),
-      sort_order = COALESCE(${sort_order}, sort_order),
-      is_published = COALESCE(${is_published}, is_published)
+    SET
+      title = COALESCE(${title ?? null}, title),
+      description = COALESCE(${description ?? null}, description),
+      content_url = COALESCE(${content_url ?? null}, content_url),
+      file_size = COALESCE(${file_size ?? null}, file_size),
+      duration = COALESCE(${duration ?? null}, duration),
+      sort_order = COALESCE(${sort_order ?? null}, sort_order),
+      is_published = COALESCE(${is_published ?? null}, is_published)
     WHERE id = ${id}
+      AND school_id = ${req.schoolId}
     RETURNING *
   `;
 
-  // Notification Logic (Async)
+  // Notification — scoped to school
   (async () => {
     try {
-      // Only notify if published
       if (!updated?.is_published) return;
 
-      // Fetch Course Class ID
       const [courseInfo] = await sql`
-        SELECT c.class_id, c.title as course_title 
+        SELECT c.class_id, c.title as course_title
         FROM lms_materials m
         JOIN lms_courses c ON m.course_id = c.id
         WHERE m.id = ${id}
       `;
       const targetClassId = courseInfo?.class_id;
-
       if (!targetClassId) return;
 
       const recipients = await sql`
@@ -357,6 +373,7 @@ router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async
         WHERE cs.class_id = ${targetClassId}
           AND se.status = 'active'
           AND u.account_status = 'active'
+          AND s.school_id = ${schoolId}
 
         UNION
 
@@ -370,61 +387,49 @@ router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async
         WHERE cs.class_id = ${targetClassId}
           AND se.status = 'active'
           AND u.account_status = 'active'
+          AND s.school_id = ${schoolId}
       `;
 
       if (recipients.length > 0) {
         const userIds = recipients.map((r) => r.id);
-        await sendNotificationToUsers(
-          userIds,
-          'LMS_CONTENT',
-          { message: `Study material updated: ${updated.title || 'In Course: ' + courseInfo.course_title}` }
-        );
+        await sendNotificationToUsers(userIds, 'LMS_CONTENT', { message: `Study material updated: ${updated.title || 'In Course: ' + courseInfo.course_title}` });
       }
-    } catch (notifyErr) {
-
-    }
+    } catch (notifyErr) {}
   })();
 
-  res.json({ message: 'Material updated', material: updated });
+  return sendSuccess(res, req.schoolId, { message: 'Material updated', material: updated });
 }));
 
 /**
  * DELETE /lms/materials/:id
- * Delete material
+ * LM3: school_id ownership check added
  */
 router.delete('/materials/:id', requirePermission('lms.create'), asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const schoolId = req.schoolId;
 
-  // Authorization: Check Course Owner
+  // LM3: Ownership check with school_id scope
   const [material] = await sql`
-    SELECT c.instructor_id 
+    SELECT c.instructor_id
     FROM lms_materials m
     JOIN lms_courses c ON m.course_id = c.id
     WHERE m.id = ${id}
+      AND c.school_id = ${schoolId}
   `;
 
   if (!material) return res.status(404).json({ error: 'Material not found' });
 
   const isAdmin = req.user?.roles.includes('admin');
-  const isOwner = material.instructor_id === (await getStaffId(req.user.internal_id));
+  const staffId = await getStaffId(req.user.internal_id);
+  const isOwner = material.instructor_id === staffId;
 
   if (!isAdmin && !isOwner) {
     return res.status(403).json({ error: 'Only the course instructor or admin can delete this material' });
   }
 
-  await sql`DELETE FROM lms_materials WHERE id = ${id}`;
+  await sql`DELETE FROM lms_materials WHERE id = ${id} AND school_id = ${req.schoolId}`;
 
-  res.json({ message: 'Material deleted' });
+  return sendSuccess(res, req.schoolId, { message: 'Material deleted' });
 }));
-
-// Helper to get staff ID from internal user ID
-async function getStaffId(internalId) {
-  const [res] = await sql`
-    SELECT s.id FROM staff s
-    JOIN users u ON s.person_id = u.person_id
-    WHERE u.id = ${internalId}
-  `;
-  return res?.id;
-}
 
 export default router;

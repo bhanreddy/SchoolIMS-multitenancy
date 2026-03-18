@@ -1,6 +1,7 @@
 import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
 
@@ -16,9 +17,40 @@ router.get('/types', requirePermission('fees.view'), asyncHandler(async (req, re
   const types = await sql`
     SELECT id, name, code, description, is_recurring, is_optional
     FROM fee_types
+    WHERE school_id = ${req.schoolId}
     ORDER BY name
   `;
-  res.json(types);
+  return sendSuccess(res, req.schoolId, types);
+}));
+
+/**
+ * POST /fees/types
+ * Create a new fee type
+ */
+router.post('/types', requirePermission('fees.manage'), asyncHandler(async (req, res) => {
+  const { name, code, description, is_recurring, is_optional } = req.body;
+
+  if (!name) {
+    return res.status(400).json({ error: 'name is required' });
+  }
+
+  // Check uniqueness within this school
+  const [existing] = await sql`
+    SELECT id FROM fee_types WHERE LOWER(name) = ${name.toLowerCase()} AND school_id = ${req.schoolId}
+  `;
+  if (existing) {
+    return res.status(409).json({ error: `Fee type "${name}" already exists` });
+  }
+
+  const feeCode = code || name.toUpperCase().replace(/\s+/g, '_').slice(0, 20);
+
+  const [feeType] = await sql`
+    INSERT INTO fee_types (school_id, name, code, description, is_recurring, is_optional)
+    VALUES (${req.schoolId}, ${name}, ${feeCode}, ${description || null}, ${is_recurring || false}, ${is_optional || false})
+    RETURNING id, name, code, description, is_recurring, is_optional
+  `;
+
+  return sendSuccess(res, req.schoolId, feeType, 201);
 }));
 
 // ============== FEE STRUCTURE ==============
@@ -42,6 +74,7 @@ router.get('/structure', requirePermission('fees.view'), asyncHandler(async (req
       JOIN classes c ON fs.class_id = c.id
       JOIN academic_years ay ON fs.academic_year_id = ay.id
       WHERE fs.class_id = ${class_id} AND fs.academic_year_id = ${academic_year_id}
+        AND fs.school_id = ${req.schoolId}
       ORDER BY ft.name
     `;
   } else if (academic_year_id) {
@@ -54,11 +87,13 @@ router.get('/structure', requirePermission('fees.view'), asyncHandler(async (req
       JOIN fee_types ft ON fs.fee_type_id = ft.id
       JOIN classes c ON fs.class_id = c.id
       WHERE fs.academic_year_id = ${academic_year_id}
+        AND fs.school_id = ${req.schoolId}
       ORDER BY c.name, ft.name
     `;
   } else {
+    // F1 FIX: Add school_id filter to unfiltered fee structure query
     structures = await sql`
-      SELECT 
+      SELECT
         fs.id, fs.amount, fs.due_date, fs.frequency,
         ft.name as fee_type, c.name as class_name,
         ay.code as academic_year
@@ -66,12 +101,13 @@ router.get('/structure', requirePermission('fees.view'), asyncHandler(async (req
       JOIN fee_types ft ON fs.fee_type_id = ft.id
       JOIN classes c ON fs.class_id = c.id
       JOIN academic_years ay ON fs.academic_year_id = ay.id
+      WHERE fs.school_id = ${req.schoolId}
       ORDER BY ay.start_date DESC, c.name, ft.name
       LIMIT 100
     `;
   }
 
-  res.json(structures);
+  return sendSuccess(res, req.schoolId, structures);
 }));
 
 /**
@@ -91,12 +127,12 @@ router.post('/structure', requirePermission('fees.manage'), asyncHandler(async (
   }
 
   const [structure] = await sql`
-    INSERT INTO fee_structures (academic_year_id, class_id, fee_type_id, amount, due_date, frequency)
-    VALUES (${academic_year_id}, ${class_id}, ${fee_type_id}, ${amount}, ${due_date}, ${frequency || 'monthly'})
+    INSERT INTO fee_structures (school_id, academic_year_id, class_id, fee_type_id, amount, due_date, frequency)
+    VALUES (${req.schoolId}, ${academic_year_id}, ${class_id}, ${fee_type_id}, ${amount}, ${due_date}, ${frequency || 'monthly'})
     RETURNING *
   `;
 
-  res.status(201).json({ message: 'Fee structure created', structure });
+  return sendSuccess(res, req.schoolId, { message: 'Fee structure created', structure }, 201);
 }));
 
 /**
@@ -107,13 +143,19 @@ router.put('/structure/:id', requirePermission('fees.manage'), asyncHandler(asyn
   const { id } = req.params;
   const { amount, due_date, frequency } = req.body;
 
+  // F2 FIX: Ownership check first
+  const [existing] = await sql`SELECT id FROM fee_structures WHERE id = ${id} AND school_id = ${req.schoolId}`;
+  if (!existing) {
+    return res.status(404).json({ error: 'Fee structure not found' });
+  }
+
   const [updated] = await sql`
     UPDATE fee_structures
-    SET 
-      amount = COALESCE(${amount}, amount),
-      due_date = COALESCE(${due_date}, due_date),
-      frequency = COALESCE(${frequency}, frequency)
-    WHERE id = ${id}
+    SET
+      amount = COALESCE(${amount ?? null}, amount),
+      due_date = COALESCE(${due_date ?? null}, due_date),
+      frequency = COALESCE(${frequency ?? null}, frequency)
+    WHERE id = ${id} AND school_id = ${req.schoolId}
     RETURNING *
   `;
 
@@ -121,7 +163,7 @@ router.put('/structure/:id', requirePermission('fees.manage'), asyncHandler(asyn
     return res.status(404).json({ error: 'Fee structure not found' });
   }
 
-  res.json({ message: 'Fee structure updated', structure: updated });
+  return sendSuccess(res, req.schoolId, { message: 'Fee structure updated', structure: updated });
 }));
 
 // ============== STUDENT FEES ==============
@@ -132,14 +174,14 @@ router.put('/structure/:id', requirePermission('fees.manage'), asyncHandler(asyn
  */
 router.get('/students/:studentId', requirePermission('fees.view'), asyncHandler(async (req, res) => {
   const { studentId } = req.params;
-  const { academic_year_id } = req.query;
+  const { academic_year_id, lastSyncedAt } = req.query;
 
   // Get student info
   const [student] = await sql`
     SELECT s.id, s.admission_no, p.display_name
     FROM students s
     JOIN persons p ON s.person_id = p.id
-    WHERE s.id = ${studentId} AND s.deleted_at IS NULL
+    WHERE s.id = ${studentId} AND s.deleted_at IS NULL AND s.school_id = ${req.schoolId}
   `;
 
   if (!student) {
@@ -159,6 +201,7 @@ router.get('/students/:studentId', requirePermission('fees.view'), asyncHandler(
       JOIN fee_types ft ON fs.fee_type_id = ft.id
       WHERE sf.student_id = ${studentId}
         AND fs.academic_year_id = ${academic_year_id}
+        ${lastSyncedAt ? sql`AND (sf.updated_at >= ${lastSyncedAt} OR sf.created_at >= ${lastSyncedAt})` : sql``}
       ORDER BY sf.due_date DESC
     `;
   } else {
@@ -172,6 +215,7 @@ router.get('/students/:studentId', requirePermission('fees.view'), asyncHandler(
       JOIN fee_types ft ON fs.fee_type_id = ft.id
       JOIN academic_years ay ON fs.academic_year_id = ay.id
       WHERE sf.student_id = ${studentId}
+        ${lastSyncedAt ? sql`AND (sf.updated_at >= ${lastSyncedAt} OR sf.created_at >= ${lastSyncedAt})` : sql``}
       ORDER BY sf.due_date DESC
       LIMIT 50
     `;
@@ -188,7 +232,7 @@ router.get('/students/:studentId', requirePermission('fees.view'), asyncHandler(
       AND deleted_at IS NULL
   `;
 
-  res.json({
+  return sendSuccess(res, req.schoolId, {
     student,
     summary: summary[0],
     fees
@@ -222,9 +266,10 @@ router.post('/collect', requirePermission('fees.collect'), asyncHandler(async (r
       payment_method,
       transaction_ref,
       remarks,
-      user: req.user
+      user: req.user,
+      schoolId: req.schoolId
     });
-    res.status(201).json({ message: 'Payment collected successfully', transaction });
+    return sendSuccess(res, req.schoolId, { message: 'Payment collected successfully', transaction }, 201);
   } catch (error) {
     if (error.status) {
       return res.status(error.status).json({ error: error.message });
@@ -258,9 +303,10 @@ router.post('/transactions', requirePermission('fees.collect'), asyncHandler(asy
       payment_method,
       transaction_ref,
       remarks,
-      user: req.user
+      user: req.user,
+      schoolId: req.schoolId
     });
-    res.status(201).json({ message: 'Transaction recorded', transaction });
+    return sendSuccess(res, req.schoolId, { message: 'Transaction recorded', transaction }, 201);
   } catch (error) {
     if (error.status) {
       return res.status(error.status).json({ error: error.message });
@@ -274,7 +320,7 @@ router.post('/transactions', requirePermission('fees.collect'), asyncHandler(asy
 /**
  * Shared helper to process fee transactions
  */
-async function processFeeTransaction({ student_fee_id, amount, payment_method, transaction_ref, remarks, user }) {
+async function processFeeTransaction({ student_fee_id, amount, payment_method, transaction_ref, remarks, user, schoolId }) {
   // Validate Amount
   const parsedAmount = Number(amount);
   if (isNaN(parsedAmount) || parsedAmount <= 0) {
@@ -304,12 +350,13 @@ async function processFeeTransaction({ student_fee_id, amount, payment_method, t
       }
     }
 
-    // Check if fee exists and get necessary fields for validation
+    // F3 FIX: Add school_id filter to student_fees SELECT
     // LOCK the row to prevent concurrent updates
     const [fee] = await tx`
       SELECT id, amount_due, amount_paid, discount, student_id
-      FROM student_fees 
+      FROM student_fees
       WHERE id = ${student_fee_id}
+        AND school_id = ${schoolId}
       FOR UPDATE
     `;
 
@@ -339,23 +386,23 @@ async function processFeeTransaction({ student_fee_id, amount, payment_method, t
       RETURNING *
     `;
 
-    // Update parent fee record (Ledger Consistency)
-    // REMOVED: Redundant update. Trigger `trg_update_paid_on_transaction` handles this automatically.
-    /*
-    await tx`
+    const [updatedFee] = await tx`
       UPDATE student_fees
-      SET 
+      SET
         amount_paid = amount_paid + ${parsedAmount},
-        updated_at = NOW(),
-        status = CASE 
-          WHEN (amount_paid + ${parsedAmount}) >= (amount_due - discount) THEN 'paid'::fee_status_enum
-          ELSE 'partial'::fee_status_enum
-        END
+        updated_at = NOW()
       WHERE id = ${student_fee_id}
+        AND school_id = ${schoolId}
+      RETURNING *
     `;
-    */
 
-    return { transaction, fee };
+    if (!updatedFee) {
+      const err = new Error('Student fee not found');
+      err.status = 404;
+      throw err;
+    }
+
+    return { transaction, fee: updatedFee };
   });
 
   // Send Notification to Student + Parents (Async) - Outside transaction
@@ -432,6 +479,7 @@ router.get('/summaries', requirePermission('fees.view'), asyncHandler(async (req
     LEFT JOIN student_fees sf ON s.id = sf.student_id 
       ${academic_year_id ? sql`AND sf.fee_structure_id IN (SELECT id FROM fee_structures WHERE academic_year_id = ${academic_year_id})` : sql``}
     WHERE s.deleted_at IS NULL
+      AND s.school_id = ${req.schoolId}
     ${class_id ? sql`AND c.id = ${class_id}` : sql``}
     ${search ? sql`AND (p.display_name ILIKE ${'%' + search + '%'} OR s.admission_no ILIKE ${'%' + search + '%'})` : sql``}
     GROUP BY s.id, s.admission_no, p.display_name, c.name
@@ -439,7 +487,7 @@ router.get('/summaries', requirePermission('fees.view'), asyncHandler(async (req
     LIMIT 100
   `;
 
-  res.json(summaries);
+  return sendSuccess(res, req.schoolId, summaries);
 }));
 
 /**
@@ -468,6 +516,7 @@ router.get('/defaulters', requirePermission('fees.view'), asyncHandler(async (re
     WHERE sf.status IN ('pending', 'partial', 'overdue')
       AND sf.due_date < CURRENT_DATE
       AND s.deleted_at IS NULL
+      AND s.school_id = ${req.schoolId}
       ${academic_year_id ? sql`AND fs.academic_year_id = ${academic_year_id}` : sql``}
       ${class_id ? sql`AND c.id = ${class_id}` : sql``}
     GROUP BY s.id, s.admission_no, p.display_name, c.name, sec.name
@@ -475,7 +524,7 @@ router.get('/defaulters', requirePermission('fees.view'), asyncHandler(async (re
     ORDER BY total_due DESC
   `;
 
-  res.json(defaulters);
+  return sendSuccess(res, req.schoolId, defaulters);
 }));
 
 /**
@@ -499,6 +548,7 @@ router.get('/receipts', requirePermission('fees.view'), asyncHandler(async (req,
       LEFT JOIN users u ON r.issued_by = u.id
       LEFT JOIN persons issuer ON u.person_id = issuer.id
       WHERE r.student_id = ${student_id}
+        AND r.school_id = ${req.schoolId}
       ORDER BY r.issued_at DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -513,6 +563,7 @@ router.get('/receipts', requirePermission('fees.view'), asyncHandler(async (req,
       JOIN students s ON r.student_id = s.id
       JOIN persons p ON s.person_id = p.id
       WHERE TRUE
+        AND r.school_id = ${req.schoolId}
         ${from_date ? sql`AND r.issued_at >= ${from_date}` : sql``}
         ${to_date ? sql`AND r.issued_at <= ${to_date}` : sql``}
       ORDER BY r.issued_at DESC
@@ -520,7 +571,7 @@ router.get('/receipts', requirePermission('fees.view'), asyncHandler(async (req,
     `;
   }
 
-  res.json(receipts);
+  return sendSuccess(res, req.schoolId, receipts);
 }));
 
 /**
@@ -541,7 +592,7 @@ router.get('/receipts/:id', requirePermission('fees.view'), asyncHandler(async (
     JOIN persons p ON s.person_id = p.id
     LEFT JOIN users u ON r.issued_by = u.id
     LEFT JOIN persons issuer ON u.person_id = issuer.id
-    WHERE r.id = ${id}
+    WHERE r.id = ${id} AND r.school_id = ${req.schoolId}
   `;
 
   if (!receipt) {
@@ -562,7 +613,7 @@ router.get('/receipts/:id', requirePermission('fees.view'), asyncHandler(async (
     WHERE ri.receipt_id = ${id}
   `;
 
-  res.json({ ...receipt, items });
+  return sendSuccess(res, req.schoolId, { ...receipt, items });
 }));
 
 /**
@@ -587,7 +638,7 @@ router.get('/transactions', requirePermission('fees.view'), asyncHandler(async (
     JOIN fee_types ft ON fs.fee_type_id = ft.id
     LEFT JOIN users u ON t.received_by = u.id
     LEFT JOIN persons receiver ON u.person_id = receiver.id
-    WHERE TRUE
+    WHERE s.school_id = ${req.schoolId}
       ${from_date ? sql`AND t.paid_at >= ${from_date}` : sql``}
       ${to_date ? sql`AND t.paid_at <= ${to_date}` : sql``}
       ${payment_method ? sql`AND t.payment_method = ${payment_method}` : sql``}
@@ -595,7 +646,7 @@ router.get('/transactions', requirePermission('fees.view'), asyncHandler(async (
     LIMIT ${limit} OFFSET ${offset}
   `;
 
-  res.json(transactions);
+  return sendSuccess(res, req.schoolId, transactions);
 }));
 
 // (Fix 7: Duplicate POST /transactions route removed — single handler at L236)
@@ -608,26 +659,28 @@ router.get('/collection-summary', requirePermission('fees.view'), asyncHandler(a
   const { date, from_date, to_date, group_by = 'day' } = req.query;
 
   if (date) {
-    // Single day summary
+    // Single day summary — F7 FIX: Add school_id filter
     const summary = await sql`
-      SELECT 
+      SELECT
         payment_method,
         COUNT(*) as transaction_count,
         SUM(amount) as total_amount
       FROM fee_transactions
       WHERE DATE(paid_at) = ${date}
+        AND school_id = ${req.schoolId}
       GROUP BY payment_method
     `;
 
     const total = await sql`
-      SELECT 
+      SELECT
         COUNT(*) as total_transactions,
         COALESCE(SUM(amount), 0) as total_collected
       FROM fee_transactions
       WHERE DATE(paid_at) = ${date}
+        AND school_id = ${req.schoolId}
     `;
 
-    res.json({
+    return sendSuccess(res, req.schoolId, {
       date,
       by_payment_method: summary,
       ...total[0]
@@ -637,41 +690,44 @@ router.get('/collection-summary', requirePermission('fees.view'), asyncHandler(a
     let summary;
     if (group_by === 'month') {
       summary = await sql`
-        SELECT 
+        SELECT
           DATE_TRUNC('month', paid_at) as period,
           COUNT(*) as transaction_count,
           SUM(amount) as total_amount
         FROM fee_transactions
         WHERE paid_at BETWEEN ${from_date} AND ${to_date}
+          AND school_id = ${req.schoolId}
         GROUP BY DATE_TRUNC('month', paid_at)
         ORDER BY period
       `;
     } else {
       summary = await sql`
-        SELECT 
+        SELECT
           DATE(paid_at) as period,
           COUNT(*) as transaction_count,
           SUM(amount) as total_amount
         FROM fee_transactions
         WHERE paid_at BETWEEN ${from_date} AND ${to_date}
+          AND school_id = ${req.schoolId}
         GROUP BY DATE(paid_at)
         ORDER BY period
       `;
     }
 
-    res.json(summary);
+    return sendSuccess(res, req.schoolId, summary);
   } else {
-    // Today's summary by default
+    // Today's summary by default — F7 FIX: Add school_id filter
     const today = new Date().toISOString().split('T')[0];
     const summary = await sql`
-      SELECT 
+      SELECT
         COUNT(*) as total_transactions,
         COALESCE(SUM(amount), 0) as total_collected
       FROM fee_transactions
       WHERE DATE(paid_at) = ${today}
+        AND school_id = ${req.schoolId}
     `;
 
-    res.json({ date: today, ...summary[0] });
+    return sendSuccess(res, req.schoolId, { date: today, ...summary[0] });
   }
 }));
 
@@ -682,11 +738,13 @@ router.get('/collection-summary', requirePermission('fees.view'), asyncHandler(a
 // Fix 4: Protected with requirePermission
 router.get('/dashboard-stats', requirePermission('fees.view'), asyncHandler(async (req, res) => {
 
+  // F8 FIX: Add school_id to all dashboard stat queries
   // 1. Today's Collection
   const todayStats = await sql`
       SELECT COALESCE(SUM(amount), 0) as total
       FROM fee_transactions
       WHERE paid_at::date = CURRENT_DATE
+        AND school_id = ${req.schoolId}
   `;
 
   // 2. Monthly Collection
@@ -694,6 +752,7 @@ router.get('/dashboard-stats', requirePermission('fees.view'), asyncHandler(asyn
       SELECT COALESCE(SUM(amount), 0) as total
       FROM fee_transactions
       WHERE date_trunc('month', paid_at) = date_trunc('month', CURRENT_DATE)
+        AND school_id = ${req.schoolId}
   `;
 
   // 3. Pending Dues (Total Outstanding)
@@ -702,6 +761,7 @@ router.get('/dashboard-stats', requirePermission('fees.view'), asyncHandler(asyn
       FROM student_fees
       WHERE status IN ('pending', 'partial', 'overdue')
         AND deleted_at IS NULL
+        AND school_id = ${req.schoolId}
   `;
 
   // 4. Defaulters Count
@@ -711,17 +771,19 @@ router.get('/dashboard-stats', requirePermission('fees.view'), asyncHandler(asyn
       WHERE status IN ('pending', 'partial', 'overdue')
         AND due_date < CURRENT_DATE
         AND deleted_at IS NULL
+        AND school_id = ${req.schoolId}
   `;
 
   // 5. Total Collected (all time or academic year)
   const totalCollected = await sql`
       SELECT COALESCE(SUM(amount), 0) as total
       FROM fee_transactions
+      WHERE school_id = ${req.schoolId}
   `;
 
   // 6. Recent Transactions (Last 5) — Fix 4: no error swallowing
   const recentTransactions = await sql`
-      SELECT 
+      SELECT
           ft.id,
           ft.amount,
           ft.paid_at as collected_at,
@@ -736,6 +798,7 @@ router.get('/dashboard-stats', requirePermission('fees.view'), asyncHandler(asyn
       LEFT JOIN fee_structures fs ON sf.fee_structure_id = fs.id
       LEFT JOIN classes c ON fs.class_id = c.id
       LEFT JOIN fee_types ftype ON fs.fee_type_id = ftype.id
+      WHERE ft.school_id = ${req.schoolId}
       ORDER BY ft.paid_at DESC
       LIMIT 5
   `;
@@ -749,7 +812,7 @@ router.get('/dashboard-stats', requirePermission('fees.view'), asyncHandler(asyn
     recent_transactions: recentTransactions || []
   };
 
-  res.json(result);
+  return sendSuccess(res, req.schoolId, result);
 }));
 
 /**
@@ -770,11 +833,12 @@ router.post('/adjust', requirePermission('fees.manage'), asyncHandler(async (req
   }
 
   const updated = await sql.begin(async (tx) => {
-    // Lock the row to prevent concurrent discount race
+    // F9 FIX: Add school_id filter to student_fees lock query
     const [fee] = await tx`
       SELECT id, amount_due, amount_paid, discount
       FROM student_fees
       WHERE id = ${student_fee_id}
+        AND school_id = ${req.schoolId}
       FOR UPDATE
     `;
 
@@ -792,18 +856,20 @@ router.post('/adjust', requirePermission('fees.manage'), asyncHandler(async (req
       throw err;
     }
 
+    // F9 FIX: Add school_id filter to student_fees UPDATE
     const [result] = await tx`
       UPDATE student_fees
       SET discount = discount + ${parsedAmount},
           updated_at = NOW()
       WHERE id = ${student_fee_id}
+        AND school_id = ${req.schoolId}
       RETURNING *
     `;
 
     return result;
   });
 
-  res.json({ message: 'Adjustment applied successfully', fee: updated });
+  return sendSuccess(res, req.schoolId, { message: 'Adjustment applied successfully', fee: updated });
 }));
 
 // ============== FEE REMINDERS ==============
@@ -833,6 +899,7 @@ router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req
       WHERE sf.status IN ('pending', 'partial', 'overdue')
         AND cs.class_id = ${class_id}
         AND s.deleted_at IS NULL
+        AND s.school_id = ${req.schoolId}
     `;
   } else {
     // All Pending
@@ -844,11 +911,12 @@ router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req
       JOIN users u ON u.person_id = p.id
       WHERE sf.status IN ('pending', 'partial', 'overdue')
         AND s.deleted_at IS NULL
+        AND s.school_id = ${req.schoolId}
     `;
   }
 
   if (!students || students.length === 0) {
-    return res.json({ message: 'No students found with pending fees', count: 0 });
+    return sendSuccess(res, req.schoolId, { message: 'No students found with pending fees', count: 0 });
   }
 
   // 2. Also fetch parent user IDs for the same students
@@ -880,12 +948,12 @@ router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req
       );
     }
 
-    res.json({ message: 'Fee reminders queued', student_count: students.length });
+    return sendSuccess(res, req.schoolId, { message: 'Fee reminders queued', student_count: students.length });
 
   } catch (err) {
 
     // Return success to client as process was initiated, but log the error
-    res.json({ message: 'Identified students but failed to send notifications', error: err.message });
+    return sendSuccess(res, req.schoolId, { message: 'Identified students but failed to send notifications', error: err.message });
   }
 }));
 

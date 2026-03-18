@@ -29,7 +29,7 @@ export async function sendNotificationToUsers(userIds = [], type, params = {}, c
   try {
     renderResult = NotificationTemplateService.render(type, params);
   } catch (err) {
-
+    console.error('Template render error:', err);
     await logNotificationSummary({ type, errorMessage: err.message }); // Log template failure
     return { successCount: 0, failureCount: 0 };
   }
@@ -115,16 +115,21 @@ export async function sendNotificationToUsers(userIds = [], type, params = {}, c
 async function sendBatch(tokens, { title, body, deepLink, soundFile, channelId, type, customSound = true }) {
   if (tokens.length === 0) return { success: 0, failure: 0 };
 
-  // DATA-ONLY message: No 'notification' key so Android does NOT auto-display.
-  // The app's background/foreground handlers must display the notification themselves
-  // using the correct channel (with custom sound).
+  // Include top-level 'notification' key so Android OS handles it securely in killed/terminated state.
   const soundBase = soundFile && soundFile !== 'default' ? soundFile.replace(/\.[^/.]+$/, "") : 'default';
 
   const message = {
     tokens,
-    // NO 'notification' key — data-only so app always handles display
+    notification: {
+      title,
+      body,
+    },
     android: {
-      priority: 'high' // Ensure timely delivery even in Doze mode
+      priority: 'high', // Ensure timely delivery even in Doze mode
+      notification: {
+        channelId: channelId,
+        sound: soundBase,
+      }
     },
     apns: {
       payload: {

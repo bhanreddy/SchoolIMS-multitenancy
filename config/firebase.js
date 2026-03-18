@@ -1,11 +1,18 @@
 
 import admin from 'firebase-admin';
 import config from './env.js';
+import logger from '../utils/logger.js';
 
 // Initialize only once
 // Initialize only once
 if (!admin.apps.length) {
   try {
+    if (!config.firebase.enabled) {
+      logger.info('Firebase Admin SDK disabled (missing env).');
+      // Exporting `admin` is still safe; callers should handle disabled state.
+      throw new Error('FIREBASE_DISABLED');
+    }
+
     const { projectId, clientEmail, privateKey } = config.firebase;
 
     // Clean up the private key
@@ -28,9 +35,13 @@ if (!admin.apps.length) {
       })
     });
 
-    console.log('✅ Firebase Admin SDK initialized successfully (project:', projectId, ')');
+    logger.info({ projectId }, 'Firebase Admin SDK initialized');
   } catch (error) {
-    console.error('❌ Firebase Admin SDK initialization FAILED:', error.message);
+    if (error.message === 'FIREBASE_DISABLED') {
+      // already logged above
+    } else {
+      logger.error({ error: error?.message }, 'Firebase Admin SDK initialization FAILED');
+    }
   }
 }
 

@@ -1,4 +1,5 @@
 import express from 'express';
+import { sendSuccess } from '../utils/apiResponse.js';
 import { supabase, supabaseAdmin } from '../db.js';
 import sql from '../db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
@@ -29,7 +30,7 @@ router.post('/login', asyncHandler(async (req, res) => {
   // Fetch user roles and permissions
   const userInfo = await sql`
     SELECT 
-      u.id, u.account_status, u.person_id,
+      u.id, u.school_id, u.account_status, u.person_id,
       p.first_name, p.last_name, p.display_name, p.photo_url,
       s.admission_no,
       st.id as staff_id,
@@ -62,6 +63,11 @@ router.post('/login', asyncHandler(async (req, res) => {
 
   if (dbUser.account_status !== 'active') {
     return res.status(403).json({ error: 'Account is not active' });
+  }
+
+  // B5: Verify user belongs to requested school (tenant isolation)
+  if (String(dbUser.school_id) !== String(req.schoolId)) {
+    return res.status(403).json({ error: 'User does not belong to this school', code: 'SCHOOL_MISMATCH' });
   }
 
   // Check for Class/Section Assignment
@@ -111,9 +117,10 @@ router.post('/login', asyncHandler(async (req, res) => {
   }
 
   // Update last login
-  await sql`UPDATE users SET last_login_at = NOW() WHERE id = ${data.user.id}`;
+  await sql`UPDATE users SET last_login_at = NOW() WHERE id = ${data.user.id}
+      AND school_id = ${req.schoolId}`;
 
-  res.json({
+  return sendSuccess(res, req.schoolId, {
     message: 'Login successful',
     token: data.session.access_token,
     refresh_token: data.session.refresh_token,
@@ -156,7 +163,67 @@ router.post('/logout', asyncHandler(async (req, res) => {
     return res.status(500).json({ error: 'Logout failed', details: error.message });
   }
 
-  res.json({ message: 'Logged out successfully' });
+  return sendSuccess(res, req.schoolId, { message: 'Logged out successfully' });
+}));
+
+/**
+ * POST /auth/validate-school-user
+ * Validates that the Supabase JWT maps to an active user in the system.
+ * The backend derives the school context from the users table using only the JWT uid.
+ */
+router.post('/validate-school-user', asyncHandler(async (req, res) => {
+  if (!req.user || !req.user.id) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+
+  const userInfo = await sql`
+    SELECT 
+      u.id as user_id, u.school_id, u.account_status,
+      p.display_name, p.photo_url,
+      r.code as role_code, r.name as role_name
+    FROM users u
+    JOIN persons p ON u.person_id = p.id
+    JOIN user_roles ur ON ur.user_id = u.id
+    JOIN roles r ON ur.role_id = r.id
+    WHERE u.id = ${req.user.id}
+      AND u.deleted_at IS NULL
+    LIMIT 1
+  `;
+
+  if (userInfo.length === 0) {
+    return res.status(403).json({ error: 'account_not_in_school' });
+  }
+
+  const dbUser = userInfo[0];
+
+  if (dbUser.account_status === 'locked') {
+    return res.status(403).json({ error: 'account_locked' });
+  }
+
+  if (dbUser.account_status !== 'active') {
+    return res.status(403).json({ error: 'account_not_active' });
+  }
+
+  // B5: Verify user belongs to requested school
+  if (String(dbUser.school_id) !== String(req.schoolId)) {
+    return res.status(403).json({ error: 'User does not belong to this school', code: 'SCHOOL_MISMATCH' });
+  }
+
+  // Update last login
+  await sql`UPDATE users SET last_login_at = NOW() WHERE id = ${req.user.id}
+      AND school_id = ${req.schoolId}`;
+
+  // Map DB role codes to frontend-expected codes
+  const roleCode = dbUser.role_code === 'accounts' ? 'accountant' : dbUser.role_code;
+
+  return sendSuccess(res, req.schoolId, {
+    userId: dbUser.user_id,
+    schoolId: dbUser.school_id,
+    displayName: dbUser.display_name,
+    photoUrl: dbUser.photo_url,
+    role: { code: roleCode, name: dbUser.role_name },
+    accountStatus: dbUser.account_status
+  });
 }));
 
 /**
@@ -176,7 +243,7 @@ router.post('/refresh', asyncHandler(async (req, res) => {
     return res.status(401).json({ error: 'Token refresh failed', details: error.message });
   }
 
-  res.json({
+  return sendSuccess(res, req.schoolId, {
     token: data.session.access_token,
     refresh_token: data.session.refresh_token,
     expires_at: data.session.expires_at
@@ -195,7 +262,7 @@ router.get('/me', asyncHandler(async (req, res) => {
   // Fetch full profile
   const userInfo = await sql`
     SELECT 
-      u.id, u.person_id, u.account_status, u.last_login_at, u.created_at,
+      u.id, u.school_id, u.person_id, u.account_status, u.last_login_at, u.created_at,
       p.first_name, p.middle_name, p.last_name, p.display_name, p.dob, p.photo_url,
       g.name as gender,
       s.admission_no,
@@ -229,6 +296,11 @@ router.get('/me', asyncHandler(async (req, res) => {
 
   const dbUser = userInfo[0];
 
+  // B5: Verify user belongs to requested school
+  if (String(dbUser.school_id) !== String(req.schoolId)) {
+    return res.status(403).json({ error: 'User does not belong to this school', code: 'SCHOOL_MISMATCH' });
+  }
+
   // Check for Class/Section Assignment (Re-detect for /me)
   let classSectionId = null;
   if (dbUser.has_staff_profile && dbUser.staff_id) {
@@ -260,7 +332,7 @@ router.get('/me', asyncHandler(async (req, res) => {
     if (enrollment) classSectionId = enrollment.class_section_id;
   }
 
-  res.json({
+  return sendSuccess(res, req.schoolId, {
     ...dbUser,
     staff_id: dbUser.staff_id,
     staff_code: dbUser.staff_code,
@@ -290,7 +362,7 @@ router.post('/forgot-password', asyncHandler(async (req, res) => {
   }
 
   // Always return success to prevent email enumeration
-  res.json({ message: 'If the email exists, a password reset link has been sent' });
+  return sendSuccess(res, req.schoolId, { message: 'If the email exists, a password reset link has been sent' });
 }));
 
 /**
@@ -314,7 +386,7 @@ router.post('/reset-password', asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Password reset failed', details: error.message });
   }
 
-  res.json({ message: 'Password reset successfully' });
+  return sendSuccess(res, req.schoolId, { message: 'Password reset successfully' });
 }));
 
 /**
@@ -398,7 +470,7 @@ router.post('/change-password', asyncHandler(async (req, res) => {
 
   }
 
-  res.json({ message: 'Password changed successfully. Please log in again.' });
+  return sendSuccess(res, req.schoolId, { message: 'Password changed successfully. Please log in again.' });
 }));
 
 /**
@@ -412,17 +484,22 @@ router.post('/request-access', asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'userId and department are required' });
   }
 
+  // Look up the user's school_id (required for multi-tenancy)
+  const [user] = await sql`SELECT school_id FROM users WHERE id = ${userId} AND deleted_at IS NULL`;
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
   // Insert using the admin backend connection (bypasses RLS)
   try {
     const [request] = await sql`
-        INSERT INTO access_requests (requested_by, department, request_note, status) 
-        VALUES (${userId}, ${department}, ${note}, 'pending')
+        INSERT INTO access_requests (school_id, requested_by, department, request_note, status) 
+        VALUES (${user.school_id}, ${userId}, ${department}, ${note}, 'pending')
         RETURNING id
     `;
-    res.json({ success: true, message: 'Access request submitted successfully', requestId: request.id });
+    return sendSuccess(res, req.schoolId, { success: true, message: 'Access request submitted successfully', requestId: request.id });
   } catch (err) {
     res.status(500).json({ error: 'Failed to submit request', details: err.message });
   }
 }));
-
 export default router;

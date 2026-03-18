@@ -1,5 +1,6 @@
 
 import express from 'express';
+import { sendSuccess } from '../utils/apiResponse.js';
 import sql from '../db.js';
 import { withRetry } from '../utils/retry.js';
 
@@ -11,8 +12,9 @@ router.post('/register', async (req, res, next) => {
         // identifyUser middleware populates req.user
         const { fcm_token, platform, language_code } = req.body;
         const user_id = req.user?.id;
+        const school_id = req.schoolId;
 
-        if (!user_id) return res.status(401).json({ error: 'Unauthorized' });
+        if (!user_id || !school_id) return res.status(401).json({ error: 'Unauthorized' });
         if (!fcm_token) return res.status(400).json({ error: 'Token required' });
 
         // Validate language_code (only 'en' and 'te' supported)
@@ -23,15 +25,15 @@ router.post('/register', async (req, res, next) => {
             await sql`DELETE FROM user_devices WHERE fcm_token = ${fcm_token} AND user_id != ${user_id}`;
 
             await sql`
-                INSERT INTO user_devices (user_id, fcm_token, platform, language_code, last_used_at)
-                VALUES (${user_id}, ${fcm_token}, ${platform || 'unknown'}, ${validLang}, now())
-                ON CONFLICT (user_id, fcm_token) 
-                DO UPDATE SET last_used_at = now(), platform = EXCLUDED.platform, language_code = EXCLUDED.language_code
+                INSERT INTO user_devices (user_id, school_id, fcm_token, platform, language_code, last_used_at, is_active, updated_at)
+                VALUES (${user_id}, ${school_id}, ${fcm_token}, ${platform || 'unknown'}, ${validLang}, now(), true, now())
+                ON CONFLICT (school_id, user_id, fcm_token) 
+                DO UPDATE SET school_id = EXCLUDED.school_id, last_used_at = now(), platform = EXCLUDED.platform, language_code = EXCLUDED.language_code, is_active = true, updated_at = now()
             `;
         }, { retries: 2, delayMs: 1000 });
 
 
-        res.json({ success: true, message: 'Token registered' });
+        return sendSuccess(res, req.schoolId, { success: true, message: 'Token registered' });
     } catch (error) {
         next(error);
     }
@@ -52,7 +54,7 @@ router.post('/unregister', async (req, res, next) => {
         }, { retries: 2, delayMs: 1000 });
 
 
-        res.json({ success: true, message: 'Token unregistered' });
+        return sendSuccess(res, req.schoolId, { success: true, message: 'Token unregistered' });
     } catch (error) {
         next(error);
     }

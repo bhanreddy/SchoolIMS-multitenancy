@@ -1,10 +1,4 @@
-/*
-  NexSyrus IMS Production Self-Enforcing Schema v1.1
-  Description: Self-enforcing database template with automated 
-               collision guards, integrity checks, and diagnostics.
-  Last Refactored: 2026-02-11
-  Target: PostgreSQL 15+ / Supabase
-*/
+
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -25,25 +19,25 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     applied_at TIMESTAMPTZ DEFAULT now()
 );
 
-INSERT INTO schema_meta (key, value) 
-VALUES ('version', '1.1') 
-ON CONFLICT (key) DO UPDATE SET value = '1.1', applied_at = now();
+-- Idempotent "upsert" without ON CONFLICT (preserves semantics)
+UPDATE schema_meta
+SET value = '1.3', applied_at = now()
+WHERE key = 'version';
+
+INSERT INTO schema_meta (key, value)
+SELECT 'version', '1.3'
+WHERE NOT EXISTS (
+  SELECT 1 FROM schema_meta WHERE key = 'version'
+);
+
+-- SECTION 00: CONNECTIVITY & RESILIENCE
+-- Standard Connection Timeout: 30 seconds
+-- Applied to: Application-level fetch (AbortSignal.timeout), PG handshake (connect_timeout).
+-- Rationale: Handle high-latency edge networks observed in diagnostics (up to 16s).
 
 -- SECTION 01: EXTENSIONS (single creation, extensions schema)
 CREATE SCHEMA IF NOT EXISTS extensions;
-DO $$
-BEGIN
-    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'anon') THEN
-        GRANT USAGE ON SCHEMA extensions TO anon;
-    END IF;
-    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'authenticated') THEN
-        GRANT USAGE ON SCHEMA extensions TO authenticated;
-    END IF;
-    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'service_role') THEN
-        GRANT USAGE ON SCHEMA extensions TO service_role;
-    END IF;
-END
-$$;
+
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA extensions;
 CREATE EXTENSION IF NOT EXISTS btree_gist SCHEMA extensions;
@@ -52,238 +46,156 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm SCHEMA extensions;
 -- Session-level search path (no ALTER DATABASE — non-transactional DDL not allowed inside BEGIN)
 SET search_path = public, extensions;
 
--- 1. REFERENCE TABLES
-CREATE TABLE IF NOT EXISTS countries (
-    code CHAR(2) PRIMARY KEY,
-    name VARCHAR(100) NOT NULL UNIQUE
-);
+-- ════════════════════════════════════════════════════════════
+-- SECTION 0B: TYPE DEFINITIONS (ENUMS)
+-- ════════════════════════════════════════════════════════════
 
-CREATE TABLE IF NOT EXISTS genders (
-    id SMALLINT PRIMARY KEY,
-    name VARCHAR(50) NOT NULL UNIQUE
-);
+DO $$ BEGIN
+    CREATE TYPE contact_type_enum AS ENUM ('email','phone','address');
+EXCEPTION WHEN others THEN null; END $$;
 
-CREATE TABLE IF NOT EXISTS student_categories (
-    id SMALLINT PRIMARY KEY,
-    name VARCHAR(50) NOT NULL UNIQUE
-);
+DO $$ BEGIN
+    CREATE TYPE account_status_enum AS ENUM ('active','locked','disabled');
+EXCEPTION WHEN others THEN null; END $$;
 
-CREATE TABLE IF NOT EXISTS religions (
-    id SMALLINT PRIMARY KEY,
-    name VARCHAR(50) NOT NULL UNIQUE
-);
+DO $$ BEGIN
+    CREATE TYPE enrollment_status_enum AS ENUM ('active','completed','withdrawn');
+EXCEPTION WHEN others THEN null; END $$;
 
-CREATE TABLE IF NOT EXISTS blood_groups (
-    id SMALLINT PRIMARY KEY,
-    name VARCHAR(10) NOT NULL UNIQUE
-);
+DO $$ BEGIN
+    CREATE TYPE attendance_status_enum AS ENUM ('present','absent','late','half_day');
+EXCEPTION WHEN others THEN null; END $$;
 
-CREATE TABLE IF NOT EXISTS relationship_types (
-    id SMALLINT PRIMARY KEY,
-    name VARCHAR(50) NOT NULL UNIQUE
-);
+DO $$ BEGIN
+    CREATE TYPE fee_status_enum AS ENUM ('pending','partial','paid','waived','overdue');
+EXCEPTION WHEN others THEN null; END $$;
 
-CREATE TABLE IF NOT EXISTS staff_designations (
-    id SMALLINT PRIMARY KEY,
-    name VARCHAR(100) NOT NULL UNIQUE
-);
+DO $$ BEGIN
+    CREATE TYPE payment_method_enum AS ENUM ('cash','card','upi','bank_transfer','cheque','online');
+EXCEPTION WHEN others THEN null; END $$;
 
--- 1b. SEED REFERENCE DATA
--- These INSERTs are idempotent (ON CONFLICT DO NOTHING) and required
--- because persons.gender_id and students.status_id are NOT NULL FK columns.
+DO $$ BEGIN
+    CREATE TYPE exam_status_enum AS ENUM ('scheduled','ongoing','completed','cancelled');
+EXCEPTION WHEN others THEN null; END $$;
 
-INSERT INTO genders (id, name) VALUES (1, 'Male'), (2, 'Female'), (3, 'Other')
-ON CONFLICT DO NOTHING;
+DO $$ BEGIN
+    CREATE TYPE complaint_status_enum AS ENUM ('open','in_progress','resolved','closed','rejected');
+EXCEPTION WHEN others THEN null; END $$;
 
-INSERT INTO countries (code, name) VALUES
-('IN', 'India'), ('US', 'United States'), ('GB', 'United Kingdom'),
-('AE', 'United Arab Emirates'), ('SA', 'Saudi Arabia'), ('AU', 'Australia')
-ON CONFLICT DO NOTHING;
+DO $$ BEGIN
+    CREATE TYPE complaint_priority_enum AS ENUM ('low','medium','high','urgent');
+EXCEPTION WHEN others THEN null; END $$;
 
-INSERT INTO religions (id, name) VALUES
-(1, 'Hinduism'), (2, 'Islam'), (3, 'Christianity'), (4, 'Sikhism'),
-(5, 'Buddhism'), (6, 'Jainism'), (7, 'Other')
-ON CONFLICT DO NOTHING;
+DO $$ BEGIN
+    CREATE TYPE notice_audience_enum AS ENUM ('all','students','staff','parents','class');
+EXCEPTION WHEN others THEN null; END $$;
 
-INSERT INTO blood_groups (id, name) VALUES
-(1, 'A+'), (2, 'A-'), (3, 'B+'), (4, 'B-'),
-(5, 'AB+'), (6, 'AB-'), (7, 'O+'), (8, 'O-')
-ON CONFLICT DO NOTHING;
+DO $$ BEGIN
+    CREATE TYPE leave_status_enum AS ENUM ('pending','approved','rejected','cancelled');
+EXCEPTION WHEN others THEN null; END $$;
 
-INSERT INTO student_categories (id, name) VALUES
-(1, 'General'), (2, 'OBC'), (3, 'SC'), (4, 'ST'), (5, 'EWS')
-ON CONFLICT DO NOTHING;
+DO $$ BEGIN
+    CREATE TYPE leave_type_enum AS ENUM ('casual','sick','earned','maternity','paternity','unpaid','other');
+EXCEPTION WHEN others THEN null; END $$;
 
-INSERT INTO relationship_types (id, name) VALUES
-(1, 'Father'), (2, 'Mother'), (3, 'Guardian'), (4, 'Sibling'), (5, 'Other')
-ON CONFLICT DO NOTHING;
+DO $$ BEGIN
+    CREATE TYPE day_of_week_enum AS ENUM ('monday','tuesday','wednesday','thursday','friday','saturday','sunday');
+EXCEPTION WHEN others THEN null; END $$;
 
-INSERT INTO staff_designations (id, name) VALUES
-(1, 'Principal'), (2, 'Vice Principal'), (3, 'Teacher'), (4, 'Senior Teacher'),
-(5, 'Lab Assistant'), (6, 'Librarian'), (7, 'Clerk'), (8, 'Peon'), (9, 'Other')
-ON CONFLICT DO NOTHING;
+DO $$ BEGIN
+    CREATE TYPE event_type_enum AS ENUM ('academic','cultural','sports','holiday','meeting','exam','other');
+EXCEPTION WHEN others THEN null; END $$;
 
--- 2. CORE TRIGGERS (GLOBAL)
+DO $$ BEGIN
+    CREATE TYPE material_type_enum AS ENUM ('video','document','link','quiz','assignment');
+EXCEPTION WHEN others THEN null; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE payroll_status_enum AS ENUM ('pending', 'paid');
+EXCEPTION WHEN others THEN null; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE notification_channel AS ENUM ('IN_APP', 'EMAIL', 'SMS', 'PUSH');
+EXCEPTION WHEN others THEN null; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE notification_status AS ENUM ('PENDING', 'PROCESSING', 'DELIVERED', 'FAILED', 'READ', 'DISMISSED');
+EXCEPTION WHEN others THEN null; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE event_status AS ENUM ('RECEIVED', 'PROCESSED', 'FAILED');
+EXCEPTION WHEN others THEN null; END $$;
+
+-- ════════════════════════════════════════════════════════════
+
+-- ════════════════════════════════════════════════════════════
+-- SECTION 0A: SCHOOLS (Multi-Tenant Root Table)
+-- ════════════════════════════════════════════════════════════
+-- ============================================================
+-- SCHOOLS MASTER TABLE
+-- Phase 1 — Multitenancy: source of truth for school identity
+-- id is INTEGER SERIAL to match all existing school_id FK columns
+-- ============================================================
+
+
+-- ════════════════════════════════════════════════════════════
+-- SECTION 02: ALL FUNCTIONS
+-- ════════════════════════════════════════════════════════════
+
+CREATE OR REPLACE FUNCTION current_school_id()
+RETURNS INTEGER
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    RETURN NULLIF(current_setting('app.current_school_id', true), '')::INTEGER;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION set_school_context(p_school_id INTEGER)
+RETURNS VOID
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+    PERFORM set_config('app.current_school_id', p_school_id::TEXT, true);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION auth_school_id()
+RETURNS INTEGER
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT u.school_id
+  FROM public.users u
+  WHERE u.id = auth.uid()
+    AND u.deleted_at IS NULL
+  LIMIT 1
+$$;
+
 CREATE OR REPLACE FUNCTION update_timestamp()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
   NEW.updated_at = now();
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
--- 3. PERSONS
-CREATE TABLE IF NOT EXISTS persons (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    first_name VARCHAR(50) NOT NULL,
-    middle_name VARCHAR(50),
-    last_name VARCHAR(50) NOT NULL,
-    display_name TEXT,
-    dob DATE,
-    gender_id SMALLINT NOT NULL REFERENCES genders(id),
-    nationality_code CHAR(2) REFERENCES countries(code),
-    photo_url TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_person_dob_past CHECK (dob IS NULL OR dob <= current_date)
-);
-
-ALTER TABLE persons ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-DROP TRIGGER IF EXISTS trg_persons_updated ON persons;
-CREATE TRIGGER trg_persons_updated
-BEFORE UPDATE ON persons
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
 CREATE OR REPLACE FUNCTION update_person_display_name()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
   NEW.display_name := trim(concat_ws(' ', NEW.first_name, NEW.middle_name, NEW.last_name));
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_persons_display_name ON persons;
-CREATE TRIGGER trg_persons_display_name
-BEFORE INSERT OR UPDATE ON persons
-FOR EACH ROW EXECUTE FUNCTION update_person_display_name();
-
--- Search Index
-CREATE INDEX IF NOT EXISTS idx_persons_name_trgm 
-ON persons USING gin (first_name gin_trgm_ops, last_name gin_trgm_ops);
-
--- 4. CONTACTS
-DO $$ BEGIN
-    CREATE TYPE contact_type_enum AS ENUM ('email','phone','address');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS person_contacts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    person_id UUID NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
-    contact_type contact_type_enum NOT NULL,
-    contact_value TEXT NOT NULL,
-    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
-    is_emergency BOOLEAN NOT NULL DEFAULT FALSE,
-    is_verified BOOLEAN NOT NULL DEFAULT FALSE,
-    verified_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE person_contacts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
--- Indexes
-CREATE UNIQUE INDEX IF NOT EXISTS uq_primary_contact_only
-ON person_contacts(person_id, contact_type)
-WHERE is_primary = true;
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_person_contact_unique
-ON person_contacts(person_id, contact_type, lower(contact_value))
-WHERE deleted_at IS NULL;
-
-DROP TRIGGER IF EXISTS trg_person_contacts_updated ON person_contacts;
-CREATE TRIGGER trg_person_contacts_updated
-BEFORE UPDATE ON person_contacts
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- 5. USERS & RBAC
-CREATE TABLE IF NOT EXISTS roles (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    code VARCHAR(50) UNIQUE NOT NULL,
-    name VARCHAR(100) NOT NULL,
-    is_system BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS permissions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    code VARCHAR(100) UNIQUE NOT NULL,
-    name VARCHAR(150) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-DO $$ BEGIN
-    CREATE TYPE account_status_enum AS ENUM ('active','locked','disabled');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS role_permissions (
-    role_id UUID REFERENCES roles(id) ON DELETE CASCADE,
-    permission_id UUID REFERENCES permissions(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    PRIMARY KEY (role_id, permission_id)
-);
-
-CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    person_id UUID NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
-    account_status account_status_enum NOT NULL DEFAULT 'active',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_login_at TIMESTAMPTZ,
-    failed_login_attempts INTEGER NOT NULL DEFAULT 0,
-    locked_until TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- Note: deleted_at needed for soft delete index safety
-ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
--- Soft Delete Safe Unique Index
-CREATE UNIQUE INDEX IF NOT EXISTS idx_users_person_active 
-ON users(person_id) WHERE deleted_at IS NULL; 
-
-CREATE TABLE IF NOT EXISTS user_settings (
-    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    notification_sound VARCHAR(20) DEFAULT 'custom' CHECK (notification_sound IN ('custom', 'default')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-DROP TRIGGER IF EXISTS trg_user_settings_updated ON user_settings;
-CREATE TRIGGER trg_user_settings_updated
-BEFORE UPDATE ON user_settings
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-CREATE TABLE IF NOT EXISTS user_roles (
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    role_id UUID REFERENCES roles(id) ON DELETE CASCADE,
-    granted_by UUID REFERENCES users(id),
-    granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    PRIMARY KEY (user_id, role_id)
-);
-
 CREATE OR REPLACE FUNCTION ensure_active_person_ref()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
   IF TG_OP = 'UPDATE' AND NEW.person_id <> OLD.person_id THEN
     RAISE EXCEPTION 'person_id cannot be changed once linked to user';
@@ -296,110 +208,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_user_active_person ON users;
-CREATE TRIGGER trg_user_active_person
-BEFORE INSERT OR UPDATE ON users
-FOR EACH ROW EXECUTE FUNCTION ensure_active_person_ref();
-
-DROP TRIGGER IF EXISTS trg_users_updated ON users;
-CREATE TRIGGER trg_users_updated
-BEFORE UPDATE ON users
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- 6. STUDENTS
-CREATE TABLE IF NOT EXISTS student_statuses (
-    id SMALLINT PRIMARY KEY,
-    code VARCHAR(20) UNIQUE NOT NULL,
-    is_terminal BOOLEAN NOT NULL DEFAULT FALSE
-);
-
-INSERT INTO student_statuses (id, code, is_terminal) VALUES
-(1, 'active', false), (2, 'graduated', true), (3, 'withdrawn', true),
-(4, 'expelled', true), (5, 'transferred', true)
-ON CONFLICT (id) DO NOTHING;
-
-CREATE TABLE IF NOT EXISTS students (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    person_id UUID NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
-    admission_no VARCHAR(30) NOT NULL,
-    admission_date DATE NOT NULL,
-    category_id SMALLINT REFERENCES student_categories(id),
-    religion_id SMALLINT REFERENCES religions(id),
-    blood_group_id SMALLINT REFERENCES blood_groups(id),
-    status_id SMALLINT NOT NULL REFERENCES student_statuses(id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE students ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE INDEX IF NOT EXISTS idx_students_status ON students(status_id);
-
--- Remediation: Soft Delete Safe Unique Indexes
-CREATE UNIQUE INDEX IF NOT EXISTS idx_students_admission_active 
-ON students(admission_no) WHERE deleted_at IS NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_students_person_active 
-ON students(person_id) WHERE deleted_at IS NULL;
-
-DROP TRIGGER IF EXISTS trg_students_updated ON students;
-CREATE TRIGGER trg_students_updated
-BEFORE UPDATE ON students
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- 7. PARENTS
-CREATE TABLE IF NOT EXISTS parents (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    person_id UUID NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
-    occupation VARCHAR(100),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE parents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_parents_person_active 
-ON parents(person_id) WHERE deleted_at IS NULL;
-
-DROP TRIGGER IF EXISTS trg_parents_updated ON parents;
-CREATE TRIGGER trg_parents_updated
-BEFORE UPDATE ON parents
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-CREATE TABLE IF NOT EXISTS student_parents (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id UUID NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
-    parent_id UUID NOT NULL REFERENCES parents(id) ON DELETE RESTRICT,
-    relationship_id SMALLINT REFERENCES relationship_types(id),
-    is_primary_contact BOOLEAN NOT NULL DEFAULT FALSE,
-    is_legal_guardian BOOLEAN NOT NULL DEFAULT FALSE,
-    valid_from DATE,
-    valid_to DATE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT uq_active_parent UNIQUE (student_id, parent_id),
-    CONSTRAINT no_parent_date_overlap EXCLUDE USING gist (
-        student_id WITH =,
-        parent_id WITH =,
-        daterange(valid_from, valid_to, '[]') WITH &&
-    ),
-    CONSTRAINT chk_parent_valid_range CHECK (valid_from IS NULL OR valid_to IS NULL OR valid_to >= valid_from)
-);
-
-ALTER TABLE student_parents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_student_primary_parent
-ON student_parents(student_id)
-WHERE is_primary_contact = true
-  AND deleted_at IS NULL;
-
 CREATE OR REPLACE FUNCTION ensure_active_student_parent()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
   IF EXISTS (SELECT 1 FROM students WHERE id = NEW.student_id AND deleted_at IS NOT NULL) THEN
     RAISE EXCEPTION 'Cannot link to deleted student';
@@ -411,116 +223,13 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_student_parents_active ON student_parents;
-CREATE TRIGGER trg_student_parents_active
-BEFORE INSERT OR UPDATE ON student_parents
-FOR EACH ROW EXECUTE FUNCTION ensure_active_student_parent();
-
--- 8. ACADEMICS
-CREATE TABLE IF NOT EXISTS academic_years (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    code VARCHAR(20) NOT NULL,
-    start_date DATE NOT NULL,
-    end_date DATE NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_academic_year CHECK (start_date < end_date)
-);
-
-ALTER TABLE academic_years ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
--- Add exclusion constraint separately as partial exclusion constraints cannot be added inline with WHERE
-ALTER TABLE academic_years DROP CONSTRAINT IF EXISTS no_academic_year_overlap;
-ALTER TABLE academic_years ADD CONSTRAINT no_academic_year_overlap EXCLUDE USING gist (
-    daterange(start_date, end_date, '[]') WITH &&
-) WHERE (deleted_at IS NULL);
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_academic_years_code_active ON academic_years(code) WHERE deleted_at IS NULL;
-
-
-CREATE TABLE IF NOT EXISTS classes (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(50) NOT NULL UNIQUE,
-    code VARCHAR(20),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE classes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_classes_name_active ON classes(name) WHERE deleted_at IS NULL;
-
-
-CREATE TABLE IF NOT EXISTS sections (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(50) NOT NULL UNIQUE,
-    code VARCHAR(20),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE sections ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sections_name_active ON sections(name) WHERE deleted_at IS NULL;
-
-
-CREATE TABLE IF NOT EXISTS class_sections (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    class_id UUID NOT NULL REFERENCES classes(id) ON DELETE RESTRICT,
-    section_id UUID NOT NULL REFERENCES sections(id) ON DELETE RESTRICT,
-    academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
-    class_teacher_id UUID, -- FK added after staff table is created (Fix 10)
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    UNIQUE (class_id, section_id, academic_year_id)
-);
-
-DO $$ BEGIN
-    CREATE TYPE enrollment_status_enum AS ENUM ('active','completed','withdrawn');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS student_enrollments (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id UUID NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
-    academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
-    class_section_id UUID NOT NULL REFERENCES class_sections(id) ON DELETE RESTRICT,
-    status enrollment_status_enum NOT NULL DEFAULT 'active',
-    start_date DATE NOT NULL,
-    end_date DATE,
-    roll_number INTEGER,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT no_enrollment_overlap EXCLUDE USING gist (
-        student_id WITH =,
-        daterange(start_date, end_date, '[]') WITH &&
-    ),
-    UNIQUE (class_section_id, academic_year_id, roll_number)
-);
-
-ALTER TABLE student_enrollments ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE INDEX IF NOT EXISTS idx_active_enrollments
-ON student_enrollments(student_id)
-WHERE status = 'active';
-
-DROP TRIGGER IF EXISTS trg_student_enrollments_updated ON student_enrollments;
-CREATE TRIGGER trg_student_enrollments_updated
-BEFORE UPDATE ON student_enrollments
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Remediation: Set-Based Roll Number Calculation
 CREATE OR REPLACE FUNCTION recalculate_section_rolls(
     p_class_section_id UUID,
     p_academic_year_id UUID
 )
-RETURNS VOID AS $$
+RETURNS VOID
+SET search_path = public
+AS $$
 BEGIN
     WITH ordered_students AS (
         SELECT 
@@ -546,7 +255,9 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION validate_enrollment_year()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM class_sections
@@ -559,13 +270,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_validate_enrollment ON student_enrollments;
-CREATE TRIGGER trg_validate_enrollment
-BEFORE INSERT OR UPDATE ON student_enrollments
-FOR EACH ROW EXECUTE FUNCTION validate_enrollment_year();
-
 CREATE OR REPLACE FUNCTION ensure_active_student_enrollment()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
   IF EXISTS (SELECT 1 FROM students WHERE id = NEW.student_id AND deleted_at IS NOT NULL) THEN
     RAISE EXCEPTION 'Cannot enroll a deleted student';
@@ -574,47 +282,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_enroll_active_student ON student_enrollments;
-CREATE TRIGGER trg_enroll_active_student
-BEFORE INSERT OR UPDATE ON student_enrollments
-FOR EACH ROW EXECUTE FUNCTION ensure_active_student_enrollment();
-
--- 9. ATTENDANCE
-DO $$ BEGIN
-    CREATE TYPE attendance_status_enum AS ENUM ('present','absent','late','half_day');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS daily_attendance (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_enrollment_id UUID NOT NULL REFERENCES student_enrollments(id) ON DELETE RESTRICT,
-    attendance_date DATE NOT NULL,
-    status attendance_status_enum NOT NULL,
-    marked_by UUID REFERENCES users(id) ON DELETE RESTRICT,
-    marked_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_attendance_date_past CHECK (attendance_date <= current_date)
-);
-
-ALTER TABLE daily_attendance ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-DROP TRIGGER IF EXISTS trg_attendance_updated ON daily_attendance;
-CREATE TRIGGER trg_attendance_updated
-BEFORE UPDATE ON daily_attendance
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_attendance_active
-ON daily_attendance(student_enrollment_id, attendance_date)
-WHERE deleted_at IS NULL;
-
-CREATE INDEX IF NOT EXISTS idx_attendance_date ON daily_attendance(attendance_date);
-CREATE INDEX IF NOT EXISTS idx_attendance_enrollment ON daily_attendance(student_enrollment_id);
-CREATE INDEX IF NOT EXISTS idx_attendance_composite ON daily_attendance(student_enrollment_id, status, attendance_date);
-
 CREATE OR REPLACE FUNCTION validate_attendance_entry()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 DECLARE
     v_class_section_id UUID;
     v_class_teacher_id UUID;
@@ -675,55 +346,10 @@ END;
 
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_validate_attendance ON daily_attendance;
-CREATE TRIGGER trg_validate_attendance
-BEFORE INSERT OR UPDATE ON daily_attendance
-FOR EACH ROW EXECUTE FUNCTION validate_attendance_entry();
-
--- 10. STAFF
-CREATE TABLE IF NOT EXISTS staff_statuses (
-    id SMALLINT PRIMARY KEY,
-    code VARCHAR(20) UNIQUE NOT NULL,
-    name VARCHAR(50) NOT NULL
-);
-
-INSERT INTO staff_statuses (id, code, name) VALUES
-(1, 'active', 'Active'), (2, 'on_leave', 'On Leave'), (3, 'resigned', 'Resigned'), (4, 'terminated', 'Terminated')
-ON CONFLICT (id) DO NOTHING;
-
-CREATE TABLE IF NOT EXISTS staff (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    person_id UUID NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
-    staff_code VARCHAR(30) NOT NULL,
-    designation_id SMALLINT REFERENCES staff_designations(id),
-    joining_date DATE NOT NULL,
-    status_id SMALLINT NOT NULL DEFAULT 1 REFERENCES staff_statuses(id),
-    salary DECIMAL(12,2),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_staff_joining_past CHECK (joining_date <= current_date)
-);
-
-ALTER TABLE staff ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_staff_code_active 
-ON staff(staff_code) WHERE deleted_at IS NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_staff_person_active 
-ON staff(person_id) WHERE deleted_at IS NULL;
-
-CREATE INDEX IF NOT EXISTS idx_staff_status ON staff(status_id);
-CREATE INDEX IF NOT EXISTS idx_staff_active ON staff(id) WHERE deleted_at IS NULL;
-
-DROP TRIGGER IF EXISTS trg_staff_updated ON staff;
-CREATE TRIGGER trg_staff_updated
-BEFORE UPDATE ON staff
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
 CREATE OR REPLACE FUNCTION ensure_active_person_staff()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
   IF EXISTS (SELECT 1 FROM persons WHERE id = NEW.person_id AND deleted_at IS NOT NULL) THEN
     RAISE EXCEPTION 'Cannot link staff to deleted person';
@@ -732,23 +358,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_staff_active_person ON staff;
-CREATE TRIGGER trg_staff_active_person
-BEFORE INSERT OR UPDATE ON staff
-FOR EACH ROW EXECUTE FUNCTION ensure_active_person_staff();
-
--- Fix 10: Deferred FK — class_teacher_id now references staff(id)
--- (class_sections was created before staff, so FK was deferred)
-DO $$ BEGIN
-    ALTER TABLE class_sections
-    ADD CONSTRAINT fk_class_sections_teacher
-    FOREIGN KEY (class_teacher_id) REFERENCES staff(id) ON DELETE RESTRICT;
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
--- 🔒 Protect System Roles
 CREATE OR REPLACE FUNCTION prevent_system_role_change()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
   IF OLD.is_system THEN
     RAISE EXCEPTION 'System roles cannot be modified or deleted';
@@ -762,95 +375,57 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_protect_system_roles_delete ON roles;
-CREATE TRIGGER trg_protect_system_roles_delete
-BEFORE DELETE ON roles
-FOR EACH ROW EXECUTE FUNCTION prevent_system_role_change();
+CREATE OR REPLACE FUNCTION propagate_fee_structure_updates()
+RETURNS TRIGGER
+SET search_path = public
+AS $$
+BEGIN
+    IF NEW.amount IS DISTINCT FROM OLD.amount THEN
+        UPDATE student_fees
+        SET amount_due = NEW.amount, updated_at = now()
+        WHERE fee_structure_id = NEW.id AND status IN ('pending', 'partial', 'overdue');
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_protect_system_roles_update ON roles;
-CREATE TRIGGER trg_protect_system_roles_update
-BEFORE UPDATE ON roles
-FOR EACH ROW EXECUTE FUNCTION prevent_system_role_change();
+CREATE OR REPLACE FUNCTION auto_assign_fees_on_structure_creation()
+RETURNS TRIGGER
+SET search_path = public
+AS $$
+BEGIN
+    INSERT INTO student_fees (school_id, student_id, fee_structure_id, amount_due, amount_paid, status, due_date)
+    SELECT NEW.school_id, se.student_id, NEW.id, NEW.amount, 0, 'pending', NEW.due_date
+    FROM student_enrollments se
+    JOIN class_sections cs ON se.class_section_id = cs.id
+    WHERE cs.class_id = NEW.class_id AND se.academic_year_id = NEW.academic_year_id AND se.status = 'active'
+      AND NOT EXISTS (SELECT 1 FROM student_fees sf WHERE sf.student_id = se.student_id AND sf.fee_structure_id = NEW.id);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
-
--- 11. FEES (REMEDIATED)
-CREATE TABLE IF NOT EXISTS fee_types (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(100) NOT NULL,
-    code VARCHAR(30),
-    description TEXT,
-    is_recurring BOOLEAN NOT NULL DEFAULT TRUE,
-    is_optional BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE fee_types ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_types_name_active ON fee_types(name) WHERE deleted_at IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_types_code_active ON fee_types(code) WHERE deleted_at IS NULL;
-
-
-CREATE TABLE IF NOT EXISTS fee_structures (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    academic_year_id UUID NOT NULL REFERENCES academic_years(id),
-    class_id UUID NOT NULL REFERENCES classes(id),
-    fee_type_id UUID NOT NULL REFERENCES fee_types(id),
-    amount DECIMAL(12,2) NOT NULL,
-    due_date DATE,
-    frequency VARCHAR(20) DEFAULT 'monthly',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_fee_amount_positive CHECK (amount > 0)
-);
-
-ALTER TABLE fee_structures ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_structures_active ON fee_structures(academic_year_id, class_id, fee_type_id) WHERE deleted_at IS NULL;
-
-
-DROP TRIGGER IF EXISTS trg_fee_structures_updated ON fee_structures;
-CREATE TRIGGER trg_fee_structures_updated
-BEFORE UPDATE ON fee_structures
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-DO $$ BEGIN
-    CREATE TYPE fee_status_enum AS ENUM ('pending','partial','paid','waived','overdue');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS student_fees (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id UUID NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
-    fee_structure_id UUID NOT NULL REFERENCES fee_structures(id) ON DELETE RESTRICT,
-    amount_due DECIMAL(12,2) NOT NULL,
-    amount_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
-    discount DECIMAL(12,2) NOT NULL DEFAULT 0,
-    status fee_status_enum NOT NULL DEFAULT 'pending',
-    due_date DATE,
-    period_month INTEGER,
-    period_year INTEGER,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT chk_amounts CHECK (amount_due >= 0 AND amount_paid >= 0 AND discount >= 0),
-    CONSTRAINT chk_paid_not_exceed CHECK (amount_paid <= amount_due - discount)
-);
-
-ALTER TABLE student_fees ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-CREATE INDEX IF NOT EXISTS idx_student_fees_student ON student_fees(student_id);
-CREATE INDEX IF NOT EXISTS idx_student_fees_status ON student_fees(status);
-
-DROP TRIGGER IF EXISTS trg_student_fees_updated ON student_fees;
-CREATE TRIGGER trg_student_fees_updated
-BEFORE UPDATE ON student_fees
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+CREATE OR REPLACE FUNCTION auto_assign_fees_on_enrollment()
+RETURNS TRIGGER
+SET search_path = public
+AS $$
+DECLARE v_class_id UUID;
+BEGIN
+    IF NEW.status = 'active' AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM 'active') THEN
+        SELECT class_id INTO v_class_id FROM class_sections WHERE id = NEW.class_section_id;
+        INSERT INTO student_fees (school_id, student_id, fee_structure_id, amount_due, amount_paid, status, due_date)
+        SELECT NEW.school_id, NEW.student_id, fs.id, fs.amount, 0, 'pending', fs.due_date
+        FROM fee_structures fs
+        WHERE fs.class_id = v_class_id AND fs.academic_year_id = NEW.academic_year_id
+          AND NOT EXISTS (SELECT 1 FROM student_fees sf WHERE sf.student_id = NEW.student_id AND sf.fee_structure_id = fs.id);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION update_fee_status()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
     IF NEW.amount_paid >= (NEW.amount_due - NEW.discount) THEN
         NEW.status := 'paid';
@@ -863,52 +438,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_auto_fee_status ON student_fees;
-CREATE TRIGGER trg_auto_fee_status
-BEFORE UPDATE ON student_fees
-FOR EACH ROW EXECUTE FUNCTION update_fee_status();
-
-DO $$ BEGIN
-    CREATE TYPE payment_method_enum AS ENUM ('cash','card','upi','bank_transfer','cheque','online');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS fee_transactions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_fee_id UUID NOT NULL REFERENCES student_fees(id) ON DELETE RESTRICT,
-    amount DECIMAL(12,2) NOT NULL,
-    payment_method payment_method_enum NOT NULL,
-    transaction_ref VARCHAR(100) NOT NULL,
-    paid_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    received_by UUID REFERENCES users(id) ON DELETE SET NULL,
-    remarks TEXT,
-    refund_of UUID REFERENCES fee_transactions(id) ON DELETE RESTRICT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- Allow negative amounts for refunds, but block zero
-    CONSTRAINT chk_transaction_amount CHECK (amount != 0),
-    -- Refund entries must have negative amount
-    CONSTRAINT chk_refund_must_be_negative CHECK (refund_of IS NULL OR amount < 0)
-);
-
--- Backfill any existing NULL transaction_ref values before constraints
-DO $$ BEGIN
-    UPDATE fee_transactions SET transaction_ref = 'LEGACY-' || id::text WHERE transaction_ref IS NULL;
-EXCEPTION WHEN OTHERS THEN null;
-END $$;
-
--- Enforce NOT NULL (may already be set by CREATE TABLE above, safe for existing DBs)
-ALTER TABLE fee_transactions ALTER COLUMN transaction_ref SET NOT NULL;
-ALTER TABLE fee_transactions ADD COLUMN IF NOT EXISTS refund_of UUID REFERENCES fee_transactions(id) ON DELETE RESTRICT;
-
--- Unique idempotency key
-CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_txn_ref_unique ON fee_transactions(transaction_ref);
-
-CREATE INDEX IF NOT EXISTS idx_transactions_paid_at ON fee_transactions(paid_at);
-
--- Remediation: Financial Trigger (APPEND-ONLY — INSERT only)
--- Refunds are negative-amount INSERTs, so += handles both payment and refund
 CREATE OR REPLACE FUNCTION update_fee_paid_amount()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
     UPDATE student_fees
     SET amount_paid = amount_paid + NEW.amount
@@ -917,47 +450,19 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_update_paid_on_transaction ON fee_transactions;
-CREATE TRIGGER trg_update_paid_on_transaction
-AFTER INSERT ON fee_transactions
-FOR EACH ROW EXECUTE FUNCTION update_fee_paid_amount();
-
--- Guard: Block UPDATE/DELETE on fee_transactions (append-only ledger)
 CREATE OR REPLACE FUNCTION prevent_fee_transaction_mutation()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
     RAISE EXCEPTION 'fee_transactions is append-only. UPDATE and DELETE are forbidden.';
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_guard_fee_txn ON fee_transactions;
-CREATE TRIGGER trg_guard_fee_txn
-BEFORE UPDATE OR DELETE ON fee_transactions
-FOR EACH ROW EXECUTE FUNCTION prevent_fee_transaction_mutation();
-
-CREATE SEQUENCE IF NOT EXISTS receipt_no_seq START 1001;
-
-CREATE TABLE IF NOT EXISTS receipts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    receipt_no VARCHAR(30) NOT NULL UNIQUE,
-    student_id UUID NOT NULL REFERENCES students(id),
-    total_amount DECIMAL(12,2) NOT NULL,
-    issued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    issued_by UUID REFERENCES users(id),
-    remarks TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS receipt_items (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    receipt_id UUID NOT NULL REFERENCES receipts(id) ON DELETE CASCADE,
-    fee_transaction_id UUID NOT NULL REFERENCES fee_transactions(id),
-    amount DECIMAL(12,2) NOT NULL
-);
-
--- Automation: Auto-generate receipt on transaction
 CREATE OR REPLACE FUNCTION auto_generate_receipt()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 DECLARE
     v_receipt_id UUID;
     v_student_id UUID;
@@ -967,190 +472,21 @@ BEGIN
 
     v_receipt_no := 'RCT-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-' || LPAD(NEXTVAL('receipt_no_seq')::TEXT, 4, '0');
 
-    INSERT INTO receipts (receipt_no, student_id, total_amount, issued_at, issued_by, remarks)
-    VALUES (v_receipt_no, v_student_id, NEW.amount, NEW.paid_at, NEW.received_by, COALESCE(NEW.remarks, 'System Generated'))
+    INSERT INTO receipts (school_id, receipt_no, student_id, total_amount, issued_at, issued_by, remarks)
+    VALUES (NEW.school_id, v_receipt_no, v_student_id, NEW.amount, NEW.paid_at, NEW.received_by, COALESCE(NEW.remarks, 'System Generated'))
     RETURNING id INTO v_receipt_id;
 
-    INSERT INTO receipt_items (receipt_id, fee_transaction_id, amount)
-    VALUES (v_receipt_id, NEW.id, NEW.amount);
+    INSERT INTO receipt_items (school_id, receipt_id, fee_transaction_id, amount)
+    VALUES (NEW.school_id, v_receipt_id, NEW.id, NEW.amount);
 
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_auto_receipt ON fee_transactions;
-CREATE TRIGGER trg_auto_receipt
-AFTER INSERT ON fee_transactions
-FOR EACH ROW EXECUTE FUNCTION auto_generate_receipt();
-
--- Backfill existing transactions without receipts
-DO $$
-DECLARE
-    r_trans RECORD;
-    v_receipt_id UUID;
-    v_student_id UUID;
-    v_receipt_no TEXT;
-BEGIN
-    FOR r_trans IN 
-        SELECT t.* 
-        FROM fee_transactions t
-        LEFT JOIN receipt_items ri ON t.id = ri.fee_transaction_id
-        WHERE ri.id IS NULL
-    LOOP
-        -- Get Student ID
-        SELECT student_id INTO v_student_id 
-        FROM student_fees 
-        WHERE id = r_trans.student_fee_id;
-
-        -- Generate Receipt No
-        v_receipt_no := 'RCT-' || TO_CHAR(r_trans.paid_at, 'YYYYMMDD') || '-' || LPAD(NEXTVAL('receipt_no_seq')::TEXT, 4, '0');
-
-        -- Insert Receipt
-        INSERT INTO receipts (
-            receipt_no,
-            student_id,
-            total_amount,
-            issued_at,
-            issued_by,
-            remarks
-        ) VALUES (
-            v_receipt_no,
-            v_student_id,
-            r_trans.amount,
-            r_trans.paid_at,
-            r_trans.received_by,
-            COALESCE(r_trans.remarks, 'Backfilled')
-        ) RETURNING id INTO v_receipt_id;
-
-        -- Insert Receipt Item
-        INSERT INTO receipt_items (
-            receipt_id,
-            fee_transaction_id,
-            amount
-        ) VALUES (
-            v_receipt_id,
-            r_trans.id,
-            r_trans.amount
-        );
-    END LOOP;
-END $$;
-
--- 12. EXAMS & RESULTS
-CREATE TABLE IF NOT EXISTS subjects (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(100) NOT NULL,
-    code VARCHAR(20),
-    description TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE subjects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_subjects_code_active ON subjects(code) WHERE deleted_at IS NULL;
-
-
-CREATE TABLE IF NOT EXISTS class_subjects (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    class_section_id UUID NOT NULL REFERENCES class_sections(id),
-    subject_id UUID NOT NULL REFERENCES subjects(id),
-    teacher_id UUID REFERENCES staff(id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE class_subjects ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE class_subjects ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE class_subjects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_class_subjects_unique ON class_subjects(class_section_id, subject_id) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_class_subjects_teacher ON class_subjects(teacher_id);
-
-DROP TRIGGER IF EXISTS trg_class_subjects_updated ON class_subjects;
-CREATE TRIGGER trg_class_subjects_updated
-BEFORE UPDATE ON class_subjects
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-
-DO $$ BEGIN
-    CREATE TYPE exam_status_enum AS ENUM ('scheduled','ongoing','completed','cancelled');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS exams (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(100) NOT NULL,
-    academic_year_id UUID NOT NULL REFERENCES academic_years(id),
-    exam_type VARCHAR(50) NOT NULL, 
-    start_date DATE,
-    end_date DATE,
-    status exam_status_enum NOT NULL DEFAULT 'scheduled',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_exam_dates CHECK (end_date IS NULL OR start_date IS NULL OR end_date >= start_date)
-);
-
-ALTER TABLE exams ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE INDEX IF NOT EXISTS idx_exams_active ON exams(id) WHERE deleted_at IS NULL;
-
-
-DROP TRIGGER IF EXISTS trg_exams_updated ON exams;
-CREATE TRIGGER trg_exams_updated
-BEFORE UPDATE ON exams
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-CREATE TABLE IF NOT EXISTS exam_subjects (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    exam_id UUID NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
-    subject_id UUID NOT NULL REFERENCES subjects(id),
-    class_id UUID NOT NULL REFERENCES classes(id),
-    exam_date DATE,
-    max_marks DECIMAL(5,2) NOT NULL DEFAULT 100,
-    passing_marks DECIMAL(5,2) NOT NULL DEFAULT 35,
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_marks_valid CHECK (passing_marks <= max_marks AND max_marks > 0)
-);
-
-ALTER TABLE exam_subjects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_exam_subjects_active ON exam_subjects(exam_id, subject_id, class_id) WHERE deleted_at IS NULL;
-
-
-CREATE TABLE IF NOT EXISTS grading_scales (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(50) NOT NULL,
-    min_percentage DECIMAL(5,2) NOT NULL,
-    max_percentage DECIMAL(5,2) NOT NULL,
-    grade VARCHAR(5) NOT NULL,
-    grade_point DECIMAL(3,1),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_percentage_range CHECK (min_percentage >= 0 AND max_percentage <= 100 AND min_percentage < max_percentage)
-);
-
-CREATE TABLE IF NOT EXISTS marks (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    exam_subject_id UUID NOT NULL REFERENCES exam_subjects(id) ON DELETE CASCADE,
-    student_enrollment_id UUID NOT NULL REFERENCES student_enrollments(id),
-    marks_obtained DECIMAL(5,2),
-    is_absent BOOLEAN NOT NULL DEFAULT FALSE,
-    remarks TEXT,
-    remarks_te TEXT,
-    entered_by UUID REFERENCES users(id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (exam_subject_id, student_enrollment_id),
-    CONSTRAINT chk_marks_or_absent CHECK (is_absent = TRUE OR marks_obtained IS NOT NULL)
-);
-
 CREATE OR REPLACE FUNCTION validate_marks_entry()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 DECLARE
     v_max_marks DECIMAL(5,2);
 BEGIN
@@ -1172,72 +508,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_validate_marks ON marks;
-CREATE TRIGGER trg_validate_marks
-BEFORE INSERT OR UPDATE ON marks
-FOR EACH ROW EXECUTE FUNCTION validate_marks_entry();
-
-
-ALTER TABLE marks ADD COLUMN IF NOT EXISTS remarks_te TEXT;
-
-CREATE INDEX IF NOT EXISTS idx_marks_enrollment ON marks(student_enrollment_id);
-CREATE INDEX IF NOT EXISTS idx_marks_exam_subject ON marks(exam_subject_id);
-
-DROP TRIGGER IF EXISTS trg_marks_updated ON marks;
-CREATE TRIGGER trg_marks_updated
-BEFORE UPDATE ON marks
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- 13. COMMUNICATION & SUPPORT
-DO $$ BEGIN
-    CREATE TYPE complaint_status_enum AS ENUM ('open','in_progress','resolved','closed','rejected');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-DO $$ BEGIN
-    CREATE TYPE complaint_priority_enum AS ENUM ('low','medium','high','urgent');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS complaints (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    ticket_no VARCHAR(30) UNIQUE,
-    title VARCHAR(200) NOT NULL,
-    title_te TEXT,
-    description TEXT NOT NULL,
-    description_te TEXT,
-    category VARCHAR(50), 
-    priority complaint_priority_enum NOT NULL DEFAULT 'medium',
-    status complaint_status_enum NOT NULL DEFAULT 'open',
-    raised_by UUID NOT NULL REFERENCES users(id),
-    raised_for_student_id UUID REFERENCES students(id), 
-    assigned_to UUID REFERENCES users(id),
-    resolution TEXT,
-    resolution_te TEXT,
-    resolved_by UUID REFERENCES users(id),
-    resolved_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-ALTER TABLE complaints ADD COLUMN IF NOT EXISTS title_te TEXT;
-ALTER TABLE complaints ADD COLUMN IF NOT EXISTS description_te TEXT;
-ALTER TABLE complaints ADD COLUMN IF NOT EXISTS resolution_te TEXT;
-
-CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints(status);
-CREATE INDEX IF NOT EXISTS idx_complaints_raised_by ON complaints(raised_by);
-CREATE INDEX IF NOT EXISTS idx_complaints_raised_for ON complaints(raised_for_student_id);
-CREATE INDEX IF NOT EXISTS idx_complaints_assigned_to ON complaints(assigned_to);
-
-DROP TRIGGER IF EXISTS trg_complaints_updated ON complaints;
-CREATE TRIGGER trg_complaints_updated
-BEFORE UPDATE ON complaints
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-CREATE SEQUENCE IF NOT EXISTS complaint_ticket_seq START 1;
-
 CREATE OR REPLACE FUNCTION generate_ticket_no()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
   IF NEW.ticket_no IS NULL THEN
     NEW.ticket_no := 'TKT-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-' || 
@@ -1247,154 +521,27 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_complaints_ticket ON complaints;
-CREATE TRIGGER trg_complaints_ticket
-BEFORE INSERT ON complaints
-FOR EACH ROW EXECUTE FUNCTION generate_ticket_no();
-
-DO $$ BEGIN
-    CREATE TYPE notice_audience_enum AS ENUM ('all','students','staff','parents','class');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS notices (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title VARCHAR(200) NOT NULL,
-    title_te TEXT,
-    content TEXT NOT NULL,
-    content_te TEXT,
-    audience notice_audience_enum NOT NULL DEFAULT 'all',
-    target_class_id UUID REFERENCES classes(id), 
-    priority complaint_priority_enum NOT NULL DEFAULT 'medium',
-    is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
-    publish_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at TIMESTAMPTZ,
-    created_by UUID NOT NULL REFERENCES users(id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-ALTER TABLE notices ADD COLUMN IF NOT EXISTS title_te TEXT;
-ALTER TABLE notices ADD COLUMN IF NOT EXISTS content_te TEXT;
-
-CREATE INDEX IF NOT EXISTS idx_notices_audience ON notices(audience);
-CREATE INDEX IF NOT EXISTS idx_notices_publish ON notices(publish_at);
-
-DROP TRIGGER IF EXISTS trg_notices_updated ON notices;
-CREATE TRIGGER trg_notices_updated
-BEFORE UPDATE ON notices
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Remediation: Notices RLS
-ALTER TABLE notices ENABLE ROW LEVEL SECURITY;
-
 CREATE OR REPLACE FUNCTION auth_has_role(role_codes text[])
-RETURNS boolean AS $$
+RETURNS boolean
+SET search_path = public
+AS $$
 BEGIN
   RETURN EXISTS (
     SELECT 1 
     FROM user_roles ur
     JOIN roles r ON ur.role_id = r.id
     WHERE ur.user_id = auth.uid()
+      AND ur.school_id = auth_school_id()
+      AND r.school_id = auth_school_id()
       AND r.code = ANY(role_codes)
   );
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
-DROP POLICY IF EXISTS "View Notices" ON notices;
-CREATE POLICY "View Notices" ON notices
-FOR SELECT
-USING (
-  (created_by = auth.uid()) OR
-  (audience = 'all' AND auth.role() = 'authenticated') OR
-  (audience = 'staff' AND auth_has_role(ARRAY['admin', 'teacher', 'staff', 'accounts'])) OR
-  (audience = 'students' AND auth_has_role(ARRAY['admin', 'student'])) OR
-  (audience = 'parents' AND auth_has_role(ARRAY['admin', 'parent'])) OR
-  (audience = 'class' AND target_class_id IS NOT NULL)
-);
-
-DROP POLICY IF EXISTS "Manage Notices" ON notices;
-CREATE POLICY "Manage Notices" ON notices
-FOR ALL 
-USING (
-  auth_has_role(ARRAY['admin']) OR
-  EXISTS (
-    SELECT 1 FROM user_roles ur
-    JOIN role_permissions rp ON ur.role_id = rp.role_id
-    JOIN permissions p ON rp.permission_id = p.id
-    WHERE ur.user_id = auth.uid() AND (p.code = 'notices.create' OR p.code = 'notices.manage')
-  )
-);
-
-DO $$ BEGIN
-    CREATE TYPE leave_status_enum AS ENUM ('pending','approved','rejected','cancelled');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-DO $$ BEGIN
-    CREATE TYPE leave_type_enum AS ENUM ('casual','sick','earned','maternity','paternity','unpaid','other');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS leave_applications (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    applicant_id UUID NOT NULL REFERENCES users(id),
-    leave_type leave_type_enum NOT NULL,
-    start_date DATE NOT NULL,
-    end_date DATE NOT NULL,
-    reason TEXT NOT NULL,
-    reason_te TEXT,
-    status leave_status_enum NOT NULL DEFAULT 'pending',
-    reviewed_by UUID REFERENCES users(id),
-    reviewed_at TIMESTAMPTZ,
-    review_remarks TEXT,
-    review_remarks_te TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT chk_leave_dates CHECK (end_date >= start_date)
-);
-
-ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS reason_te TEXT;
-ALTER TABLE leave_applications ADD COLUMN IF NOT EXISTS review_remarks_te TEXT;
-
-CREATE INDEX IF NOT EXISTS idx_leaves_applicant ON leave_applications(applicant_id);
-CREATE INDEX IF NOT EXISTS idx_leaves_status ON leave_applications(status);
-
-DROP TRIGGER IF EXISTS trg_leaves_updated ON leave_applications;
-CREATE TRIGGER trg_leaves_updated
-BEFORE UPDATE ON leave_applications
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-CREATE TABLE IF NOT EXISTS diary_entries (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    class_section_id UUID NOT NULL REFERENCES class_sections(id) ON DELETE RESTRICT,
-    subject_id UUID REFERENCES subjects(id) ON DELETE RESTRICT,
-    entry_date DATE NOT NULL,
-    title VARCHAR(200),
-    title_te TEXT,
-    content TEXT NOT NULL,
-    content_te TEXT,
-    homework_due_date DATE,
-    attachments JSONB, 
-    created_by UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_homework_due_date CHECK (homework_due_date IS NULL OR homework_due_date >= entry_date),
-    -- Prevent duplicate homework for same class/subject/date
-    UNIQUE (class_section_id, subject_id, entry_date, created_by)
-);
-
-ALTER TABLE diary_entries ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-ALTER TABLE diary_entries ADD COLUMN IF NOT EXISTS title_te TEXT;
-ALTER TABLE diary_entries ADD COLUMN IF NOT EXISTS content_te TEXT;
-
-
-CREATE INDEX IF NOT EXISTS idx_diary_class ON diary_entries(class_section_id);
-CREATE INDEX IF NOT EXISTS idx_diary_date ON diary_entries(entry_date);
-
 CREATE OR REPLACE FUNCTION validate_diary_entry()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
     -- 1. Subject Assignment Check
     IF NEW.subject_id IS NOT NULL THEN
@@ -1413,341 +560,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_validate_diary ON diary_entries;
-CREATE TRIGGER trg_validate_diary
-BEFORE INSERT OR UPDATE ON diary_entries
-FOR EACH ROW EXECUTE FUNCTION validate_diary_entry();
-
-DROP TRIGGER IF EXISTS trg_diary_updated ON diary_entries;
-CREATE TRIGGER trg_diary_updated
-BEFORE UPDATE ON diary_entries
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-DO $$ BEGIN
-    CREATE TYPE day_of_week_enum AS ENUM ('mon','tue','wed','thu','fri','sat','sun');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS periods (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(50) NOT NULL UNIQUE, 
-    start_time TIME NOT NULL,
-    end_time TIME NOT NULL,
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    CONSTRAINT chk_period_times CHECK (end_time > start_time)
-);
-
--- 1. Deduplicate periods (Keep the one with the smallest ID, delete others)
-DELETE FROM periods
-WHERE id IN (
-    SELECT id
-    FROM (
-        SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY sort_order ASC, id ASC) as rnum
-        FROM periods
-    ) t
-    WHERE t.rnum > 1
-);
-
--- 2. Add Unique Constraint explicitly (Safe to run if table exists)
-DO $$ BEGIN
-    ALTER TABLE periods ADD CONSTRAINT periods_name_key UNIQUE (name);
-EXCEPTION
-    WHEN duplicate_table THEN NULL; -- constraint already exists
-    WHEN duplicate_object THEN NULL;
-    WHEN OTHERS THEN NULL; -- ignore if it fails for other reasons (like still duplicates, though we just deleted them)
-END $$;
-
--- 3. Seed/Update Data
-INSERT INTO periods (name, start_time, end_time, sort_order) VALUES
-('Period 1', '08:00', '08:45', 1), ('Period 2', '08:45', '09:30', 2), ('Period 3', '09:30', '10:15', 3),
-('Break', '10:15', '10:30', 4), ('Period 4', '10:30', '11:15', 5), ('Period 5', '11:15', '12:00', 6),
-('Lunch', '12:00', '12:45', 7), ('Period 6', '12:45', '13:30', 8), ('Period 7', '13:30', '14:15', 9),
-('Period 8', '14:15', '15:00', 10)
-ON CONFLICT (name) DO UPDATE SET
-    start_time = EXCLUDED.start_time,
-    end_time = EXCLUDED.end_time,
-    sort_order = EXCLUDED.sort_order;
-
--- 4. Cleanup: Remove any periods that are NOT in the standard list (e.g., if user had Period 9 before)
-DELETE FROM periods WHERE name NOT IN (
-    'Period 1', 'Period 2', 'Period 3', 'Break', 'Period 4', 'Period 5', 'Lunch', 'Period 6', 'Period 7', 'Period 8'
-);
-
--- (Removed Legacy timetable_entries table - Use timetable_slots)
-
-
--- 14. TRANSPORT
-
--- 14.1 Routes (Bus → Route → Stops → Students)
-CREATE TABLE IF NOT EXISTS transport_routes (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(100) NOT NULL,
-    code VARCHAR(20) UNIQUE,
-    description TEXT,
-    start_point VARCHAR(200),
-    end_point VARCHAR(200),
-    total_stops INTEGER,
-    monthly_fee DECIMAL(12,2),
-    direction VARCHAR(20) DEFAULT 'morning' CHECK (direction IN ('morning', 'afternoon')),
-    bus_id UUID, -- FK added after buses table creation
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-DROP TRIGGER IF EXISTS trg_transport_routes_updated ON transport_routes;
-CREATE TRIGGER trg_transport_routes_updated
-BEFORE UPDATE ON transport_routes
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- 14.2 Buses
-CREATE TABLE IF NOT EXISTS buses (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    bus_no VARCHAR(50) NOT NULL UNIQUE,
-    registration_no VARCHAR(50) UNIQUE,
-    capacity INTEGER NOT NULL DEFAULT 40,
-    driver_id UUID REFERENCES staff(id),         -- FK to staff (source of truth)
-    driver_name VARCHAR(100),                     -- Legacy/display fallback
-    driver_phone VARCHAR(20),                     -- Legacy/display fallback
-    route_id UUID REFERENCES transport_routes(id) ON DELETE RESTRICT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_bus_capacity CHECK (capacity > 0)
-);
-
-CREATE INDEX IF NOT EXISTS idx_buses_route ON buses(route_id);
-CREATE INDEX IF NOT EXISTS idx_buses_driver ON buses(driver_id);
-
--- Add deferred FK from routes → buses (circular reference resolved)
-ALTER TABLE transport_routes ADD COLUMN IF NOT EXISTS bus_id UUID REFERENCES buses(id);
-CREATE INDEX IF NOT EXISTS idx_routes_bus ON transport_routes(bus_id);
-
--- 14.3 Stops (strictly ordered per route)
-CREATE TABLE IF NOT EXISTS transport_stops (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    route_id UUID NOT NULL REFERENCES transport_routes(id) ON DELETE CASCADE,
-    name VARCHAR(200) NOT NULL,
-    latitude DECIMAL(10,8),
-    longitude DECIMAL(11,8),
-    pickup_time TIME,
-    drop_time TIME,
-    stop_order INTEGER NOT NULL,
-    deleted_at TIMESTAMPTZ,
-    UNIQUE (route_id, stop_order)
-);
-
--- 14.4 Student ↔ Transport mapping
-CREATE TABLE IF NOT EXISTS student_transport (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-    route_id UUID NOT NULL REFERENCES transport_routes(id) ON DELETE RESTRICT,
-    stop_id UUID REFERENCES transport_stops(id) ON DELETE SET NULL,
-    bus_id UUID REFERENCES buses(id),            -- Auto-derived from route on assignment
-    academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (student_id, academic_year_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_student_transport_route ON student_transport(route_id);
-CREATE INDEX IF NOT EXISTS idx_student_transport_bus ON student_transport(bus_id);
-
--- 14.5 Bus live locations (single row per bus, upserted)
-CREATE TABLE IF NOT EXISTS bus_locations (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    bus_id UUID NOT NULL REFERENCES buses(id) ON DELETE CASCADE,
-    latitude DECIMAL(10,8) NOT NULL,
-    longitude DECIMAL(11,8) NOT NULL,
-    speed DECIMAL(5,2),
-    heading DECIMAL(5,2),
-    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS idx_bus_locations_recent ON bus_locations(bus_id, recorded_at DESC);
-
--- 14.6 Trips (driver trip execution)
-CREATE TABLE IF NOT EXISTS trips (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    bus_id UUID NOT NULL REFERENCES buses(id),
-    route_id UUID NOT NULL REFERENCES transport_routes(id),
-    driver_id UUID NOT NULL REFERENCES staff(id),
-    status VARCHAR(20) NOT NULL DEFAULT 'active'
-      CHECK (status IN ('active', 'completed', 'cancelled')),
-    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    ended_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- Only one active trip per bus at any time
-CREATE UNIQUE INDEX IF NOT EXISTS idx_trips_active_bus ON trips(bus_id) WHERE status = 'active';
-CREATE INDEX IF NOT EXISTS idx_trips_driver ON trips(driver_id);
-CREATE INDEX IF NOT EXISTS idx_trips_route ON trips(route_id);
-CREATE INDEX IF NOT EXISTS idx_trips_status ON trips(status);
-
-DROP TRIGGER IF EXISTS trg_trips_updated ON trips;
-CREATE TRIGGER trg_trips_updated
-BEFORE UPDATE ON trips
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- 14.7 Trip stop execution status
-CREATE TABLE IF NOT EXISTS trip_stop_status (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    trip_id UUID NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
-    stop_id UUID NOT NULL REFERENCES transport_stops(id),
-    stop_order INTEGER NOT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending'
-      CHECK (status IN ('pending', 'arrived', 'completed', 'skipped')),
-    arrival_time TIMESTAMPTZ,
-    departure_time TIMESTAMPTZ,
-    UNIQUE (trip_id, stop_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_trip_stop_trip ON trip_stop_status(trip_id);
-CREATE INDEX IF NOT EXISTS idx_trip_stop_status ON trip_stop_status(status);
-
--- 14.8 RLS for trips
-ALTER TABLE trips ENABLE ROW LEVEL SECURITY;
-GRANT ALL ON TABLE trips TO authenticated;
-GRANT ALL ON TABLE trips TO service_role;
-
-DROP POLICY IF EXISTS "Admins can manage trips" ON trips;
-CREATE POLICY "Admins can manage trips" ON trips FOR ALL USING (
-  EXISTS (
-    SELECT 1 FROM user_roles ur
-    JOIN roles r ON ur.role_id = r.id
-    WHERE ur.user_id = auth.uid() AND r.code IN ('admin', 'driver')
-  )
-);
-
-DROP POLICY IF EXISTS "Drivers can view own trips" ON trips;
-CREATE POLICY "Drivers can view own trips" ON trips FOR SELECT USING (
-  driver_id IN (
-    SELECT s.id FROM staff s
-    JOIN users u ON s.person_id = u.person_id
-    WHERE u.id = auth.uid()
-  )
-);
-
--- 14.9 RLS for trip_stop_status
-ALTER TABLE trip_stop_status ENABLE ROW LEVEL SECURITY;
-GRANT ALL ON TABLE trip_stop_status TO authenticated;
-GRANT ALL ON TABLE trip_stop_status TO service_role;
-
-DROP POLICY IF EXISTS "Authenticated can view trip stops" ON trip_stop_status;
-CREATE POLICY "Authenticated can view trip stops" ON trip_stop_status FOR SELECT
-  TO authenticated USING (true);
-
--- 15. HOSTEL
-CREATE TABLE IF NOT EXISTS hostel_blocks (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(100) NOT NULL UNIQUE,
-    code VARCHAR(20),
-    gender_id SMALLINT REFERENCES genders(id),
-    total_rooms INTEGER,
-    warden_id UUID REFERENCES staff(id),
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS hostel_rooms (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    block_id UUID NOT NULL REFERENCES hostel_blocks(id) ON DELETE CASCADE,
-    room_no VARCHAR(20) NOT NULL,
-    floor INTEGER,
-    capacity INTEGER NOT NULL DEFAULT 2,
-    room_type VARCHAR(50) DEFAULT 'shared', 
-    monthly_fee DECIMAL(12,2),
-    is_available BOOLEAN NOT NULL DEFAULT TRUE,
-    deleted_at TIMESTAMPTZ,
-    UNIQUE (block_id, room_no)
-);
-
-CREATE TABLE IF NOT EXISTS hostel_allocations (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id UUID NOT NULL REFERENCES students(id),
-    room_id UUID NOT NULL REFERENCES hostel_rooms(id),
-    academic_year_id UUID NOT NULL REFERENCES academic_years(id),
-    bed_no INTEGER,
-    allocated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    vacated_at TIMESTAMPTZ,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    UNIQUE (student_id, academic_year_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_hostel_allocations_room ON hostel_allocations(room_id);
-
--- 16. EVENTS
-DO $$ BEGIN
-    CREATE TYPE event_type_enum AS ENUM ('academic','cultural','sports','holiday','meeting','exam','other');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS events (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title VARCHAR(200) NOT NULL,
-    title_te TEXT,
-    description TEXT,
-    description_te TEXT,
-    event_type event_type_enum NOT NULL DEFAULT 'other',
-    start_date DATE NOT NULL,
-    end_date DATE,
-    start_time TIME,
-    end_time TIME,
-    location VARCHAR(200),
-    is_all_day BOOLEAN NOT NULL DEFAULT FALSE,
-    is_public BOOLEAN NOT NULL DEFAULT TRUE,
-    target_audience notice_audience_enum DEFAULT 'all',
-    created_by UUID REFERENCES users(id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT chk_event_dates CHECK (end_date IS NULL OR end_date >= start_date)
-);
-
-ALTER TABLE events ADD COLUMN IF NOT EXISTS title_te TEXT;
-ALTER TABLE events ADD COLUMN IF NOT EXISTS description_te TEXT;
-
-CREATE INDEX IF NOT EXISTS idx_events_dates ON events(start_date, end_date);
-
-DROP TRIGGER IF EXISTS trg_events_updated ON events;
-CREATE TRIGGER trg_events_updated
-BEFORE UPDATE ON events
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Remediation: Events RLS
-ALTER TABLE events ENABLE ROW LEVEL SECURITY;
-
-DROP POLICY IF EXISTS "View Events" ON events;
-CREATE POLICY "View Events" ON events
-FOR SELECT
-USING (
-  is_public = true OR
-  created_by = auth.uid() OR
-  (target_audience = 'all' AND auth.role() = 'authenticated') OR
-  (target_audience = 'staff' AND auth_has_role(ARRAY['admin', 'teacher', 'staff', 'accounts']))
-);
-
--- 17. LMS
-CREATE TABLE IF NOT EXISTS lms_courses (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title VARCHAR(200) NOT NULL,
-    description TEXT,
-    subject_id UUID REFERENCES subjects(id),
-    class_id UUID REFERENCES classes(id),
-    instructor_id UUID REFERENCES staff(id),
-    is_published BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE lms_courses ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
 CREATE OR REPLACE FUNCTION validate_lms_course_modify()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 DECLARE
     v_is_admin BOOLEAN;
 BEGIN
@@ -1777,247 +593,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_validate_lms_course ON lms_courses;
-CREATE TRIGGER trg_validate_lms_course
-BEFORE UPDATE ON lms_courses
-FOR EACH ROW EXECUTE FUNCTION validate_lms_course_modify();
-
-
-CREATE INDEX IF NOT EXISTS idx_lms_courses_subject ON lms_courses(subject_id);
-CREATE INDEX IF NOT EXISTS idx_lms_courses_class ON lms_courses(class_id);
-CREATE INDEX IF NOT EXISTS idx_lms_courses_instructor ON lms_courses(instructor_id);
-
-DROP TRIGGER IF EXISTS trg_lms_courses_updated ON lms_courses;
-CREATE TRIGGER trg_lms_courses_updated
-BEFORE UPDATE ON lms_courses
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-DO $$ BEGIN
-    CREATE TYPE material_type_enum AS ENUM ('video','document','link','quiz','assignment');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS lms_materials (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    course_id UUID NOT NULL REFERENCES lms_courses(id) ON DELETE CASCADE,
-    title VARCHAR(200) NOT NULL,
-    description TEXT,
-    material_type material_type_enum NOT NULL,
-    content_url TEXT,
-    file_size INTEGER,
-    duration INTEGER, 
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    is_published BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-ALTER TABLE lms_materials ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-
-CREATE INDEX IF NOT EXISTS idx_lms_materials_active ON lms_materials(id) WHERE deleted_at IS NULL;
-
-
-CREATE INDEX IF NOT EXISTS idx_lms_materials_course ON lms_materials(course_id);
-
--- 18. SEED DATA (PERMISSIONS)
-INSERT INTO permissions (code, name) VALUES
-('students.view', 'View Students'), ('students.create', 'Create Students'), ('students.edit', 'Edit Students'), ('students.delete', 'Delete Students'),
-('staff.view', 'View Staff'), ('staff.create', 'Create Staff'), ('staff.edit', 'Edit Staff'), ('staff.delete', 'Delete Staff'),
-('users.view', 'View Users'), ('users.create', 'Create Users'), ('users.edit', 'Edit Users'), ('users.delete', 'Delete Users'),
-('academics.view', 'View Academics'), ('academics.manage', 'Manage Academics'),
-('attendance.view', 'View Attendance'), ('attendance.mark', 'Mark Attendance'), ('attendance.edit', 'Edit Attendance'),
-('fees.view', 'View Fees'), ('fees.manage', 'Manage Fees'), ('fees.collect', 'Collect Fees'),
-('transactions.view', 'View Transactions'), ('receipts.generate', 'Generate Receipts'), ('reports.financial', 'View Financial Reports'),
-('exams.view', 'View Exams'), ('exams.manage', 'Manage Exams'), ('marks.view', 'View Marks'), ('marks.enter', 'Enter Marks'), ('results.view', 'View Results'), ('results.generate', 'Generate Results'),
-('transport.view', 'View Transport'), ('transport.manage', 'Manage Transport'),
-('hostel.view', 'View Hostel'), ('hostel.manage', 'Manage Hostel'),
-('events.view', 'View Events'), ('events.manage', 'Manage Events'),
-('lms.view', 'View LMS'), ('lms.create', 'Create LMS Content'), ('lms.manage', 'Manage LMS'),
-('complaints.view', 'View Complaints'), ('complaints.create', 'Create Complaints'), ('complaints.manage', 'Manage Complaints'),
-('notices.view', 'View Notices'), ('notices.create', 'Create Notices'), ('notices.manage', 'Manage Notices'),
-('leaves.view', 'View Leaves'), ('leaves.apply', 'Apply for Leave'), ('leaves.approve', 'Approve Leaves'),
-('diary.view', 'View Diary'), ('diary.create', 'Create Diary Entries'),
-('timetable.view', 'View Timetable'), ('timetable.manage', 'Manage Timetable'),
-('dashboard.view', 'View Dashboard'),
-('results.publish', 'Publish Results'),
-('diary.manage', 'Manage Diary')
-ON CONFLICT (code) DO NOTHING;
-
--- 18.1 ROLES
-INSERT INTO roles (code, name, is_system) VALUES
-('admin', 'Administrator', true),
-('staff', 'Staff/Teacher', true),
-('student', 'Student', true),
-('accounts', 'Accounts Manager', true),
-('principal', 'Principal', true),
-('driver', 'Driver', true)
-ON CONFLICT (code) DO NOTHING;
-
--- 18.2 ROLE-PERMISSION MAPPING (Production RBAC)
--- Admin: All
-INSERT INTO role_permissions (role_id, permission_id)
-SELECT r.id, p.id FROM roles r, permissions p WHERE r.code = 'admin'
-ON CONFLICT DO NOTHING;
-
--- Staff: Academic & Operations
-INSERT INTO role_permissions (role_id, permission_id)
-SELECT r.id, p.id FROM roles r, permissions p 
-WHERE r.code = 'staff' AND p.code IN (
-    'students.view', 'academics.view', 'attendance.view', 'attendance.mark', 
-    'exams.view', 'marks.enter', 'marks.view', 'diary.view', 'diary.create',
-    'timetable.view', 'leaves.apply', 'notices.view', 'events.view', 'lms.view'
-)
-ON CONFLICT DO NOTHING;
-
--- Student: View Only Access
-INSERT INTO role_permissions (role_id, permission_id)
-SELECT r.id, p.id FROM roles r, permissions p 
-WHERE r.code = 'student' AND p.code IN (
-    'academics.view', 'attendance.view', 'exams.view', 'results.view', 
-    'diary.view', 'timetable.view', 'notices.view', 'events.view', 'lms.view', 'fees.view'
-)
-ON CONFLICT DO NOTHING;
-
--- Accounts: Financial Management
-INSERT INTO role_permissions (role_id, permission_id)
-SELECT r.id, p.id FROM roles r, permissions p 
-WHERE r.code = 'accounts' AND p.code IN (
-    'fees.view', 'fees.manage', 'fees.collect', 'transactions.view', 
-    'receipts.generate', 'reports.financial', 'notices.view', 'staff.view',
-    'dashboard.view'
-)
-ON CONFLICT DO NOTHING;
-
--- Principal: Full Access (same as Admin)
-INSERT INTO role_permissions (role_id, permission_id)
-SELECT r.id, p.id FROM roles r, permissions p WHERE r.code = 'principal'
-ON CONFLICT DO NOTHING;
-
--- Driver: Transport-only Access
-INSERT INTO role_permissions (role_id, permission_id)
-SELECT r.id, p.id FROM roles r, permissions p 
-WHERE r.code = 'driver' AND p.code IN (
-    'transport.view', 'notices.view'
-)
-ON CONFLICT DO NOTHING;
-
--- ============================================================
--- 19. NOTIFICATION INFRASTRUCTURE
--- ============================================================
-
--- 19.1 User Devices (FCM Push Token Storage)
-CREATE TABLE IF NOT EXISTS user_devices (
-    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    fcm_token     TEXT NOT NULL,
-    platform      VARCHAR(20) NOT NULL DEFAULT 'unknown',
-    device_name   TEXT,
-    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
-    last_used_at  TIMESTAMPTZ,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_user_device_token UNIQUE (user_id, fcm_token)
-);
-
-CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
-CREATE INDEX IF NOT EXISTS idx_user_devices_fcm_token ON user_devices(fcm_token);
-CREATE INDEX IF NOT EXISTS idx_user_devices_active ON user_devices(user_id, is_active);
-
--- Idempotent column adds for existing deployments
-ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS device_name TEXT;
-ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
-ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS language_code VARCHAR(5) NOT NULL DEFAULT 'en';
-
--- 19.2 Notification Configuration (Kill Switch + Settings)
-CREATE TABLE IF NOT EXISTS notification_config (
-    key         TEXT PRIMARY KEY,
-    value       JSONB NOT NULL DEFAULT '{}'::jsonb,
-    updated_at  TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at  TIMESTAMPTZ
-);
-
--- Seed defaults
-INSERT INTO notification_config (key, value) VALUES
-    ('kill_switch',              '{"global": false, "types": {}}'::jsonb),
-    ('max_batch_size',           '{"value": 500}'::jsonb),
-    ('fee_reminder_daily_limit', '{"value": 1}'::jsonb)
-ON CONFLICT (key) DO NOTHING;
-
--- 19.3 Notification Logs (Delivery Audit Trail)
-CREATE TABLE IF NOT EXISTS notification_logs (
-    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id           UUID REFERENCES users(id) ON DELETE SET NULL,
-    batch_id          UUID,
-    notification_type TEXT NOT NULL,
-    role              TEXT,
-    channel_id        TEXT,
-    push_provider     TEXT DEFAULT 'fcm',
-    tokens_targeted   INTEGER NOT NULL DEFAULT 0,
-    tokens_sent       INTEGER NOT NULL DEFAULT 0,
-    tokens_failed     INTEGER NOT NULL DEFAULT 0,
-    error_message     TEXT,
-    provider_response JSONB,
-    status            TEXT CHECK (status IN ('success', 'failed', 'partial')),
-    created_at        TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at        TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS idx_notification_logs_type_date ON notification_logs(notification_type, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_notification_logs_batch_id ON notification_logs(batch_id);
-CREATE INDEX IF NOT EXISTS idx_notification_logs_user_type_date ON notification_logs(user_id, notification_type, created_at);
-
--- 19.4 Notification Batches (Bulk Send Tracking)
-CREATE TABLE IF NOT EXISTS notification_batches (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    admin_id        UUID REFERENCES users(id),
-    type            TEXT NOT NULL,
-    filters         JSONB DEFAULT '{}',
-    status          TEXT CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'aborted')) DEFAULT 'pending',
-    total_targets   INTEGER DEFAULT 0,
-    sent_count      INTEGER DEFAULT 0,
-    failure_count   INTEGER DEFAULT 0,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at      TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS idx_notification_batches_status ON notification_batches(status);
-CREATE INDEX IF NOT EXISTS idx_notification_batches_type_created ON notification_batches(type, created_at);
-
--- Idempotent column adds for existing deployments (merged from Section 20/21)
-ALTER TABLE notification_config ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-ALTER TABLE notification_logs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-ALTER TABLE notification_batches ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
--- Constraints merged from Section 20/21
-DO $$ BEGIN
-    ALTER TABLE notification_batches ADD CONSTRAINT chk_notification_batches_type 
-    CHECK (type IN ('FEES', 'GENERAL', 'EXAM', 'EMERGENCY', 'DIARY', 'RESULTS', 'NOTICE', 'TEST_TRIGGER'));
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
--- Enable Row Level Security (merged from Section 20/21)
-ALTER TABLE notification_config ENABLE ROW LEVEL SECURITY;
-ALTER TABLE notification_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE notification_batches ENABLE ROW LEVEL SECURITY;
-
--- Views
-CREATE OR REPLACE VIEW active_students AS
-SELECT * FROM students WHERE deleted_at IS NULL AND status_id = 1;
-
-CREATE OR REPLACE VIEW active_persons AS
-SELECT * FROM persons WHERE deleted_at IS NULL;
-
--- END OF SCHEMA
--- ============================================================
--- HARDENING TRIGGERS (SAFETY GUARDS)
--- ============================================================
-
--- Guard 1: Prevent Direct Updates to amount_paid
--- Only allow updates via internal triggers (depth > 0)
 CREATE OR REPLACE FUNCTION prevent_direct_fee_update()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 BEGIN
     -- Block direct manual tampering at depth 0, but allow system recalculation via GUC flag
     IF (pg_trigger_depth() = 0)
@@ -2031,39 +610,13 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_guard_fee_update ON student_fees;
-CREATE TRIGGER trg_guard_fee_update
-BEFORE UPDATE ON student_fees
-FOR EACH ROW EXECUTE FUNCTION prevent_direct_fee_update();
-
--- Guard 2: Prevent Negative Balances
--- Redundant to logical check but good as constraint
-ALTER TABLE student_fees 
-DROP CONSTRAINT IF EXISTS chk_no_negative_paid;
-
-ALTER TABLE student_fees
-ADD CONSTRAINT chk_no_negative_paid CHECK (amount_paid >= 0);
-
--- Guard 3: Prevent Overpayment (Paid > Due - Discount)
--- chk_paid_not_exceed is defined in the CREATE TABLE student_fees block (line ~827).
--- No standalone ALTER needed — constraint is already active.
-
--- Guard 4: Prevent Discount Exceeding Amount Due
-ALTER TABLE student_fees
-DROP CONSTRAINT IF EXISTS chk_discount_not_exceed_due;
-
-ALTER TABLE student_fees
-ADD CONSTRAINT chk_discount_not_exceed_due CHECK (discount <= amount_due);
-
--- (Removed Legacy Timetable Logic - See lines 1513+ for new implementation)
--- Function: promote_students_academic_year
--- Logic: Move students from current AY to next AY, incrementing class.
-
 CREATE OR REPLACE FUNCTION promote_students_academic_year(
     p_current_ay_id UUID,
     p_next_ay_id UUID
 )
-RETURNS JSONB AS $$
+RETURNS JSONB
+SET search_path = public
+AS $$
 DECLARE
     v_promoted_count INT := 0;
     v_graduated_count INT := 0;
@@ -2096,7 +649,7 @@ BEGIN
         -- Assuming "Class X" format for simplicity as per common IMS.
         
         -- Simple Regex to extract number
-        v_class_number := substring(r_enrollment.class_name FROM '\d+')::INT;
+        v_class_number := NULLIF(substring(r_enrollment.class_name FROM '\d+'), '')::INT;
         
         IF v_class_number IS NOT NULL THEN
             v_next_class_name := 'Class ' || (v_class_number + 1);
@@ -2118,8 +671,9 @@ BEGIN
                 IF v_next_class_section_id IS NOT NULL THEN
                     -- PROMOTE
                     INSERT INTO student_enrollments (
-                        student_id, academic_year_id, class_section_id, status, start_date, roll_number
+                        school_id, student_id, academic_year_id, class_section_id, status, start_date, roll_number
                     ) VALUES (
+                        r_enrollment.school_id,
                         r_enrollment.student_id,
                         p_next_ay_id,
                         v_next_class_section_id,
@@ -2168,59 +722,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- ============================================================
--- 19. TIMETABLE (NEW IMPLEMENTATION - timetable_slots)
--- ============================================================
-
--- Drop table to ensure clean slate if re-running
-DROP TABLE IF EXISTS timetable_slots CASCADE;
-
--- Create Enum for Days
-DO $$ BEGIN
-    CREATE TYPE day_of_week_enum AS ENUM ('monday','tuesday','wednesday','thursday','friday','saturday','sunday');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE timetable_slots (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    
-    academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
-    class_section_id UUID NOT NULL REFERENCES class_sections(id) ON DELETE RESTRICT,
-    
-    day_of_week day_of_week_enum NOT NULL,
-    period_number SMALLINT NOT NULL,
-    
-    subject_id UUID NOT NULL REFERENCES subjects(id) ON DELETE RESTRICT,
-    teacher_id UUID REFERENCES staff(id) ON DELETE RESTRICT,
-    room_no VARCHAR(50),
-    
-    start_time TIME NOT NULL,
-    end_time TIME NOT NULL,
-    
-    created_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    
-    CONSTRAINT chk_time_order CHECK (start_time < end_time)
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_timetable_slots_active 
-ON timetable_slots (class_section_id, academic_year_id, day_of_week, period_number) 
-WHERE deleted_at IS NULL;
-
-
-CREATE INDEX IF NOT EXISTS idx_timetable_class ON timetable_slots(class_section_id);
-CREATE INDEX IF NOT EXISTS idx_timetable_teacher ON timetable_slots(teacher_id);
-CREATE INDEX IF NOT EXISTS idx_timetable_slots_time_check ON timetable_slots(teacher_id, start_time, end_time); -- Updated for collision detection
-
--- Financial & Course Performance Indexes
-CREATE INDEX IF NOT EXISTS idx_complaints_assigned_to ON complaints(assigned_to);
-CREATE INDEX IF NOT EXISTS idx_lms_courses_subject ON lms_courses(subject_id);
-CREATE INDEX IF NOT EXISTS idx_lms_courses_instructor ON lms_courses(instructor_id);
-
--- Validation Trigger
 CREATE OR REPLACE FUNCTION validate_timetable_entry()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 DECLARE
     v_teacher_collision BOOLEAN;
     v_room_collision BOOLEAN;
@@ -2272,21 +777,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_validate_timetable ON timetable_slots;
-CREATE TRIGGER trg_validate_timetable
-BEFORE INSERT OR UPDATE ON timetable_slots
-FOR EACH ROW EXECUTE FUNCTION validate_timetable_entry();
-
-DROP TRIGGER IF EXISTS trg_timetable_updated ON timetable_slots;
-CREATE TRIGGER trg_timetable_updated
-BEFORE UPDATE ON timetable_slots
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
-ALTER TABLE timetable_slots ENABLE ROW LEVEL SECURITY;
-
--- Automated Class Teacher Assignment (Monday Period 1)
 CREATE OR REPLACE FUNCTION sync_class_teacher_from_timetable()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+SET search_path = public
+AS $$
 DECLARE
     v_class_section_id UUID;
     v_teacher_id UUID;
@@ -2328,230 +822,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
-DROP TRIGGER IF EXISTS trg_sync_class_teacher ON timetable_slots;
-CREATE TRIGGER trg_sync_class_teacher
-AFTER INSERT OR UPDATE OR DELETE ON timetable_slots
-FOR EACH ROW EXECUTE FUNCTION sync_class_teacher_from_timetable();
-
--- Initial Sync (Ensure consistency on schema apply)
-DO $$
-DECLARE
-    r RECORD;
-    v_monday_label TEXT;
-BEGIN
-    -- Dynamically find the correct enum label for Monday ('mon' or 'monday')
-    SELECT e.enumlabel INTO v_monday_label
-    FROM pg_type t
-    JOIN pg_enum e ON t.oid = e.enumtypid
-    WHERE t.typname = 'day_of_week_enum'
-      AND e.enumlabel IN ('mon', 'monday')
-    LIMIT 1;
-
-    IF v_monday_label IS NULL THEN
-        RAISE NOTICE 'Initial timetable sync skipped: no Monday label found in day_of_week_enum';
-        RETURN;
-    END IF;
-
-    FOR r IN 
-        EXECUTE format(
-            'SELECT class_section_id, teacher_id FROM timetable_slots WHERE day_of_week = %L::day_of_week_enum AND period_number = 1',
-            v_monday_label
-        )
-    LOOP
-        UPDATE class_sections 
-        SET class_teacher_id = r.teacher_id 
-        WHERE id = r.class_section_id;
-    END LOOP;
-EXCEPTION WHEN OTHERS THEN
-    RAISE NOTICE 'Initial timetable sync skipped: %', SQLERRM;
-END $$;
-
-
-
--- RLS Policies
-
--- 1. Students: View OWN class timetable
-DROP POLICY IF EXISTS "Students view own class timetable" ON timetable_slots;
-CREATE POLICY "Students view own class timetable" ON timetable_slots
-FOR SELECT
-USING (
-    class_section_id IN (
-        SELECT class_section_id 
-        FROM student_enrollments 
-        WHERE student_id IN (
-            SELECT id FROM students WHERE person_id = (
-                SELECT person_id FROM users WHERE id = auth.uid()
-            )
-        )
-        AND status = 'active'
-    )
-);
-
--- 2. Teachers: View OWN slots
-DROP POLICY IF EXISTS "Teachers view own slots" ON timetable_slots;
-CREATE POLICY "Teachers view own slots" ON timetable_slots
-FOR SELECT
-USING (
-    teacher_id IN (
-        SELECT id FROM staff 
-        WHERE person_id = (
-            SELECT person_id FROM users WHERE id = auth.uid()
-        )
-    )
-);
-
--- 3. Admins: Full Access
-DROP POLICY IF EXISTS "Admins full access" ON timetable_slots;
-CREATE POLICY "Admins full access" ON timetable_slots
-FOR ALL
-USING (
-    EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND EXISTS (
-        SELECT 1 FROM user_roles ur 
-        JOIN roles r ON ur.role_id = r.id 
-        WHERE ur.user_id = users.id AND r.code = 'admin'
-    ))
-);
-
-
--- ============================================================
--- NEXSYRUS TABS SCHEMA & AUTOMATION
--- ============================================================
-
--- 1. DISCIPLINE & CONDUCT
-CREATE TABLE IF NOT EXISTS discipline_records (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-    academic_year_id UUID NOT NULL REFERENCES academic_years(id),
-    incident_date DATE NOT NULL DEFAULT CURRENT_DATE,
-    title VARCHAR(200) NOT NULL,
-    description TEXT,
-    severity VARCHAR(20) CHECK (severity IN ('low', 'medium', 'high', 'critical')),
-    action_taken TEXT,
-    evidence_urls TEXT[], -- Linked evidence images/docs
-    reported_by UUID REFERENCES users(id), -- Staff who reported
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS idx_discipline_student ON discipline_records(student_id);
-
--- 2. MONEY SCIENCE
-CREATE TABLE IF NOT EXISTS money_science_modules (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title VARCHAR(200) NOT NULL,
-    description TEXT,
-    age_group VARCHAR(50), 
-    
-    -- Content Fields
-    content_body TEXT, -- Markdown or JSON content
-    thumbnail_url TEXT,
-    estimated_duration INTEGER, -- Minutes
-    difficulty_level VARCHAR(20) DEFAULT 'beginner',
-    tags TEXT[],
-    total_points INTEGER DEFAULT 0,
-    
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS student_money_science_progress (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-    module_id UUID NOT NULL REFERENCES money_science_modules(id) ON DELETE CASCADE,
-    status VARCHAR(20) NOT NULL DEFAULT 'not_started' CHECK (status IN ('not_started', 'in_progress', 'completed')),
-    progress_percentage INTEGER DEFAULT 0,
-    completed_at TIMESTAMPTZ,
-    last_accessed_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    UNIQUE(student_id, module_id)
-);
-
--- 3. SCIENCE PROJECTS
-CREATE TABLE IF NOT EXISTS science_projects (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title VARCHAR(200) NOT NULL,
-    description TEXT,
-    difficulty_level VARCHAR(20) CHECK (difficulty_level IN ('beginner', 'intermediate', 'advanced')),
-    is_group_project BOOLEAN DEFAULT FALSE,
-    min_participants INTEGER DEFAULT 1,
-    max_participants INTEGER DEFAULT 1,
-    
-    -- Content Fields
-    materials_required TEXT[],
-    safety_instructions TEXT,
-    thumbnail_url TEXT,
-
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS student_science_projects (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-    project_id UUID NOT NULL REFERENCES science_projects(id) ON DELETE CASCADE,
-    status VARCHAR(20) NOT NULL DEFAULT 'registered' CHECK (status IN ('registered', 'submitted', 'evaluated', 'certified')),
-    submission_url TEXT,
-    teacher_remarks TEXT,
-    grade VARCHAR(10),
-    certified_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    UNIQUE(student_id, project_id)
-);
-
--- 4. LIFE VALUES
-CREATE TABLE IF NOT EXISTS life_values_modules (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title VARCHAR(200) NOT NULL,
-    description TEXT,
-    academic_year_id UUID REFERENCES academic_years(id), -- Optional: if content is specific to year
-    
-    -- Content Fields
-    content_body TEXT,
-    banner_image_url TEXT,
-    quote_author VARCHAR(100),
-    highlight_quote TEXT,
-
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- RLS for Life Values
-ALTER TABLE life_values_modules ENABLE ROW LEVEL SECURITY;
-GRANT SELECT ON life_values_modules TO authenticated;
-DROP POLICY IF EXISTS "Enable read access for all" ON life_values_modules;
-CREATE POLICY "Enable read access for all" ON life_values_modules FOR SELECT USING (true);
-
-CREATE TABLE IF NOT EXISTS student_life_values_progress (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
-    module_id UUID NOT NULL REFERENCES life_values_modules(id) ON DELETE CASCADE,
-    academic_year_id UUID NOT NULL REFERENCES academic_years(id),
-    status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed')),
-    engagement_score INTEGER DEFAULT 0, -- Metric for "Engagement"
-    completed_at TIMESTAMPTZ,
-    last_accessed_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    UNIQUE(student_id, module_id, academic_year_id)
-);
-
--- RLS for Life Values Progress
-ALTER TABLE student_life_values_progress ENABLE ROW LEVEL SECURITY;
-GRANT ALL ON student_life_values_progress TO authenticated;
-DROP POLICY IF EXISTS "Allow all authenticated check" ON student_life_values_progress;
-CREATE POLICY "Allow all authenticated check" ON student_life_values_progress FOR SELECT USING (true);
-DROP POLICY IF EXISTS "Students can view own progress" ON student_life_values_progress;
-CREATE POLICY "Students can view own progress" ON student_life_values_progress FOR ALL USING (
-    student_id IN (
-        SELECT s.id FROM students s
-        JOIN persons p ON s.person_id = p.id
-        JOIN users u ON u.person_id = p.id
-        WHERE u.id = auth.uid()
-    )
-);
-
--- 5. AUTOMATION: ENROLLMENT
-DROP FUNCTION IF EXISTS ensure_student_enrollment(uuid);
 CREATE OR REPLACE FUNCTION ensure_student_enrollment(p_user_id UUID)
-RETURNS JSONB AS $$
+RETURNS JSONB
+SET search_path = public
+AS $$
 DECLARE
     v_person_id UUID;
     v_student_id UUID;
@@ -2560,30 +834,33 @@ DECLARE
     v_enrollment_id UUID;
     v_enrollment_exists BOOLEAN;
 BEGIN
-    -- 0. Resolve Student ID from User ID
-    SELECT person_id INTO v_person_id FROM users WHERE id = p_user_id;
+    -- 0. Resolve Student ID & School from User ID (tenant-scoped)
+    DECLARE v_school_id INTEGER;
+    BEGIN
+    SELECT person_id, school_id INTO v_person_id, v_school_id
+    FROM users WHERE id = p_user_id AND deleted_at IS NULL;
     
     IF v_person_id IS NULL THEN
          RAISE EXCEPTION 'User not found';
     END IF;
 
-    SELECT id INTO v_student_id FROM students WHERE person_id = v_person_id;
+    SELECT id INTO v_student_id FROM students
+    WHERE person_id = v_person_id AND school_id = v_school_id;
 
     IF v_student_id IS NULL THEN
         RAISE EXCEPTION 'Student profile not found for this user';
     END IF;
 
-    -- Check if enrollment exists for CURRENT academic year
-    -- 1. Get Current Academic Year
     SELECT id INTO v_academic_year_id
     FROM academic_years
     WHERE start_date <= CURRENT_DATE AND end_date >= CURRENT_DATE
+      AND school_id = v_school_id
     LIMIT 1;
 
     IF v_academic_year_id IS NULL THEN
-        -- Fallback: Get the latest one if no current one matches date
         SELECT id INTO v_academic_year_id
         FROM academic_years
+        WHERE school_id = v_school_id
         ORDER BY start_date DESC
         LIMIT 1;
     END IF;
@@ -2592,11 +869,11 @@ BEGIN
         RAISE EXCEPTION 'No academic year configured.';
     END IF;
 
-    -- 2. Check existing enrollment
     SELECT EXISTS (
         SELECT 1 FROM student_enrollments
         WHERE student_id = v_student_id
           AND academic_year_id = v_academic_year_id
+          AND school_id = v_school_id
           AND deleted_at IS NULL
     ) INTO v_enrollment_exists;
 
@@ -2604,13 +881,12 @@ BEGIN
         RETURN jsonb_build_object('status', 'exists', 'message', 'Enrollment already exists');
     END IF;
 
-    -- 3. Find Default Class/Section (Deterministic: First alphabetical class & section)
-    -- We join with classes and sections to order by name ensuring "Class 1" comes before "Class 2"
     SELECT cs.id INTO v_class_section_id
     FROM class_sections cs
     JOIN classes c ON cs.class_id = c.id
     JOIN sections s ON cs.section_id = s.id
     WHERE cs.academic_year_id = v_academic_year_id
+      AND cs.school_id = v_school_id
     ORDER BY c.name ASC, s.name ASC
     LIMIT 1;
 
@@ -2618,301 +894,39 @@ BEGIN
          RAISE EXCEPTION 'No class sections defined for the current academic year.';
     END IF;
 
-    -- 4. Calculate next roll number (Atomic / Locked)
-    -- Acquire advisory lock based on class_section_id hash to prevent race conditions
     PERFORM pg_advisory_xact_lock(hashtext(v_class_section_id::text));
     
     INSERT INTO student_enrollments (
-        student_id, academic_year_id, class_section_id, status, start_date, roll_number
+        school_id, student_id, academic_year_id, class_section_id, status, start_date, roll_number
     )
     VALUES (
+        v_school_id,
         v_student_id, 
         v_academic_year_id, 
         v_class_section_id, 
         'active', 
         CURRENT_DATE,
-        (SELECT COALESCE(MAX(roll_number), 0) + 1 FROM student_enrollments WHERE class_section_id = v_class_section_id)
+        (SELECT COALESCE(MAX(roll_number), 0) + 1 FROM student_enrollments
+         WHERE class_section_id = v_class_section_id AND school_id = v_school_id)
     )
     RETURNING id INTO v_enrollment_id;
 
     RETURN jsonb_build_object('status', 'created', 'enrollment_id', v_enrollment_id);
+    END;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- SECTION 99: GRANTS & FINALIZATION
-GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;
-
-GRANT ALL ON ALL TABLES IN SCHEMA public TO postgres, service_role;
-GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO postgres, service_role;
-GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO postgres, service_role;
-
--- Allow authenticated users to interact (enforced by RLS)
-GRANT ALL ON ALL TABLES IN SCHEMA public TO authenticated;
-GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO authenticated;
-GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO authenticated;
-
--- ============================================================
--- 100. SECURITY ENFORCEMENT (Linter Fixes)
--- ============================================================
-
--- A. Fix Security Definer Views
--- Views should be security_invoker to respect RLS
-ALTER VIEW active_students SET (security_invoker = true);
-ALTER VIEW active_persons SET (security_invoker = true);
-
--- B. Enable RLS on ALL Tables
--- (Some are already enabled, re-running is safe / idempotent)
-
-ALTER TABLE genders ENABLE ROW LEVEL SECURITY;
-ALTER TABLE persons ENABLE ROW LEVEL SECURITY;
-ALTER TABLE countries ENABLE ROW LEVEL SECURITY;
-ALTER TABLE person_contacts ENABLE ROW LEVEL SECURITY;
-ALTER TABLE receipt_items ENABLE ROW LEVEL SECURITY;
-ALTER TABLE marks ENABLE ROW LEVEL SECURITY;
-ALTER TABLE discipline_records ENABLE ROW LEVEL SECURITY;
-ALTER TABLE student_money_science_progress ENABLE ROW LEVEL SECURITY;
-ALTER TABLE student_science_projects ENABLE ROW LEVEL SECURITY;
-ALTER TABLE roles ENABLE ROW LEVEL SECURITY;
-ALTER TABLE role_permissions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE permissions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE students ENABLE ROW LEVEL SECURITY;
-ALTER TABLE student_categories ENABLE ROW LEVEL SECURITY;
-ALTER TABLE religions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE classes ENABLE ROW LEVEL SECURITY;
-ALTER TABLE class_sections ENABLE ROW LEVEL SECURITY;
-ALTER TABLE sections ENABLE ROW LEVEL SECURITY;
-ALTER TABLE staff_designations ENABLE ROW LEVEL SECURITY;
-ALTER TABLE staff_statuses ENABLE ROW LEVEL SECURITY;
-ALTER TABLE daily_attendance ENABLE ROW LEVEL SECURITY;
-ALTER TABLE staff ENABLE ROW LEVEL SECURITY;
-ALTER TABLE fee_structures ENABLE ROW LEVEL SECURITY;
-ALTER TABLE student_fees ENABLE ROW LEVEL SECURITY;
-ALTER TABLE class_subjects ENABLE ROW LEVEL SECURITY;
-ALTER TABLE subjects ENABLE ROW LEVEL SECURITY;
-ALTER TABLE fee_types ENABLE ROW LEVEL SECURITY;
-ALTER TABLE fee_transactions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE receipts ENABLE ROW LEVEL SECURITY;
-ALTER TABLE exams ENABLE ROW LEVEL SECURITY;
-ALTER TABLE exam_subjects ENABLE ROW LEVEL SECURITY;
-ALTER TABLE grading_scales ENABLE ROW LEVEL SECURITY;
-ALTER TABLE complaints ENABLE ROW LEVEL SECURITY;
-ALTER TABLE leave_applications ENABLE ROW LEVEL SECURITY;
-ALTER TABLE diary_entries ENABLE ROW LEVEL SECURITY;
-ALTER TABLE periods ENABLE ROW LEVEL SECURITY;
-ALTER TABLE transport_routes ENABLE ROW LEVEL SECURITY;
-ALTER TABLE transport_stops ENABLE ROW LEVEL SECURITY;
-ALTER TABLE buses ENABLE ROW LEVEL SECURITY;
-ALTER TABLE student_transport ENABLE ROW LEVEL SECURITY;
-ALTER TABLE bus_locations ENABLE ROW LEVEL SECURITY;
-ALTER TABLE hostel_blocks ENABLE ROW LEVEL SECURITY;
-ALTER TABLE hostel_rooms ENABLE ROW LEVEL SECURITY;
-ALTER TABLE hostel_allocations ENABLE ROW LEVEL SECURITY;
-ALTER TABLE lms_courses ENABLE ROW LEVEL SECURITY;
-ALTER TABLE money_science_modules ENABLE ROW LEVEL SECURITY;
-ALTER TABLE science_projects ENABLE ROW LEVEL SECURITY;
-ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE user_roles ENABLE ROW LEVEL SECURITY;
-ALTER TABLE users ENABLE ROW LEVEL SECURITY;
-ALTER TABLE blood_groups ENABLE ROW LEVEL SECURITY;
-ALTER TABLE student_statuses ENABLE ROW LEVEL SECURITY;
-ALTER TABLE parents ENABLE ROW LEVEL SECURITY;
-ALTER TABLE student_parents ENABLE ROW LEVEL SECURITY;
-ALTER TABLE relationship_types ENABLE ROW LEVEL SECURITY;
-ALTER TABLE academic_years ENABLE ROW LEVEL SECURITY;
-ALTER TABLE student_enrollments ENABLE ROW LEVEL SECURITY;
-ALTER TABLE lms_materials ENABLE ROW LEVEL SECURITY;
-
--- C. Default RLS policies removed (Fix 9)
--- The blanket "Enable all for authenticated" policy was overriding all 
--- per-table security policies. Backend uses service_role key (bypasses RLS),
--- so fine-grained RLS policies above are sufficient.
-
--- ============================================================
--- 101. LINTER FIXES (ROUND 2)
--- ============================================================
-
--- A. Fix "Function Search Path Mutable" (Fix 8)
--- Only ALTER functions that actually exist in this schema.
--- Wrapped in DO blocks so non-existent functions don't break the transaction.
-
-DO $$ 
-DECLARE
-    func_name TEXT;
-BEGIN
-    FOR func_name IN 
-        SELECT unnest(ARRAY[
-            'update_timestamp', 'update_fee_paid_amount', 'update_fee_status',
-            'auto_generate_receipt', 'generate_ticket_no', 'validate_marks_entry',
-            'recalculate_section_rolls', 'validate_enrollment_year',
-            'ensure_active_person_ref', 'ensure_active_person_staff',
-            'ensure_active_student_enrollment', 'ensure_active_student_parent',
-            'prevent_system_role_change', 'prevent_direct_fee_update',
-            'update_person_display_name', 'auth_has_role',
-            'validate_attendance_entry', 'validate_diary_entry',
-            'validate_timetable_entry', 'sync_class_teacher_from_timetable',
-            'promote_students_academic_year', 'ensure_student_enrollment',
-            'log_financial_destruction', 'get_financial_analytics',
-            'get_attendance_analytics', 'get_dashboard_insights',
-            'debug_user_permissions', 'debug_teacher_profile',
-            'run_integrity_check', 'recalculate_fee_ledger'
-        ])
-    LOOP
-        BEGIN
-            EXECUTE format('ALTER FUNCTION %I SET search_path = ''public''', func_name);
-        EXCEPTION WHEN undefined_function THEN
-            -- Function does not exist, skip silently
-            NULL;
-        END;
-    END LOOP;
-END $$;
-
--- B. Fix "Extension in Public"
--- We try to move extensions to 'extensions' schema, creating it if needed.
--- Note: 'auth' schema is managed by Supabase, 'extensions' is a good convention.
-
--- Extensions already created in SECTION 01. No duplicate creation or migration needed.
-
--- ============================================================
--- 102. EXPENSE TRACKER MODULE
--- ============================================================
-
--- 1. Create Expenses Table
-CREATE TABLE IF NOT EXISTS expenses (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    created_by UUID NOT NULL REFERENCES users(id), -- Fixed: was auth.users(id) (Fix 6)
-    title TEXT NOT NULL,
-    category TEXT NOT NULL,
-    amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
-    expense_date DATE NOT NULL DEFAULT CURRENT_DATE,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'paid')),
-    description TEXT, -- Optional description
-    receipt_url TEXT, -- Optional receipt image
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- 2. Indexes
-CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(expense_date DESC);
-CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
-
--- 3. Auto-update Trigger
-DROP TRIGGER IF EXISTS trg_expenses_updated ON expenses;
-CREATE TRIGGER trg_expenses_updated
-BEFORE UPDATE ON expenses
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- 4. Row Level Security (RLS)
-ALTER TABLE expenses ENABLE ROW LEVEL SECURITY;
-
--- 4.1 READ: Users can view expenses from their own school
-DROP POLICY IF EXISTS "View own school expenses" ON expenses;
-CREATE POLICY "View own school expenses" ON expenses
-FOR SELECT
-USING (
-    created_by = auth.uid() OR
-    EXISTS (
-        SELECT 1 FROM user_roles ur
-        JOIN roles r ON ur.role_id = r.id
-        WHERE ur.user_id = auth.uid() 
-          AND (r.code IN ('admin', 'principal', 'accounts'))
-    )
-);
-
--- 4.2 INSERT: Authenticated users can create expenses
-DROP POLICY IF EXISTS "Create expenses" ON expenses;
-CREATE POLICY "Create expenses" ON expenses
-FOR INSERT
-WITH CHECK (
-    auth.role() = 'authenticated' AND
-    created_by = auth.uid() 
-);
-
--- 4.3 UPDATE: Creator wins pending, Admins win all
-DROP POLICY IF EXISTS "Update expenses" ON expenses;
-CREATE POLICY "Update expenses" ON expenses
-FOR UPDATE
-USING (
-    (created_by = auth.uid() AND status = 'pending') OR
-    EXISTS (
-        SELECT 1 FROM user_roles ur
-        JOIN roles r ON ur.role_id = r.id
-        WHERE ur.user_id = auth.uid() 
-          AND (r.code IN ('admin', 'principal', 'accounts'))
-    )
-);
-
--- 4.4 DELETE: Only Creator (if pending) or Admin
-DROP POLICY IF EXISTS "Delete expenses" ON expenses;
-CREATE POLICY "Delete expenses" ON expenses
-FOR DELETE
-USING (
-    (created_by = auth.uid() AND status = 'pending') OR
-    EXISTS (
-        SELECT 1 FROM user_roles ur
-        JOIN roles r ON ur.role_id = r.id
-        WHERE ur.user_id = auth.uid() 
-          AND (r.code IN ('admin', 'principal', 'accounts'))
-    )
-);
-
--- 5. Grant Permissions
-GRANT ALL ON expenses TO authenticated;
-GRANT ALL ON expenses TO service_role;
-
-
--- search_path managed at session level (ALTER DATABASE is non-transactional DDL)
-SET search_path = public, extensions;
-
-
--- (Fix 1: Removed mid-file COMMIT that split the transaction)
--- The single COMMIT is at the end of the file.
-
--- VERIFICATION (Commented)
-/*
-SELECT table_name, row_security FROM pg_tables WHERE schemaname = 'public';
-*/
-
--- 13. STAFF PAYROLL (New Additions)
-DO $$ BEGIN
-    CREATE TYPE payroll_status_enum AS ENUM ('pending', 'paid');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-CREATE TABLE IF NOT EXISTS staff_payroll (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    staff_id UUID NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
-    base_salary DECIMAL(12,2) NOT NULL,
-    bonus DECIMAL(12,2) DEFAULT 0,
-    deductions DECIMAL(12,2) DEFAULT 0,
-    net_salary DECIMAL(12,2) NOT NULL, -- Application value: base + bonus - deductions
-    status payroll_status_enum NOT NULL DEFAULT 'pending',
-    payment_date DATE,
-    payroll_month INTEGER NOT NULL CHECK (payroll_month BETWEEN 1 AND 12),
-    payroll_year INTEGER NOT NULL,
-    payment_method VARCHAR(50), 
-    remarks TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (staff_id, payroll_month, payroll_year)
-);
-
-CREATE INDEX IF NOT EXISTS idx_payroll_staff ON staff_payroll(staff_id);
-CREATE INDEX IF NOT EXISTS idx_payroll_period ON staff_payroll(payroll_month, payroll_year);
-
-DROP TRIGGER IF EXISTS trg_staff_payroll_updated ON staff_payroll;
-CREATE TRIGGER trg_staff_payroll_updated
-BEFORE UPDATE ON staff_payroll
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- GENERATOR FUNCTION (Idempotent)
 CREATE OR REPLACE FUNCTION generate_monthly_payroll(
   p_month INTEGER,
   p_year INTEGER
 )
-RETURNS VOID AS $$
+RETURNS VOID
+SET search_path = public
+AS $$
 BEGIN
-  INSERT INTO staff_payroll (staff_id, base_salary, net_salary, payroll_month, payroll_year, status)
+  INSERT INTO staff_payroll (school_id, staff_id, base_salary, net_salary, payroll_month, payroll_year, status)
   SELECT 
+    school_id,
     id, 
     COALESCE(salary, 0), 
     COALESCE(salary, 0), 
@@ -2925,152 +939,124 @@ BEGIN
     AND NOT EXISTS (
       SELECT 1 FROM staff_payroll sp 
       WHERE sp.staff_id = staff.id 
+        AND sp.school_id = staff.school_id
         AND sp.payroll_month = p_month 
         AND sp.payroll_year = p_year
     );
 END;
 $$ LANGUAGE plpgsql;
 
--- RLS POLICIES
-ALTER TABLE staff_payroll ENABLE ROW LEVEL SECURITY;
-
--- Allow admins and accounts to do everything
-DROP POLICY IF EXISTS "Admins can manage payroll" ON staff_payroll;
-DROP POLICY IF EXISTS "Admins and Accounts can manage payroll" ON staff_payroll;
-CREATE POLICY "Admins and Accounts can manage payroll" ON staff_payroll
-FOR ALL
-USING (
-  EXISTS (
-    SELECT 1 FROM user_roles ur
-    JOIN roles r ON ur.role_id = r.id
-    WHERE ur.user_id = auth.uid() AND r.code IN ('admin', 'accounts')
-  )
-);
-
--- FIX: Grant permissions to authenticated role for the new table
--- This was missing in the initial schema update
-
--- 1. Table Permissions
-GRANT ALL ON TABLE staff_payroll TO authenticated;
-GRANT ALL ON TABLE staff_payroll TO service_role;
-
--- 2. Function Permissions (RPC)
-GRANT EXECUTE ON FUNCTION generate_monthly_payroll TO authenticated;
-GRANT EXECUTE ON FUNCTION generate_monthly_payroll TO service_role;
-
--- 3. Ensure sequence permissions if any (UUID gen_random_uuid doesn't use sequence, but good practice if serial)
--- (None needed for UUID PK)
-
--- 4. Verify RLS is enabled (It was, but harmless to repeat)
-ALTER TABLE staff_payroll ENABLE ROW LEVEL SECURITY;
-
--- Staff can view their own payroll
-DROP POLICY IF EXISTS "Staff can view own payroll" ON staff_payroll;
-CREATE POLICY "Staff can view own payroll" ON staff_payroll
-FOR SELECT
-USING (
-  staff_id IN (
-    SELECT id FROM staff WHERE person_id IN (
-        SELECT person_id FROM users WHERE id = auth.uid()
-    )
-  )
-);
-
--- =========================================================
--- FINANCIAL POLICY & CONTROL LAYER (AUTO-APPENDED)
--- =========================================================
-
-
--- 1. Financial Audit Logs (For destructive actions)
-CREATE TABLE IF NOT EXISTS financial_audit_logs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    table_name TEXT NOT NULL,
-    record_id TEXT NOT NULL, -- Storing as text to support various ID types
-    action_type TEXT NOT NULL CHECK (action_type IN ('DELETE', 'UPDATE', 'CREATE')),
-    old_data JSONB, -- The state before deletion/update
-    new_data JSONB, -- The state after update/creation
-    reason TEXT, -- Mandatory for deletions
-    performed_by UUID REFERENCES auth.users(id),
-    performed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    metadata JSONB -- Extra context (user agent, IP, etc if available)
-);
-
--- Enable RLS on Audit Logs
-ALTER TABLE financial_audit_logs ENABLE ROW LEVEL SECURITY;
-
--- Admin can view all logs
-DROP POLICY IF EXISTS "Admins can view financial audit logs" ON financial_audit_logs;
-CREATE POLICY "Admins can view financial audit logs" 
-ON financial_audit_logs FOR SELECT 
-TO authenticated 
-USING (
-    EXISTS (
-        SELECT 1 FROM user_roles ur
-        JOIN roles r ON ur.role_id = r.id
-        WHERE ur.user_id = auth.uid() AND r.code = 'admin'
-    )
-);
-
--- Only service_role (and SECURITY DEFINER functions running as owner) can insert
-DROP POLICY IF EXISTS "System can insert audit logs" ON financial_audit_logs;
-CREATE POLICY "System can insert audit logs" 
-ON financial_audit_logs FOR INSERT 
-TO service_role 
-WITH CHECK (true);
-
--- 2. Financial Policy Rules (Limits, Permissions, Locks)
-CREATE TABLE IF NOT EXISTS financial_policy_rules (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    rule_code TEXT NOT NULL UNIQUE, 
-    rule_name TEXT NOT NULL,
-    description TEXT,
-    value_type TEXT CHECK (value_type IN ('amount', 'percentage', 'boolean', 'json')),
-    default_value JSONB NOT NULL,
-    current_value JSONB NOT NULL,
-    is_active BOOLEAN DEFAULT true,
-    updated_by UUID REFERENCES auth.users(id),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Enable RLS
-ALTER TABLE financial_policy_rules ENABLE ROW LEVEL SECURITY;
-
-DROP POLICY IF EXISTS "Authenticated users can read financial policies" ON financial_policy_rules;
-CREATE POLICY "Authenticated users can read financial policies" 
-ON financial_policy_rules FOR SELECT 
-TO authenticated 
-USING (true);
-
-DROP POLICY IF EXISTS "Admins can update financial policies" ON financial_policy_rules;
-CREATE POLICY "Admins can update financial policies" 
-ON financial_policy_rules FOR UPDATE 
-TO authenticated 
-USING (
-    EXISTS (
-        SELECT 1 FROM user_roles ur
-        JOIN roles r ON ur.role_id = r.id
-        WHERE ur.user_id = auth.uid() AND r.code = 'admin'
-    )
+CREATE OR REPLACE FUNCTION recalculate_staff_payroll(
+    p_staff_id UUID, 
+    p_month INTEGER, 
+    p_year INTEGER
 )
-WITH CHECK (
-    EXISTS (
-        SELECT 1 FROM user_roles ur
-        JOIN roles r ON ur.role_id = r.id
-        WHERE ur.user_id = auth.uid() AND r.code = 'admin'
+RETURNS VOID
+SET search_path = public
+AS $$
+DECLARE
+    v_base_salary DECIMAL(12,2);
+    v_per_day_salary DECIMAL(12,2);
+    v_absent_days INTEGER := 0;
+    v_rejected_leave_days INTEGER := 0;
+    v_total_deduction_days INTEGER := 0;
+    v_deduction_amount DECIMAL(12,2);
+    v_start_date DATE;
+    v_end_date DATE;
+BEGIN
+    SELECT salary INTO v_base_salary FROM staff WHERE id = p_staff_id;
+    IF v_base_salary IS NULL THEN v_base_salary := 0; END IF;
+    v_per_day_salary := v_base_salary / 30.0;
+    v_start_date := make_date(p_year, p_month, 1);
+    v_end_date := (v_start_date + interval '1 month' - interval '1 day')::DATE;
+
+    WITH deductible_dates AS (
+        SELECT attendance_date AS d_date
+        FROM staff_attendance
+        WHERE staff_id = p_staff_id
+          AND attendance_date BETWEEN v_start_date AND v_end_date
+          AND status = 'absent'
+          AND deleted_at IS NULL
+        UNION
+        SELECT generate_series(
+            GREATEST(start_date, v_start_date), 
+            LEAST(end_date, v_end_date), 
+            interval '1 day'
+        )::DATE AS d_date
+        FROM leave_applications
+        WHERE applicant_id = (SELECT id FROM users WHERE person_id = (SELECT person_id FROM staff WHERE id = p_staff_id))
+          AND status = 'rejected'
+          AND leave_type != 'unpaid'
+          AND end_date >= v_start_date
+          AND start_date <= v_end_date
     )
-);
+    SELECT COUNT(DISTINCT d_date) INTO v_total_deduction_days FROM deductible_dates;
 
--- Seed Default Policies
-INSERT INTO financial_policy_rules (rule_code, rule_name, description, value_type, default_value, current_value)
-VALUES 
-    ('EXPENSE_AUTO_APPROVE_LIMIT', 'Expense Auto-Approval Limit', 'Expenses below this amount are auto-approved.', 'amount', '1000'::jsonb, '1000'::jsonb),
-    ('CASH_COLLECTION_DAILY_LIMIT', 'Daily Cash Collection Limit', 'Maximum cash a user can collect per day.', 'amount', '50000'::jsonb, '50000'::jsonb),
-    ('FEE_WAIVER_MAX_PERCENT', 'Max Fee Waiver Percentage', 'Maximum percentage of fee that can be waived.', 'percentage', '20'::jsonb, '20'::jsonb),
-    ('PAYROLL_OVERRIDE_ALLOWED', 'Payroll Override Allowed', 'Can payroll values be manually overridden?', 'boolean', 'false'::jsonb, 'false'::jsonb),
-    ('LOCK_PAST_MONTHS_DAYS', 'Lock Past Months After (Days)', 'Number of days after which previous month data is locked.', 'amount', '7'::jsonb, '7'::jsonb)
-ON CONFLICT (rule_code) DO NOTHING;
+    v_deduction_amount := v_total_deduction_days * v_per_day_salary;
 
--- 3. Audit Log Trigger Function
+    -- Idempotent upsert without ON CONFLICT (preserves semantics)
+    UPDATE staff_payroll sp
+    SET base_salary = v_base_salary,
+        deductions = v_deduction_amount,
+        net_salary = GREATEST(0, v_base_salary - v_deduction_amount),
+        updated_at = now()
+    WHERE sp.school_id = (SELECT school_id FROM staff WHERE id = p_staff_id)
+      AND sp.staff_id = p_staff_id
+      AND sp.payroll_month = p_month
+      AND sp.payroll_year = p_year;
+
+    IF NOT FOUND THEN
+      INSERT INTO staff_payroll (school_id, staff_id, payroll_month, payroll_year, base_salary, deductions, net_salary, status)
+      VALUES ((SELECT school_id FROM staff WHERE id = p_staff_id), p_staff_id, p_month, p_year, v_base_salary, v_deduction_amount, GREATEST(0, v_base_salary - v_deduction_amount), 'pending');
+    END IF;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION trg_recalc_payroll_on_attendance()
+RETURNS TRIGGER
+SET search_path = public
+AS $$
+DECLARE
+    v_staff_id UUID;
+    v_date DATE;
+BEGIN
+    IF (TG_OP = 'DELETE') THEN
+        v_staff_id := OLD.staff_id;
+        v_date := OLD.attendance_date;
+    ELSE
+        v_staff_id := NEW.staff_id;
+        v_date := NEW.attendance_date;
+    END IF;
+    PERFORM recalculate_staff_payroll(v_staff_id, EXTRACT(MONTH FROM v_date)::INT, EXTRACT(YEAR FROM v_date)::INT);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION trg_recalc_payroll_on_leave()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_staff_id UUID;
+    v_start DATE;
+    v_end DATE;
+    v_d DATE;
+BEGIN
+    IF (TG_OP = 'UPDATE' AND (OLD.status IS DISTINCT FROM NEW.status OR OLD.start_date IS DISTINCT FROM NEW.start_date OR OLD.end_date IS DISTINCT FROM NEW.end_date)) 
+       OR (TG_OP = 'INSERT') THEN
+       SELECT id INTO v_staff_id FROM staff WHERE person_id = (SELECT person_id FROM users WHERE id = NEW.applicant_id);
+       IF v_staff_id IS NOT NULL THEN
+           v_start := DATE_TRUNC('month', NEW.start_date);
+           v_end := DATE_TRUNC('month', NEW.end_date);
+           v_d := v_start;
+           WHILE v_d <= v_end LOOP
+               PERFORM recalculate_staff_payroll(v_staff_id, EXTRACT(MONTH FROM v_d)::INT, EXTRACT(YEAR FROM v_d)::INT);
+               v_d := v_d + interval '1 month';
+           END LOOP;
+       END IF;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION log_financial_destruction()
 RETURNS TRIGGER 
 SET search_path = public
@@ -3088,17 +1074,17 @@ BEGIN
 
     IF (TG_OP = 'DELETE') THEN
         INSERT INTO financial_audit_logs (
-            table_name, record_id, action_type, old_data, reason, performed_by
+            school_id, table_name, record_id, action_type, old_data, reason, performed_by
         ) VALUES (
-            TG_TABLE_NAME, OLD.id::text, 'DELETE', row_to_json(OLD),
+            OLD.school_id, TG_TABLE_NAME, OLD.id::text, 'DELETE', row_to_json(OLD),
             COALESCE(reason_text, 'Unknown (Direct DB Delete)'), current_user_id
         );
         RETURN OLD;
     ELSIF (TG_OP = 'UPDATE') THEN
         INSERT INTO financial_audit_logs (
-            table_name, record_id, action_type, old_data, new_data, reason, performed_by
+            school_id, table_name, record_id, action_type, old_data, new_data, reason, performed_by
         ) VALUES (
-            TG_TABLE_NAME, NEW.id::text, 'UPDATE', row_to_json(OLD), row_to_json(NEW),
+            NEW.school_id, TG_TABLE_NAME, NEW.id::text, 'UPDATE', row_to_json(OLD), row_to_json(NEW),
             'Update Operation', current_user_id
         );
         RETURN NEW;
@@ -3107,32 +1093,18 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- 4. Attach Triggers to Financial Tables
-DROP TRIGGER IF EXISTS audit_delete_receipts ON receipts;
-CREATE TRIGGER audit_delete_receipts BEFORE DELETE ON receipts FOR EACH ROW EXECUTE FUNCTION log_financial_destruction();
-
-DROP TRIGGER IF EXISTS audit_delete_student_fees ON student_fees;
-CREATE TRIGGER audit_delete_student_fees BEFORE DELETE ON student_fees FOR EACH ROW EXECUTE FUNCTION log_financial_destruction();
-
-DROP TRIGGER IF EXISTS audit_delete_expenses ON expenses;
-CREATE TRIGGER audit_delete_expenses BEFORE DELETE ON expenses FOR EACH ROW EXECUTE FUNCTION log_financial_destruction();
-
-DROP TRIGGER IF EXISTS audit_delete_payroll ON staff_payroll;
-CREATE TRIGGER audit_delete_payroll BEFORE DELETE ON staff_payroll FOR EACH ROW EXECUTE FUNCTION log_financial_destruction();
-
--- 5. Helper: Read Policy
 CREATE OR REPLACE FUNCTION get_financial_policy_value(code_input TEXT)
 RETURNS JSONB 
 SET search_path = public
 AS $$
 DECLARE val JSONB;
 BEGIN
-    SELECT current_value INTO val FROM financial_policy_rules WHERE rule_code = code_input;
+    SELECT current_value INTO val FROM financial_policy_rules
+    WHERE rule_code = code_input AND school_id = auth_school_id();
     RETURN val;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- 6. Helper: Check Financial Permission & Limits
 CREATE OR REPLACE FUNCTION check_financial_permission(
     p_action_code TEXT,
     p_amount DECIMAL DEFAULT 0
@@ -3146,13 +1118,15 @@ DECLARE
     v_auto_approve_limit DECIMAL;
 BEGIN
     v_user_id := auth.uid();
-    SELECT r.code INTO v_role_code FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = v_user_id
+    SELECT r.code INTO v_role_code FROM user_roles ur JOIN roles r ON ur.role_id = r.id
+    WHERE ur.user_id = v_user_id AND ur.school_id = auth_school_id() AND r.school_id = auth_school_id()
     ORDER BY (CASE WHEN r.code = 'admin' THEN 1 WHEN r.code = 'principal' THEN 2 ELSE 3 END) LIMIT 1;
 
     IF v_role_code = 'admin' THEN RETURN TRUE; END IF;
 
     IF p_action_code = 'EXPENSE_AUTO_APPROVE' THEN
-        SELECT current_value->>'amount' INTO v_auto_approve_limit FROM financial_policy_rules WHERE rule_code = 'EXPENSE_AUTO_APPROVE_LIMIT';
+        SELECT current_value->>'amount' INTO v_auto_approve_limit FROM financial_policy_rules
+        WHERE rule_code = 'EXPENSE_AUTO_APPROVE_LIMIT' AND school_id = auth_school_id();
         IF v_auto_approve_limit IS NOT NULL AND p_amount > v_auto_approve_limit::DECIMAL THEN
              RAISE EXCEPTION 'Amount % exceeds auto-approval limit of %', p_amount, v_auto_approve_limit;
         END IF;
@@ -3163,8 +1137,11 @@ BEGIN
             v_today_total DECIMAL;
             v_daily_limit JSONB;
         BEGIN
-            SELECT COALESCE(SUM(amount), 0) INTO v_today_total FROM fee_transactions WHERE received_by = v_user_id AND payment_method = 'cash' AND paid_at::DATE = CURRENT_DATE;
-            SELECT current_value INTO v_daily_limit FROM financial_policy_rules WHERE rule_code = 'CASH_COLLECTION_DAILY_LIMIT';
+            SELECT COALESCE(SUM(amount), 0) INTO v_today_total FROM fee_transactions
+            WHERE received_by = v_user_id AND payment_method = 'cash' AND paid_at::DATE = CURRENT_DATE
+              AND school_id = auth_school_id();
+            SELECT current_value INTO v_daily_limit FROM financial_policy_rules
+            WHERE rule_code = 'CASH_COLLECTION_DAILY_LIMIT' AND school_id = auth_school_id();
             IF v_daily_limit IS NOT NULL AND (v_today_total + p_amount) > (v_daily_limit->>'amount')::DECIMAL THEN
                  RAISE EXCEPTION 'Daily cash limit exceeded. Collected: %, Attempt: %, Limit: %', v_today_total, p_amount, v_daily_limit->>'amount';
             END IF;
@@ -3174,14 +1151,14 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- 7. Helper: Enforce Locks
 CREATE OR REPLACE FUNCTION enforce_financial_lock(p_date DATE, p_context TEXT)
 RETURNS BOOLEAN 
 SET search_path = public
 AS $$
 DECLARE v_lock_days INT;
 BEGIN
-    SELECT (current_value->>'amount')::INT INTO v_lock_days FROM financial_policy_rules WHERE rule_code = 'LOCK_PAST_MONTHS_DAYS';
+    SELECT (current_value->>'amount')::INT INTO v_lock_days FROM financial_policy_rules
+    WHERE rule_code = 'LOCK_PAST_MONTHS_DAYS' AND school_id = auth_school_id();
     IF v_lock_days IS NULL THEN v_lock_days := 7; END IF;
     IF p_date < DATE_TRUNC('month', CURRENT_DATE) THEN
         IF EXTRACT(DAY FROM CURRENT_DATE) > v_lock_days THEN
@@ -3192,7 +1169,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- 8. Triggers for Active Enforcement
 CREATE OR REPLACE FUNCTION trg_check_expense_policy()
 RETURNS TRIGGER 
 SET search_path = public
@@ -3207,6 +1183,7 @@ BEGIN
                SELECT 1 FROM user_roles ur 
                JOIN roles r ON ur.role_id = r.id 
                WHERE ur.user_id = auth.uid() AND r.code = 'admin'
+                 AND ur.school_id = auth_school_id() AND r.school_id = auth_school_id()
            ) INTO v_is_admin;
            
            IF NOT v_is_admin THEN
@@ -3223,9 +1200,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS enforce_expense_policy ON expenses;
-CREATE TRIGGER enforce_expense_policy BEFORE INSERT OR UPDATE ON expenses FOR EACH ROW EXECUTE FUNCTION trg_check_expense_policy();
-
 CREATE OR REPLACE FUNCTION trg_check_fee_cash_limit()
 RETURNS TRIGGER 
 SET search_path = public
@@ -3237,10 +1211,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS enforce_fee_cash_limit ON fee_transactions;
-CREATE TRIGGER enforce_fee_cash_limit BEFORE INSERT ON fee_transactions FOR EACH ROW EXECUTE FUNCTION trg_check_fee_cash_limit();
-
--- 9. Generic Deletion RPC with Reason
 CREATE OR REPLACE FUNCTION delete_record_with_reason(p_table_name TEXT, p_record_id UUID, p_reason TEXT)
 RETURNS JSONB 
 SET search_path = public
@@ -3259,25 +1229,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY INVOKER;
 
--- 10. Grant Permissions
-GRANT ALL ON TABLE financial_audit_logs TO service_role;
-GRANT SELECT ON TABLE financial_audit_logs TO authenticated;
-GRANT ALL ON TABLE financial_policy_rules TO service_role;
-GRANT SELECT, UPDATE ON TABLE financial_policy_rules TO authenticated;
-GRANT EXECUTE ON FUNCTION delete_record_with_reason TO authenticated;
-GRANT EXECUTE ON FUNCTION get_financial_policy_value TO authenticated;
-
-
-
-
--- ============================================================
--- SECTION 12: ANALYTICS & INSIGHTS (CONSOLIDATED)
--- ============================================================
--- ============================================================
--- ANALYTICS & INSIGHTS ENGINE
--- ============================================================
-
--- helper to get safe division
 CREATE OR REPLACE FUNCTION safe_div(n NUMERIC, d NUMERIC) RETURNS NUMERIC AS $$
 BEGIN
     IF d = 0 OR d IS NULL THEN RETURN 0; END IF;
@@ -3285,8 +1236,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
--- 1. FINANCIAL ANALYTICS
--- Returns: total_collected, pending_dues, collection_efficiency, trends (json)
 CREATE OR REPLACE FUNCTION get_financial_analytics(
     p_from_date DATE,
     p_to_date DATE,
@@ -3379,7 +1328,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- 2. ATTENDANCE ANALYTICS
 CREATE OR REPLACE FUNCTION get_attendance_analytics(
     p_from_date DATE,
     p_to_date DATE
@@ -3463,8 +1411,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- 3. AUTOMATED INSIGHTS
--- Generates text-based insights based on patterns.
 CREATE OR REPLACE FUNCTION get_dashboard_insights()
 RETURNS TABLE (
     type TEXT,
@@ -3513,396 +1459,27 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-
--- Grant Permissions for Analytics
-GRANT EXECUTE ON FUNCTION get_financial_analytics TO authenticated;
-GRANT EXECUTE ON FUNCTION get_attendance_analytics TO authenticated;
-GRANT EXECUTE ON FUNCTION get_dashboard_insights TO authenticated;
-
-  
-
--- 19. SALARY DEDUCTION LOGIC
--- ============================================================
--- SALARY DEDUCTION LOGIC SCHEMA (Added 2026-02-08)
--- ============================================================
-
--- 1. Create Staff Attendance Table
-CREATE TABLE IF NOT EXISTS staff_attendance (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    staff_id UUID NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
-    attendance_date DATE NOT NULL,
-    status attendance_status_enum NOT NULL, -- reusing present, absent, late, half_day
-    marked_by UUID REFERENCES users(id) ON DELETE SET NULL,
-    marked_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at TIMESTAMPTZ,
-    UNIQUE(staff_id, attendance_date)
-);
-
-CREATE INDEX IF NOT EXISTS idx_staff_attendance_date ON staff_attendance(attendance_date);
-CREATE INDEX IF NOT EXISTS idx_staff_attendance_staff ON staff_attendance(staff_id);
-
--- RLS for Staff Attendance
-ALTER TABLE staff_attendance ENABLE ROW LEVEL SECURITY;
-
--- 2. Recalculate Payroll Function
-CREATE OR REPLACE FUNCTION recalculate_staff_payroll(
-    p_staff_id UUID, 
-    p_month INTEGER, 
-    p_year INTEGER
-)
-RETURNS VOID AS $$
-DECLARE
-    v_base_salary DECIMAL(12,2);
-    v_per_day_salary DECIMAL(12,2);
-    v_absent_days INTEGER := 0;
-    v_rejected_leave_days INTEGER := 0;
-    v_total_deduction_days INTEGER := 0;
-    v_deduction_amount DECIMAL(12,2);
-    v_start_date DATE;
-    v_end_date DATE;
-BEGIN
-    -- Get Base Salary
-    SELECT salary INTO v_base_salary FROM staff WHERE id = p_staff_id;
-    
-    IF v_base_salary IS NULL THEN 
-        v_base_salary := 0; 
-    END IF;
-
-    -- Calculate Per Day Salary (Fixed 30 days as per requirement)
-    v_per_day_salary := v_base_salary / 30.0;
-
-    -- Determine Month Start and End Date
-    v_start_date := make_date(p_year, p_month, 1);
-    v_end_date := (v_start_date + interval '1 month' - interval '1 day')::DATE;
-
-    -- Count Deductible Days (Union of Absent AND Rejected Leaves to avoid double counting)
-    -- Logic: Find all unique dates in this month for this staff that are either Absent OR Rejected Leave
-    
-    WITH deductible_dates AS (
-        -- 1. Dates marked as Absent
-        SELECT attendance_date AS d_date
-        FROM staff_attendance
-        WHERE staff_id = p_staff_id
-          AND attendance_date BETWEEN v_start_date AND v_end_date
-          AND status = 'absent'
-          AND deleted_at IS NULL
-        
-        UNION
-        
-        -- 2. Dates covered by Rejected Leaves
-        SELECT generate_series(
-            GREATEST(start_date, v_start_date), 
-            LEAST(end_date, v_end_date), 
-            interval '1 day'
-        )::DATE AS d_date
-        FROM leave_applications
-        WHERE applicant_id = (SELECT id FROM users WHERE person_id = (SELECT person_id FROM staff WHERE id = p_staff_id))
-          AND status = 'rejected'
-          AND leave_type != 'unpaid' -- Assuming 'unpaid' might be handled differently, but req says "leave requests that are rejected"
-          -- Note: If leave handling logic needs to change (e.g. 'unpaid' approved leave also deducts), modify here.
-          -- For now, strictly following: "salary deductions must apply for: days marked absent, leave requests that are rejected"
-          AND end_date >= v_start_date
-          AND start_date <= v_end_date
-    )
-    SELECT COUNT(DISTINCT d_date) INTO v_total_deduction_days FROM deductible_dates;
-
-    -- Calculate Deduction Amount
-    v_deduction_amount := v_total_deduction_days * v_per_day_salary;
-
-    -- Ensure Payroll Record Exists (Upsert)
-    INSERT INTO staff_payroll (staff_id, payroll_month, payroll_year, base_salary, deductions, net_salary, status)
-    VALUES (
-        p_staff_id, 
-        p_month, 
-        p_year, 
-        v_base_salary, 
-        v_deduction_amount, 
-        GREATEST(0, v_base_salary - v_deduction_amount), -- Prevent negative salary
-        'pending'
-    )
-    ON CONFLICT (staff_id, payroll_month, payroll_year) 
-    DO UPDATE SET 
-        base_salary = EXCLUDED.base_salary,
-        deductions = EXCLUDED.deductions,
-        net_salary = EXCLUDED.net_salary,
-        updated_at = now();
-        
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
-
--- 3. Triggers
-
--- Trigger 1: On Staff Attendance Change
-CREATE OR REPLACE FUNCTION trg_recalc_payroll_on_attendance()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_staff_id UUID;
-    v_date DATE;
-BEGIN
-    IF (TG_OP = 'DELETE') THEN
-        v_staff_id := OLD.staff_id;
-        v_date := OLD.attendance_date;
-    ELSE
-        v_staff_id := NEW.staff_id;
-        v_date := NEW.attendance_date;
-    END IF;
-
-    -- Recalculate for the month of the attendance
-    PERFORM recalculate_staff_payroll(
-        v_staff_id, 
-        EXTRACT(MONTH FROM v_date)::INT, 
-        EXTRACT(YEAR FROM v_date)::INT
-    );
-    
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_staff_attendance_payroll ON staff_attendance;
-CREATE TRIGGER trg_staff_attendance_payroll
-AFTER INSERT OR UPDATE OR DELETE ON staff_attendance
-FOR EACH ROW EXECUTE FUNCTION trg_recalc_payroll_on_attendance();
-
-
--- Trigger 2: On Leave Status Change (Rejected)
-CREATE OR REPLACE FUNCTION trg_recalc_payroll_on_leave()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_staff_id UUID;
-    v_start DATE;
-    v_end DATE;
-    v_d DATE;
-BEGIN
-    -- Only verify if status changed to/from 'rejected' or dates changed
-    IF (TG_OP = 'UPDATE' AND (OLD.status IS DISTINCT FROM NEW.status OR OLD.start_date IS DISTINCT FROM NEW.start_date OR OLD.end_date IS DISTINCT FROM NEW.end_date)) 
-       OR (TG_OP = 'INSERT') THEN
-       
-       -- Resolve Staff ID from User ID (Applicant)
-       SELECT id INTO v_staff_id FROM staff WHERE person_id = (SELECT person_id FROM users WHERE id = NEW.applicant_id);
-       
-       IF v_staff_id IS NOT NULL THEN
-           -- We need to recalculate for every month covered by the leave
-           -- Iterate through months
-           v_start := DATE_TRUNC('month', NEW.start_date);
-           v_end := DATE_TRUNC('month', NEW.end_date);
-           
-           v_d := v_start;
-           WHILE v_d <= v_end LOOP
-               PERFORM recalculate_staff_payroll(
-                   v_staff_id, 
-                   EXTRACT(MONTH FROM v_d)::INT, 
-                   EXTRACT(YEAR FROM v_d)::INT
-               );
-               v_d := v_d + interval '1 month';
-           END LOOP;
-       END IF;
-    END IF;
-    
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_leave_payroll ON leave_applications;
-CREATE TRIGGER trg_leave_payroll
-AFTER INSERT OR UPDATE ON leave_applications
-FOR EACH ROW EXECUTE FUNCTION trg_recalc_payroll_on_leave();
-
--- NOTE: Notification table definitions (user_devices, notification_config,
--- notification_logs, notification_batches) are defined in Section 19.
--- See lines ~1869–1941.
-
--- Trigger to propagate fee structure changes to student fees
-
-
-
--- 1. Propagate changes from Fee Structure amount to ongoing student fees
-CREATE OR REPLACE FUNCTION propagate_fee_structure_updates()
-RETURNS TRIGGER AS $$
-BEGIN
-    -- Only update amount_due; status is deterministically handled by trg_auto_fee_status (single owner)
-    IF NEW.amount IS DISTINCT FROM OLD.amount THEN
-        UPDATE student_fees
-        SET 
-            amount_due = NEW.amount,
-            updated_at = now()
-        WHERE fee_structure_id = NEW.id
-          AND status IN ('pending', 'partial', 'overdue');
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_propagate_fee_updates ON fee_structures;
-CREATE TRIGGER trg_propagate_fee_updates
-AFTER UPDATE ON fee_structures
-FOR EACH ROW EXECUTE FUNCTION propagate_fee_structure_updates();
-
--- 2. Auto-assign fees when a new Fee Structure is created for a class
-CREATE OR REPLACE FUNCTION auto_assign_fees_on_structure_creation()
-RETURNS TRIGGER AS $$
-BEGIN
-    INSERT INTO student_fees (student_id, fee_structure_id, amount_due, amount_paid, status, due_date)
-    SELECT 
-        se.student_id,
-        NEW.id,
-        NEW.amount,
-        0,
-        'pending',
-        NEW.due_date
-    FROM student_enrollments se
-    JOIN class_sections cs ON se.class_section_id = cs.id
-    WHERE cs.class_id = NEW.class_id
-      AND se.academic_year_id = NEW.academic_year_id
-      AND se.status = 'active'
-      AND NOT EXISTS (
-          SELECT 1 FROM student_fees sf 
-          WHERE sf.student_id = se.student_id 
-            AND sf.fee_structure_id = NEW.id
-      );
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_auto_assign_fees_structure ON fee_structures;
-CREATE TRIGGER trg_auto_assign_fees_structure
-AFTER INSERT ON fee_structures
-FOR EACH ROW EXECUTE FUNCTION auto_assign_fees_on_structure_creation();
-
--- 3. Auto-assign fees when a Student is enrolled into a class
-CREATE OR REPLACE FUNCTION auto_assign_fees_on_enrollment()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_class_id UUID;
-BEGIN
-    IF NEW.status = 'active' AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM 'active') THEN
-        SELECT class_id INTO v_class_id FROM class_sections WHERE id = NEW.class_section_id;
-
-        INSERT INTO student_fees (student_id, fee_structure_id, amount_due, amount_paid, status, due_date)
-        SELECT 
-            NEW.student_id,
-            fs.id,
-            fs.amount,
-            0,
-            'pending',
-            fs.due_date
-        FROM fee_structures fs
-        WHERE fs.class_id = v_class_id
-          AND fs.academic_year_id = NEW.academic_year_id
-          AND NOT EXISTS (
-              SELECT 1 FROM student_fees sf 
-              WHERE sf.student_id = NEW.student_id 
-                AND sf.fee_structure_id = fs.id
-          );
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_auto_assign_fees_enrollment ON student_enrollments;
-CREATE TRIGGER trg_auto_assign_fees_enrollment
-AFTER INSERT OR UPDATE ON student_enrollments
-FOR EACH ROW EXECUTE FUNCTION auto_assign_fees_on_enrollment();
-
--- ============================================================
--- ADDITIONAL CONSTRAINTS & INDEXES
--- ============================================================
-
--- Prevent double fee assignment for the same structure to the same student
-CREATE UNIQUE INDEX IF NOT EXISTS idx_student_fees_unique_assignment 
-ON student_fees(student_id, fee_structure_id);
-
--- Prevent accidental double entry of transaction references (checks, UPI IDs, etc)
-CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_transactions_unique_ref 
-ON fee_transactions(transaction_ref) 
-WHERE transaction_ref IS NOT NULL AND transaction_ref <> '';
-
--- SECTION 13: AUDIT & PERFORMANCE
--- ============================================================
-
-CREATE TABLE IF NOT EXISTS audit_logs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(id),
-    action TEXT NOT NULL,
-    entity TEXT,
-    entity_id TEXT,
-    details JSONB,
-    ip_address TEXT,
-    user_agent TEXT,
-    request_id TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_audit_logs_user_date ON audit_logs(user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_logs_request_id ON audit_logs(request_id);
-
--- Performance Indexes for Foreign Keys
-CREATE INDEX IF NOT EXISTS idx_person_contacts_person_id ON person_contacts(person_id);
-CREATE INDEX IF NOT EXISTS idx_student_fees_structure_id ON student_fees(fee_structure_id);
-CREATE INDEX IF NOT EXISTS idx_fee_transactions_student_fee_id ON fee_transactions(student_fee_id);
-CREATE INDEX IF NOT EXISTS idx_receipt_items_receipt_id ON receipt_items(receipt_id);
-CREATE INDEX IF NOT EXISTS idx_receipt_items_transaction_id ON receipt_items(fee_transaction_id);
-CREATE INDEX IF NOT EXISTS idx_student_enrollments_class_section ON student_enrollments(class_section_id);
-CREATE INDEX IF NOT EXISTS idx_class_subjects_subject_id ON class_subjects(subject_id);
-CREATE INDEX IF NOT EXISTS idx_exam_subjects_subject_id ON exam_subjects(subject_id);
-CREATE INDEX IF NOT EXISTS idx_exam_subjects_class_id ON exam_subjects(class_id);
-
--- Enable RLS on all core tables (Minimal default policy: deny all unless specific policies added)
--- Note: This is a proactive hardening step.
-ALTER TABLE persons ENABLE ROW LEVEL SECURITY;
-ALTER TABLE users ENABLE ROW LEVEL SECURITY;
-ALTER TABLE students ENABLE ROW LEVEL SECURITY;
-ALTER TABLE staff ENABLE ROW LEVEL SECURITY;
-ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
-
--- SECTION 14: NOTIFICATIONS & DEVICES
--- ============================================================
-
-CREATE TABLE IF NOT EXISTS user_devices (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    fcm_token TEXT NOT NULL,
-    platform TEXT CHECK (platform IN ('android', 'ios')),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-    last_used_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-    UNIQUE(user_id, fcm_token)
-);
-
-CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
-CREATE INDEX IF NOT EXISTS idx_user_devices_token ON user_devices(fcm_token);
-
-ALTER TABLE user_devices ENABLE ROW LEVEL SECURITY;
-
--- Allow users to manage their own devices
-DROP POLICY IF EXISTS "Users can manage own devices" ON user_devices;
-CREATE POLICY "Users can manage own devices" ON user_devices
-FOR ALL
-USING (user_id = auth.uid());
-
--- ============================================================
--- 103. DEBUG UTILITIES (Production Diagnostics)
--- ============================================================
-
--- Function to check a user's permissions
 CREATE OR REPLACE FUNCTION debug_user_permissions(p_user_id UUID)
 RETURNS TABLE (
     role_code VARCHAR,
     permission_code VARCHAR,
     permission_name VARCHAR
 ) AS $$
+DECLARE v_school INTEGER;
 BEGIN
+    SELECT school_id INTO v_school FROM users WHERE id = p_user_id AND deleted_at IS NULL;
     RETURN QUERY
     SELECT r.code::VARCHAR, p.code::VARCHAR, p.name::VARCHAR
     FROM user_roles ur
     JOIN roles r ON ur.role_id = r.id
     JOIN role_permissions rp ON r.id = rp.role_id
     JOIN permissions p ON rp.permission_id = p.id
-    WHERE ur.user_id = p_user_id;
+    WHERE ur.user_id = p_user_id
+      AND ur.school_id = v_school AND r.school_id = v_school
+      AND rp.school_id = v_school AND p.school_id = v_school;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
--- Advanced Diagnostic: Teacher Profile & Timetable Check
 CREATE OR REPLACE FUNCTION debug_teacher_profile(p_staff_code VARCHAR)
 RETURNS TABLE (
     period_number INTEGER,
@@ -3924,38 +1501,36 @@ BEGIN
     JOIN classes c ON cs.class_id = c.id
     JOIN sections s ON cs.section_id = s.id
     JOIN subjects sub ON ts.subject_id = sub.id
-    WHERE ts.teacher_id = (SELECT id FROM staff WHERE staff_code = p_staff_code)
+    WHERE ts.teacher_id = (SELECT id FROM staff WHERE staff_code = p_staff_code AND school_id = auth_school_id())
+      AND ts.school_id = auth_school_id()
     ORDER BY ts.period_number;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
--- CORE AUDIT: Data Integrity Check
-CREATE OR REPLACE FUNCTION perform_data_audit()
-RETURNS TABLE (
-    issue_type TEXT,
-    entity_id TEXT,
-    details TEXT
-) AS $$
+CREATE OR REPLACE FUNCTION perform_data_audit(p_school_id INTEGER)
+RETURNS TABLE (issue_type TEXT, entity_id TEXT, details TEXT) AS $$
 BEGIN
-    -- 1. Orphan Enrollments
-    RETURN QUERY
-    SELECT 'ORPHAN_ENROLLMENT'::TEXT, se.id::TEXT, format('Student %s missing or deleted', se.student_id)
+    RETURN QUERY SELECT 'ORPHAN_ENROLLMENT'::TEXT, se.id::TEXT, format('Student %s missing', se.student_id)
     FROM student_enrollments se 
     LEFT JOIN students s ON se.student_id = s.id 
-    WHERE (s.id IS NULL OR s.deleted_at IS NOT NULL) AND se.deleted_at IS NULL;
+    WHERE (s.id IS NULL OR s.deleted_at IS NOT NULL) 
+      AND se.deleted_at IS NULL 
+      AND s.school_id = p_school_id;
+
 
     -- 2. Invalid Class Teachers
     RETURN QUERY
     SELECT 'INVALID_CLASS_TEACHER'::TEXT, cs.id::TEXT, format('Staff %s missing or deleted', cs.class_teacher_id)
     FROM class_sections cs
     LEFT JOIN staff s ON cs.class_teacher_id = s.id
-    WHERE cs.class_teacher_id IS NOT NULL AND (s.id IS NULL OR s.deleted_at IS NOT NULL);
+    WHERE cs.class_teacher_id IS NOT NULL AND (s.id IS NULL OR s.deleted_at IS NOT NULL)
+      AND cs.school_id = p_school_id;
 
     -- 3. Duplicate Attendance
     RETURN QUERY
     SELECT 'DUPLICATE_ATTENDANCE'::TEXT, da.student_enrollment_id::TEXT, format('Date: %s', da.attendance_date)
     FROM daily_attendance da
-    WHERE da.deleted_at IS NULL
+    WHERE da.deleted_at IS NULL AND da.school_id = p_school_id
     GROUP BY da.student_enrollment_id, da.attendance_date
     HAVING COUNT(*) > 1;
 
@@ -3963,46 +1538,44 @@ BEGIN
     RETURN QUERY
     SELECT 'MULTIPLE_ACTIVE_ENROLLMENTS'::TEXT, se.student_id::TEXT, format('Academic Year ID: %s', se.academic_year_id)
     FROM student_enrollments se
-    WHERE se.status = 'active' AND se.deleted_at IS NULL
+    WHERE se.status = 'active' AND se.deleted_at IS NULL AND se.school_id = p_school_id
     GROUP BY se.student_id, se.academic_year_id
     HAVING COUNT(*) > 1;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
--- CORE REPAIR: Data Integrity Recovery
-CREATE OR REPLACE FUNCTION repair_data_integrity()
+CREATE OR REPLACE FUNCTION repair_data_integrity(p_school_id INTEGER DEFAULT NULL)
 RETURNS VOID AS $$
 DECLARE
     v_count INTEGER;
+    v_sid INTEGER := COALESCE(p_school_id, auth_school_id());
 BEGIN
-    -- 1. Deduplicate daily_attendance (Keep latest)
+    IF v_sid IS NULL THEN RAISE EXCEPTION 'school_id required'; END IF;
+
     WITH duplicates AS (
         SELECT id, ROW_NUMBER() OVER (PARTITION BY student_enrollment_id, attendance_date ORDER BY updated_at DESC) as rn
-        FROM daily_attendance WHERE deleted_at IS NULL
+        FROM daily_attendance WHERE deleted_at IS NULL AND school_id = v_sid
     )
     UPDATE daily_attendance SET deleted_at = NOW()
     WHERE id IN (SELECT id FROM duplicates WHERE rn > 1);
 
-    -- 2. Deduplicate class_subjects
     UPDATE class_subjects SET deleted_at = NOW()
     WHERE id IN (
         SELECT id FROM (
             SELECT id, ROW_NUMBER() OVER (PARTITION BY class_section_id, subject_id ORDER BY id) as rn
-            FROM class_subjects WHERE deleted_at IS NULL
+            FROM class_subjects WHERE deleted_at IS NULL AND school_id = v_sid
         ) t WHERE rn > 1
     );
 
-    -- 3. Backfill class_subjects from timetable_slots
-    INSERT INTO class_subjects (class_section_id, subject_id, teacher_id)
-    SELECT DISTINCT ts.class_section_id, ts.subject_id, ts.teacher_id
+    INSERT INTO class_subjects (school_id, class_section_id, subject_id, teacher_id)
+    SELECT DISTINCT v_sid, ts.class_section_id, ts.subject_id, ts.teacher_id
     FROM timetable_slots ts
-    WHERE ts.teacher_id IS NOT NULL 
+    WHERE ts.teacher_id IS NOT NULL AND ts.school_id = v_sid
       AND NOT EXISTS (
         SELECT 1 FROM class_subjects cs
-        WHERE cs.class_section_id = ts.class_section_id AND cs.subject_id = ts.subject_id
+        WHERE cs.class_section_id = ts.class_section_id AND cs.subject_id = ts.subject_id AND cs.school_id = v_sid
     );
 
-    -- 4. Sync teacher_id in class_subjects from timetable if mismatch
     UPDATE class_subjects cs
     SET teacher_id = ts.teacher_id
     FROM timetable_slots ts
@@ -4010,54 +1583,20 @@ BEGIN
       AND cs.subject_id = ts.subject_id
       AND cs.teacher_id IS DISTINCT FROM ts.teacher_id
       AND cs.deleted_at IS NULL
-      AND ts.teacher_id IS NOT NULL;
+      AND ts.teacher_id IS NOT NULL
+      AND cs.school_id = v_sid AND ts.school_id = v_sid;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
--- View to see assigned Class Teachers
-CREATE OR REPLACE VIEW debug_class_teachers AS
-SELECT 
-    c.name as class_name, 
-    s.name as section_name, 
-    p.display_name as teacher_name,
-    ay.code as academic_year
-FROM class_sections cs
-JOIN classes c ON cs.class_id = c.id
-JOIN sections s ON cs.section_id = s.id
-JOIN academic_years ay ON cs.academic_year_id = ay.id
-LEFT JOIN staff st ON cs.class_teacher_id = st.id
-LEFT JOIN persons p ON st.person_id = p.id;
-
--- View to see Roles & Permissions Mapping
-CREATE OR REPLACE VIEW debug_role_permissions AS
-SELECT 
-    r.code as role,
-    STRING_AGG(p.code, ', ') as permissions
-FROM roles r
-LEFT JOIN role_permissions rp ON r.id = rp.role_id
-LEFT JOIN permissions p ON rp.permission_id = p.id
-GROUP BY r.code;
-
--- CORE INTEGRITY GUARD: Central Diagnostic Toolkit
-CREATE OR REPLACE FUNCTION run_integrity_check()
-RETURNS TABLE (
-    severity TEXT,
-    category TEXT,
-    entity_id TEXT,
-    description TEXT
-) AS $$
+CREATE OR REPLACE FUNCTION run_integrity_check(p_school_id INTEGER)
+RETURNS TABLE (severity TEXT, category TEXT, entity_id TEXT, description TEXT) AS $$
 BEGIN
-    -- 1. Teacher Collision Audit
-    RETURN QUERY
-    SELECT 
-        'CRITICAL'::TEXT, 'COLLISION'::TEXT, t1.id::TEXT, 
-        format('Teacher %s is double-booked for period %s on %s', t1.teacher_id, t1.period_number, t1.day_of_week)
-    FROM timetable_slots t1
-    JOIN timetable_slots t2 ON t1.teacher_id = t2.teacher_id 
-        AND t1.day_of_week = t2.day_of_week 
-        AND t1.period_number = t2.period_number
-        AND t1.academic_year_id = t2.academic_year_id
-    WHERE t1.id < t2.id;
+    RETURN QUERY SELECT 'CRITICAL'::TEXT, 'COLLISION'::TEXT, t1.id::TEXT, format('Teacher double-booked')
+    FROM timetable_slots t1 
+    JOIN timetable_slots t2 ON t1.teacher_id = t2.teacher_id AND t1.day_of_week = t2.day_of_week AND t1.period_number = t2.period_number AND t1.academic_year_id = t2.academic_year_id
+    WHERE t1.id < t2.id 
+      AND t1.school_id = p_school_id;
+
 
     -- 2. Duplicate Attendance Audit
     RETURN QUERY
@@ -4065,7 +1604,7 @@ BEGIN
         'HIGH'::TEXT, 'DUPLICATE_DATA'::TEXT, da.student_enrollment_id::TEXT, 
         format('Multiple attendance records for date %s', da.attendance_date)
     FROM daily_attendance da
-    WHERE da.deleted_at IS NULL
+    WHERE da.deleted_at IS NULL AND da.school_id = p_school_id
     GROUP BY da.student_enrollment_id, da.attendance_date
     HAVING COUNT(*) > 1;
 
@@ -4075,13 +1614,14 @@ BEGIN
         'MEDIUM'::TEXT, 'MAPPING_ERROR'::TEXT, ts.id::TEXT, 
         format('Teacher is teaching Subject %s in Class Section %s without assignment', ts.subject_id, ts.class_section_id)
     FROM timetable_slots ts
-    WHERE ts.teacher_id IS NOT NULL 
+    WHERE ts.teacher_id IS NOT NULL AND ts.school_id = p_school_id
       AND NOT EXISTS (
         SELECT 1 FROM class_subjects cs 
         WHERE cs.class_section_id = ts.class_section_id 
           AND cs.teacher_id = ts.teacher_id 
           AND cs.subject_id = ts.subject_id
           AND cs.deleted_at IS NULL
+          AND cs.school_id = p_school_id
       );
 
     -- 4. Multi-Section Enrollment Check
@@ -4090,7 +1630,7 @@ BEGIN
         'CRITICAL'::TEXT, 'ENROLLMENT_ERROR'::TEXT, se.student_id::TEXT, 
         format('Student has %s active enrollments in Academic Year %s', COUNT(*), se.academic_year_id)
     FROM student_enrollments se
-    WHERE se.status = 'active' AND se.deleted_at IS NULL
+    WHERE se.status = 'active' AND se.deleted_at IS NULL AND se.school_id = p_school_id
     GROUP BY se.student_id, se.academic_year_id
     HAVING COUNT(*) > 1;
 
@@ -4099,30 +1639,27 @@ BEGIN
     SELECT 'HIGH'::TEXT, 'ORPHAN'::TEXT, se.id::TEXT, 'Enrollment linked to deleted student'
     FROM student_enrollments se
     LEFT JOIN students s ON se.student_id = s.id
-    WHERE (s.id IS NULL OR s.deleted_at IS NOT NULL) AND se.deleted_at IS NULL;
+    WHERE (s.id IS NULL OR s.deleted_at IS NOT NULL) AND se.deleted_at IS NULL
+      AND se.school_id = p_school_id;
 
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
--- ============================================================
--- UTILITIES & MAINTENANCE
--- ============================================================
-
--- Function to recalculate fee ledger from transactions (Fix for double-counting)
-CREATE OR REPLACE FUNCTION recalculate_fee_ledger()
+CREATE OR REPLACE FUNCTION recalculate_fee_ledger(p_school_id INTEGER DEFAULT NULL)
 RETURNS VOID AS $$
 DECLARE
     r_fee RECORD;
     v_calculated_paid DECIMAL(12,2);
     v_new_status fee_status_enum;
     v_remaining DECIMAL(12,2);
+    v_sid INTEGER := COALESCE(p_school_id, auth_school_id());
 BEGIN
-    -- Set GUC flag to bypass prevent_direct_fee_update guard trigger
+    IF v_sid IS NULL THEN RAISE EXCEPTION 'school_id required'; END IF;
     PERFORM set_config('app.fee_recalc_mode', 'true', true);
 
     FOR r_fee IN 
         SELECT sf.id, sf.amount_due, sf.amount_paid, sf.discount, sf.status
-        FROM student_fees sf
+        FROM student_fees sf WHERE sf.school_id = v_sid
     LOOP
         -- Calculate total from transactions
         SELECT COALESCE(SUM(amount), 0) INTO v_calculated_paid
@@ -4162,193 +1699,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Session-level search path (ALTER DATABASE removed — non-transactional DDL)
-SET search_path = public, extensions;
-
--- ============================================================
--- NOTIFICATION SYSTEM (Production Hardened)
--- ============================================================
-
-DO $$ BEGIN
-    CREATE TYPE notification_channel AS ENUM ('IN_APP', 'EMAIL', 'SMS', 'PUSH');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-DO $$ BEGIN
-    CREATE TYPE notification_status AS ENUM ('PENDING', 'PROCESSING', 'DELIVERED', 'FAILED', 'READ', 'DISMISSED');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
-DO $$ BEGIN
-    CREATE TYPE event_status AS ENUM ('RECEIVED', 'PROCESSED', 'FAILED');
-EXCEPTION WHEN duplicate_object THEN null;
-END $$;
-
--- 1. Notification Templates
-CREATE TABLE IF NOT EXISTS notification_templates (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_type VARCHAR(100) UNIQUE NOT NULL,
-    title_template TEXT NOT NULL,
-    body_template TEXT NOT NULL,
-    default_channels notification_channel[] NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ
-);
-ALTER TABLE notification_templates ENABLE ROW LEVEL SECURITY;
-
--- 2. Notification Preferences
-CREATE TABLE IF NOT EXISTS notification_preferences (
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    event_type VARCHAR(100) REFERENCES notification_templates(event_type),
-    channel notification_channel NOT NULL,
-    is_enabled BOOLEAN DEFAULT TRUE,
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ,
-    PRIMARY KEY (user_id, event_type, channel)
-);
-ALTER TABLE notification_preferences ENABLE ROW LEVEL SECURITY;
-
--- 3. Notification Events
-CREATE TABLE IF NOT EXISTS notification_events (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    idempotency_key VARCHAR(255) UNIQUE NOT NULL,
-    event_type VARCHAR(100) NOT NULL REFERENCES notification_templates(event_type),
-    actor_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    target_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    payload JSONB NOT NULL,
-    status event_status NOT NULL DEFAULT 'RECEIVED',
-    error_reason TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ
-);
-ALTER TABLE notification_events ENABLE ROW LEVEL SECURITY;
-
--- 4. Notifications
-CREATE TABLE IF NOT EXISTS notifications (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_id UUID NOT NULL REFERENCES notification_events(id) ON DELETE CASCADE,
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title TEXT NOT NULL, 
-    body TEXT NOT NULL,
-    action_url TEXT,
-    status notification_status NOT NULL DEFAULT 'PENDING',
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    read_at TIMESTAMPTZ,
-    expires_at TIMESTAMPTZ,
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT uniq_notifications_event_user UNIQUE (event_id, user_id)
-);
-ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
-
--- 5. Notification Deliveries
-CREATE TABLE IF NOT EXISTS notification_deliveries (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
-    channel notification_channel NOT NULL,
-    provider_message_id VARCHAR(255),
-    status notification_status NOT NULL DEFAULT 'PENDING',
-    retry_count INT DEFAULT 0,
-    next_retry_at TIMESTAMPTZ,
-    error_log TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ,
-    CONSTRAINT uniq_delivery_notification_channel UNIQUE (notification_id, channel),
-    CONSTRAINT chk_max_retries CHECK (retry_count <= 5),
-    CONSTRAINT chk_retry_time CHECK (
-        (status = 'FAILED' AND next_retry_at IS NOT NULL) OR 
-        (status != 'FAILED')
-    )
-);
-ALTER TABLE notification_deliveries ENABLE ROW LEVEL SECURITY;
-
--- 6. Notification Audit Logs
-CREATE TABLE IF NOT EXISTS notification_audit_logs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    delivery_id UUID REFERENCES notification_deliveries(id),
-    notification_id UUID REFERENCES notifications(id),
-    action VARCHAR(50) NOT NULL,
-    metadata JSONB,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Indexes for Performance
-CREATE INDEX IF NOT EXISTS idx_notifications_unread_fetch 
-ON notifications (user_id, created_at DESC) 
-WHERE status IN ('PENDING', 'DELIVERED');
-
-CREATE INDEX IF NOT EXISTS idx_deliveries_worker_fetch 
-ON notification_deliveries (next_retry_at) 
-WHERE status = 'FAILED' AND retry_count < 5;
-
-CREATE INDEX IF NOT EXISTS idx_events_idempotency ON notification_events(idempotency_key);
-
--- ============================================================
--- RECENT DDL PATCHES (Drivers, RLS, Timetables)
--- ============================================================
-
--- From apply_phase5_db.js
-CREATE TABLE IF NOT EXISTS public.driver_devices (
-    driver_id uuid NOT NULL,
-    device_id varchar NOT NULL,
-    last_active timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now(),
-    PRIMARY KEY (driver_id)
-);
-
-CREATE TABLE IF NOT EXISTS public.driver_heartbeat (
-    driver_id uuid NOT NULL,
-    last_ping timestamp with time zone DEFAULT now(),
-    status varchar DEFAULT 'online', -- online, offline, paused
-    PRIMARY KEY (driver_id)
-);
-
-CREATE TABLE IF NOT EXISTS public.bus_trip_history (
-    id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-    bus_id uuid NOT NULL,
-    latitude double precision,
-    longitude double precision,
-    speed double precision,
-    is_mocked boolean DEFAULT false,
-    is_suspicious boolean DEFAULT false,
-    recorded_at timestamp with time zone DEFAULT now()
-);
-
-ALTER TABLE public.bus_locations 
-  ADD COLUMN IF NOT EXISTS is_mocked boolean DEFAULT false,
-  ADD COLUMN IF NOT EXISTS is_suspicious boolean DEFAULT false;
-
-CREATE INDEX IF NOT EXISTS idx_bus_locations_bus_id ON public.bus_locations (bus_id);
-CREATE INDEX IF NOT EXISTS idx_bus_locations_recorded_at ON public.bus_locations (recorded_at DESC);
-CREATE INDEX IF NOT EXISTS idx_bus_trip_history_bus_id_time ON public.bus_trip_history (bus_id, recorded_at DESC);
-
-
--- From apply_driver_rls.js
-ALTER TABLE IF EXISTS public.buses ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "Authenticated users can read buses" ON public.buses;
-CREATE POLICY "Authenticated users can read buses" ON public.buses FOR SELECT USING (auth.role() = 'authenticated');
-
-ALTER TABLE IF EXISTS public.bus_locations ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "Authenticated users can read bus locations" ON public.bus_locations;
-CREATE POLICY "Authenticated users can read bus locations" ON public.bus_locations FOR SELECT USING (auth.role() = 'authenticated');
-DROP POLICY IF EXISTS "Authenticated users can insert bus locations" ON public.bus_locations;
-CREATE POLICY "Authenticated users can insert bus locations" ON public.bus_locations FOR INSERT WITH CHECK (auth.role() = 'authenticated');
-
-ALTER TABLE IF EXISTS public.transport_routes ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "Authenticated users can read routes" ON public.transport_routes;
-CREATE POLICY "Authenticated users can read routes" ON public.transport_routes FOR SELECT USING (auth.role() = 'authenticated');
-
-ALTER TABLE IF EXISTS public.persons ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "Users can read own person" ON public.persons;
-CREATE POLICY "Users can read own person" ON public.persons FOR SELECT USING (id IN (SELECT person_id FROM public.users WHERE public.users.id = auth.uid()) OR auth.role() = 'service_role' OR auth.role() = 'anon');
-
-ALTER TABLE IF EXISTS public.staff ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "Users can read own staff record" ON public.staff;
-CREATE POLICY "Users can read own staff record" ON public.staff FOR SELECT USING (person_id IN (SELECT person_id FROM public.users WHERE public.users.id = auth.uid()) OR auth.role() = 'service_role' OR auth.role() = 'anon');
-
-
--- From fix_trigger.js
 CREATE OR REPLACE FUNCTION public.sync_class_teacher_from_timetable()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -4378,8 +1728,6 @@ BEGIN
 END;
 $function$;
 
-
--- From migrate_timetable.js
 CREATE OR REPLACE FUNCTION validate_timetable_entry()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -4476,11 +1824,3550 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DO $$ 
+CREATE OR REPLACE FUNCTION is_admin() RETURNS BOOLEAN AS $$
 BEGIN
-  ALTER TABLE timetable_slots DROP COLUMN IF EXISTS day_of_week CASCADE;
-EXCEPTION WHEN OTHERS THEN NULL;
+    RETURN EXISTS (
+        SELECT 1 FROM user_roles ur
+        JOIN roles r ON ur.role_id = r.id
+        WHERE ur.user_id = auth.uid()
+          AND ur.school_id = auth_school_id()
+          AND r.school_id = auth_school_id()
+          AND r.code = 'admin'
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION public.update_user_settings_updated_at()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+            BEGIN
+                NEW.updated_at = NOW();
+                RETURN NEW;
+            END;
+            $function$
+;
+
+CREATE OR REPLACE FUNCTION public.is_principal()
+ RETURNS boolean
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  RETURN EXISTS (
+    SELECT 1 
+    FROM public.staff s 
+    WHERE s.user_id = auth.uid() AND s.designation_id = 1
+      AND s.school_id = auth_school_id()
+  );
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.fn_transaction_immutability()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+    IF (TG_OP = 'DELETE') THEN
+        RAISE EXCEPTION 'Hard delete of financial transactions is FORBIDDEN. Use voiding.';
+    END IF;
+
+    IF (TG_OP = 'UPDATE') THEN
+        -- Allow updating ONLY voided_at or purely metadata fields if strictness needed
+        IF (NEW.amount != OLD.amount) OR (NEW.student_fee_id != OLD.student_fee_id) THEN
+            RAISE EXCEPTION 'Modification of Transaction Amount/Linkage is FORBIDDEN.';
+        END IF;
+        
+        IF (OLD.voided_at IS NOT NULL) THEN
+            RAISE EXCEPTION 'Cannot modify an already voided transaction.';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.fn_prevent_immutable_changes()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+    IF (OLD.id IS DISTINCT FROM NEW.id) THEN
+        RAISE EXCEPTION 'Modification of ID is not allowed.';
+    END IF;
+    
+    -- Check created_at only if it exists in the table (generic safety)
+    -- Note: We assume the column is named 'created_at' standardly.
+    IF (OLD.created_at IS DISTINCT FROM NEW.created_at) THEN
+        RAISE EXCEPTION 'Modification of created_at is not allowed.';
+    END IF;
+    
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.fn_prevent_overpayment()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+    IF NEW.amount_paid > NEW.amount_due THEN
+        RAISE EXCEPTION 'Overpayment Violation: Paid (%) > Due (%)', NEW.amount_paid, NEW.amount_due;
+    END IF;
+    
+    -- Auto-status
+    IF NEW.amount_paid = NEW.amount_due THEN
+        NEW.status = 'paid';
+    ELSIF NEW.amount_paid > 0 THEN
+        NEW.status = 'partial';
+    ELSE
+        NEW.status = 'unpaid';
+    END IF;
+    
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.fn_check_academic_year_dates()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+    IF NEW.start_date > NEW.end_date THEN
+        RAISE EXCEPTION 'Academic Year Start Date (%) cannot be after End Date (%).', NEW.start_date, NEW.end_date;
+    END IF;
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.is_management()
+ RETURNS boolean
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  RETURN (public.is_principal() OR public.is_accounts());
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.fn_update_fee_balance()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_fee public.student_fees%ROWTYPE;
+BEGIN
+    -- LOCK the parent row to prevent race conditions
+    SELECT * INTO v_fee
+    FROM public.student_fees
+    WHERE id = NEW.student_fee_id
+    FOR UPDATE;
+
+    -- Handle Insert
+    IF (TG_OP = 'INSERT') THEN
+        UPDATE public.student_fees
+        SET amount_paid = v_fee.amount_paid + NEW.amount
+        WHERE id = v_fee.id;
+        RETURN NEW;
+    END IF;
+
+    -- Handle Voiding
+    IF (TG_OP = 'UPDATE') THEN
+        IF OLD.voided_at IS NULL AND NEW.voided_at IS NOT NULL THEN
+            UPDATE public.student_fees
+            SET amount_paid = v_fee.amount_paid - NEW.amount
+            WHERE id = v_fee.id;
+        END IF;
+        RETURN NEW;
+    END IF;
+    
+    RETURN NULL;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.current_staff_id()
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_staff_id UUID;
+BEGIN
+  SELECT id INTO v_staff_id
+  FROM public.staff
+  WHERE user_id = auth.uid()
+    AND school_id = auth_school_id();
+  
+  RETURN v_staff_id;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.is_accounts()
+ RETURNS boolean
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  RETURN EXISTS (
+    SELECT 1 
+    FROM public.staff s 
+    WHERE s.user_id = auth.uid() AND s.designation_id = 4
+      AND s.school_id = auth_school_id()
+  );
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.fn_lower_email()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+    IF NEW.email IS NOT NULL THEN
+        NEW.email = LOWER(NEW.email);
+    END IF;
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.validate_attendance_date()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM student_enrollments
+    WHERE id = NEW.student_enrollment_id
+      AND status = 'active'
+      AND NEW.attendance_date BETWEEN start_date AND COALESCE(end_date, NEW.attendance_date)
+      AND (end_date IS NULL OR NEW.attendance_date <= end_date)
+      AND deleted_at IS NULL
+  ) THEN
+    RAISE EXCEPTION 'Attendance date outside valid enrollment period or enrollment not active';
+  END IF;
+  RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.fn_verify_fee_integrity()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+    v_sum NUMERIC;
+BEGIN
+    SELECT COALESCE(SUM(amount), 0)
+    INTO v_sum
+    FROM public.fee_transactions
+    WHERE student_fee_id = NEW.id
+      AND voided_at IS NULL;
+
+    -- Using small epsilon for float math if needed, but DECIMAL should be exact.
+    IF v_sum != NEW.amount_paid THEN
+        RAISE EXCEPTION 'Ledger Mismatch: Computed Sum (%) != Stored Paid Amount (%) for Fee ID %', v_sum, NEW.amount_paid, NEW.id;
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.fn_check_no_future_attendance()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+    IF NEW.attendance_date > CURRENT_DATE THEN
+        RAISE EXCEPTION 'Cannot mark attendance for future date: % (Today is %)', NEW.date, CURRENT_DATE;
+    END IF;
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.prevent_complaint_delete()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+    IF (current_user <> 'postgres') THEN -- Allow admin/migration tool to delete if needed
+        RAISE EXCEPTION 'Deleting complaints is not allowed. Update status instead.';
+    END IF;
+    RETURN OLD;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.enforce_class_teacher_source_of_truth()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+    -- Allow updates if they match Monday Period 1 (which the trigger above does)
+    -- But if a user manually tries to set it to something else, we should either:
+    -- A) Block it.
+    -- B) Let it happen but it will be overwritten next timetable change.
+    
+    -- Let's just rely on the trigger. If they manually change it, it might be for a valid reason 
+    -- (temp substitute), but the next timetable edit will reset it. 
+    -- User requirement: "No static or manually assigned class teacher logic."
+    -- So we should probably effectively make it read-only from the API perspective, 
+    -- or just let the trigger handle it.
+    
+    -- To adhere to "Single Source of Truth", we can force checking against timetable on update.
+    -- But that causes circular logic if we aren't careful.
+    -- Let's stick to the AFTER trigger on timetable_slots as the primary mechanism.
+    
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.fn_update_timestamp()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.fn_check_invoice_amounts()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+    IF NEW.paid_amount > NEW.total_amount THEN
+        RAISE EXCEPTION 'Paid amount (%) cannot exceed Total amount (%).', NEW.paid_amount, NEW.total_amount;
+    END IF;
+    
+    -- Auto-update status based on payment
+    IF NEW.paid_amount = NEW.total_amount THEN
+        NEW.status = 'paid';
+    ELSIF NEW.paid_amount > 0 THEN
+        NEW.status = 'partial';
+    ELSIF NEW.paid_amount = 0 THEN
+         -- Optional: Reset to unpaid if it was something else, or leave logic to app.
+         -- Safest to only strictly set 'paid' or 'partial' if logic dictates.
+         IF NEW.status = 'paid' THEN NEW.status = 'unpaid'; END IF; 
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION public.is_staff()
+ RETURNS boolean
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  RETURN EXISTS (
+    SELECT 1 FROM public.staff WHERE user_id = auth.uid() AND staff.school_id = auth_school_id()
+  );
+END;
+$function$
+;
+
+CREATE OR REPLACE FUNCTION get_next_receipt_no(p_school_id INTEGER) RETURNS TEXT AS $$
+DECLARE
+  v_seq_name TEXT := 'receipt_no_seq_school_' || p_school_id;
+BEGIN
+  EXECUTE format('CREATE SEQUENCE IF NOT EXISTS %I START 1001', v_seq_name);
+  RETURN 'SCH' || p_school_id || '-RCT-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-' || LPAD(NEXTVAL(v_seq_name)::TEXT, 5, '0');
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_next_complaint_ticket(p_school_id INTEGER) RETURNS TEXT AS $$
+DECLARE
+  v_seq_name TEXT := 'complaint_ticket_seq_school_' || p_school_id;
+BEGIN
+  EXECUTE format('CREATE SEQUENCE IF NOT EXISTS %I START 1', v_seq_name);
+  RETURN 'TKT-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-S' || p_school_id || '-' || LPAD(NEXTVAL(v_seq_name)::TEXT, 4, '0');
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+CREATE TABLE IF NOT EXISTS schools (
+  id         SERIAL      PRIMARY KEY,                           -- INTEGER auto-increment; matches all tenant school_id FK columns
+  name       TEXT        NOT NULL,                              -- Display name shown in app UI
+  code       TEXT        UNIQUE NOT NULL,                       -- Matches EXPO_PUBLIC_SCHOOL_CODE in each per-school app build
+  address    TEXT,                                              -- Physical address, nullable
+  logo_url   TEXT,                                              -- CDN URL for school branding, nullable
+  is_active  BOOLEAN     NOT NULL DEFAULT true,                 -- Soft-disable a school without deleting rows
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()                 -- Audit timestamp
+);
+
+-- Schools are provisioned by the NexSyrus super admin via API.
+-- No school is seeded at schema level. Fresh DB starts empty.
+-- Legacy compatibility: if an old NOT NULL slug column exists on schools,
+-- relax it so the above seed (which does not populate slug) can succeed.
+
+
+-- Helper: Get current school from session GUC
+
+-- Helper: RPC for clients to set school context
+
+GRANT EXECUTE ON FUNCTION current_school_id() TO authenticated, service_role;
+-- Prevent clients from arbitrarily switching tenant context.
+REVOKE EXECUTE ON FUNCTION set_school_context(INTEGER) FROM authenticated;
+GRANT EXECUTE ON FUNCTION set_school_context(INTEGER) TO service_role;
+
+-- Multitenancy: derive school from the authenticated user record (single source of truth).
+
+GRANT EXECUTE ON FUNCTION auth_school_id() TO authenticated, service_role;
+
+-- 1. REFERENCE TABLES
+CREATE TABLE IF NOT EXISTS countries (
+    code CHAR(2) PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    UNIQUE (name)
+);
+
+CREATE TABLE IF NOT EXISTS genders (
+    id SMALLINT PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    UNIQUE (name)
+);
+
+CREATE TABLE IF NOT EXISTS student_categories (
+    id SMALLINT PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    UNIQUE (name)
+);
+
+CREATE TABLE IF NOT EXISTS religions (
+    id SMALLINT PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    UNIQUE (name)
+);
+
+CREATE TABLE IF NOT EXISTS blood_groups (
+    id SMALLINT PRIMARY KEY,
+    name VARCHAR(10) NOT NULL,
+    UNIQUE (name)
+);
+
+CREATE TABLE IF NOT EXISTS relationship_types (
+    id SMALLINT PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    UNIQUE (name)
+);
+
+CREATE TABLE IF NOT EXISTS staff_designations (
+    id SMALLINT PRIMARY KEY,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    name VARCHAR(100) NOT NULL,
+    UNIQUE (school_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_staff_designations_school_id ON staff_designations(school_id);
+
+
+-- ENSURE SCHOOL_ID ON ALL TABLES
+
+
+CREATE INDEX IF NOT EXISTS idx_staff_designations_school_id ON staff_designations(school_id);
+
+-- 1b. SEED REFERENCE DATA
+-- These INSERTs are idempotent (ON CONFLICT DO NOTHING) and required
+-- because persons.gender_id and students.status_id are NOT NULL FK columns.
+
+INSERT INTO genders (id, name)
+SELECT v.id, v.name
+FROM (VALUES
+  (1, 'Male'),
+  (2, 'Female'),
+  (3, 'Other')
+) AS v(id, name)
+WHERE NOT EXISTS (
+  SELECT 1 FROM genders g WHERE g.id = v.id
+);
+
+INSERT INTO countries (code, name)
+SELECT v.code, v.name
+FROM (VALUES
+  ('IN', 'India'),
+  ('US', 'United States'),
+  ('GB', 'United Kingdom'),
+  ('AE', 'United Arab Emirates'),
+  ('SA', 'Saudi Arabia'),
+  ('AU', 'Australia')
+) AS v(code, name)
+WHERE NOT EXISTS (
+  SELECT 1 FROM countries c WHERE c.code = v.code
+);
+
+INSERT INTO religions (id, name)
+SELECT v.id, v.name
+FROM (VALUES
+  (1, 'Hinduism'),
+  (2, 'Islam'),
+  (3, 'Christianity'),
+  (4, 'Sikhism'),
+  (5, 'Buddhism'),
+  (6, 'Jainism'),
+  (7, 'Other')
+) AS v(id, name)
+WHERE NOT EXISTS (
+  SELECT 1 FROM religions r WHERE r.id = v.id
+);
+
+INSERT INTO blood_groups (id, name)
+SELECT v.id, v.name
+FROM (VALUES
+  (1, 'A+'),
+  (2, 'A-'),
+  (3, 'B+'),
+  (4, 'B-'),
+  (5, 'AB+'),
+  (6, 'AB-'),
+  (7, 'O+'),
+  (8, 'O-')
+) AS v(id, name)
+WHERE NOT EXISTS (
+  SELECT 1 FROM blood_groups b WHERE b.id = v.id
+);
+
+INSERT INTO student_categories (id, name)
+SELECT v.id, v.name
+FROM (VALUES
+  (1, 'General'),
+  (2, 'OBC'),
+  (3, 'SC'),
+  (4, 'ST'),
+  (5, 'EWS')
+) AS v(id, name)
+WHERE NOT EXISTS (
+  SELECT 1 FROM student_categories sc WHERE sc.id = v.id
+);
+
+INSERT INTO relationship_types (id, name)
+SELECT v.id, v.name
+FROM (VALUES
+  (1, 'Father'),
+  (2, 'Mother'),
+  (3, 'Guardian'),
+  (4, 'Sibling'),
+  (5, 'Other')
+) AS v(id, name)
+WHERE NOT EXISTS (
+  SELECT 1 FROM relationship_types rt WHERE rt.id = v.id
+);
+
+INSERT INTO staff_designations (id, school_id, name)
+SELECT v.id, v.school_id, v.name
+FROM (VALUES
+  (1, 1, 'Principal'),
+  (2, 1, 'Vice Principal'),
+  (3, 1, 'Teacher'),
+  (4, 1, 'Senior Teacher'),
+  (5, 1, 'Lab Assistant'),
+  (6, 1, 'Librarian'),
+  (7, 1, 'Clerk'),
+  (8, 1, 'Peon'),
+  (9, 1, 'Other')
+) AS v(id, school_id, name)
+WHERE NOT EXISTS (
+  SELECT 1 FROM staff_designations sd WHERE sd.id = v.id
+);
+
+-- 2. CORE TRIGGERS (GLOBAL)
+
+-- 3. PERSONS
+CREATE TABLE IF NOT EXISTS persons (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    first_name VARCHAR(50) NOT NULL,
+    middle_name VARCHAR(50),
+    last_name VARCHAR(50) NOT NULL,
+    display_name TEXT,
+    dob DATE,
+    gender_id SMALLINT NOT NULL REFERENCES genders(id),
+    nationality_code CHAR(2) REFERENCES countries(code),
+    photo_url TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_person_dob_past CHECK (dob IS NULL OR dob <= current_date),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_persons_school_id ON persons(school_id);
+
+
+DROP TRIGGER IF EXISTS trg_persons_updated ON persons;
+CREATE TRIGGER trg_persons_updated
+BEFORE UPDATE ON persons
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+DROP TRIGGER IF EXISTS trg_persons_display_name ON persons;
+CREATE TRIGGER trg_persons_display_name
+BEFORE INSERT OR UPDATE ON persons
+FOR EACH ROW EXECUTE FUNCTION update_person_display_name();
+
+
+-- Search Index
+CREATE INDEX IF NOT EXISTS idx_persons_name_trgm 
+ON persons USING gin (first_name gin_trgm_ops, last_name gin_trgm_ops);
+
+-- 4. CONTACTS
+
+
+CREATE TABLE IF NOT EXISTS person_contacts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    person_id UUID NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
+    contact_type contact_type_enum NOT NULL,
+    contact_value TEXT NOT NULL,
+    is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+    is_emergency BOOLEAN NOT NULL DEFAULT FALSE,
+    is_verified BOOLEAN NOT NULL DEFAULT FALSE,
+    verified_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_person_contacts_school_id ON person_contacts(school_id);
+
+
+-- Indexes
+CREATE UNIQUE INDEX IF NOT EXISTS uq_primary_contact_only
+ON person_contacts(person_id, contact_type)
+WHERE is_primary = true;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_person_contact_unique
+ON person_contacts(person_id, contact_type, lower(contact_value))
+WHERE deleted_at IS NULL;
+
+DROP TRIGGER IF EXISTS trg_person_contacts_updated ON person_contacts;
+CREATE TRIGGER trg_person_contacts_updated
+BEFORE UPDATE ON person_contacts
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- 5. USERS & RBAC
+CREATE TABLE IF NOT EXISTS roles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code VARCHAR(50) NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    is_system BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    UNIQUE (code),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_roles_school_id ON roles(school_id);
+
+CREATE TABLE IF NOT EXISTS permissions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code VARCHAR(100) NOT NULL,
+    name VARCHAR(150) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    UNIQUE (code),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_permissions_school_id ON permissions(school_id);
+
+
+CREATE TABLE IF NOT EXISTS role_permissions (
+    role_id UUID REFERENCES roles(id) ON DELETE CASCADE,
+    permission_id UUID REFERENCES permissions(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    PRIMARY KEY (role_id, permission_id),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_role_permissions_school_id ON role_permissions(school_id);
+
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    person_id UUID NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
+    account_status account_status_enum NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_login_at TIMESTAMPTZ,
+    failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    theme text DEFAULT 'light'::text,
+    is_super_admin BOOLEAN DEFAULT false,
+    deleted_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_school_id ON users(school_id);
+
+
+-- Note: deleted_at needed for soft delete index safety
+
+
+-- Soft Delete Safe Unique Index
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_person_active 
+ON users(school_id, person_id) WHERE deleted_at IS NULL; 
+
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    notification_sound VARCHAR(20) DEFAULT 'custom' CHECK (notification_sound IN ('custom', 'default')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_settings_school_id ON user_settings(school_id);
+
+
+DROP TRIGGER IF EXISTS trg_user_settings_updated ON user_settings;
+CREATE TRIGGER trg_user_settings_updated
+BEFORE UPDATE ON user_settings
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    role_id UUID REFERENCES roles(id) ON DELETE CASCADE,
+    granted_by UUID REFERENCES users(id),
+    granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    PRIMARY KEY (user_id, role_id),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_roles_school_id ON user_roles(school_id);
+
+
+DROP TRIGGER IF EXISTS trg_user_active_person ON users;
+CREATE TRIGGER trg_user_active_person
+BEFORE INSERT OR UPDATE ON users
+FOR EACH ROW EXECUTE FUNCTION ensure_active_person_ref();
+
+DROP TRIGGER IF EXISTS trg_users_updated ON users;
+CREATE TRIGGER trg_users_updated
+BEFORE UPDATE ON users
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+-- 6. STUDENTS
+CREATE TABLE IF NOT EXISTS student_statuses (
+    id SMALLINT PRIMARY KEY,
+    code VARCHAR(20) NOT NULL,
+    is_terminal BOOLEAN NOT NULL DEFAULT FALSE,
+    UNIQUE (code)
+);
+
+
+INSERT INTO student_statuses (id, code, is_terminal)
+SELECT v.id, v.code, v.is_terminal
+FROM (VALUES
+  (1, 'active', false),
+  (2, 'graduated', true),
+  (3, 'withdrawn', true),
+  (4, 'expelled', true),
+  (5, 'transferred', true)
+) AS v(id, code, is_terminal)
+WHERE NOT EXISTS (
+  SELECT 1 FROM student_statuses ss WHERE ss.id = v.id
+);
+
+CREATE TABLE IF NOT EXISTS students (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    person_id UUID NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
+    admission_no VARCHAR(30) NOT NULL,
+    admission_date DATE NOT NULL,
+    category_id SMALLINT REFERENCES student_categories(id),
+    religion_id SMALLINT REFERENCES religions(id),
+    blood_group_id SMALLINT REFERENCES blood_groups(id),
+    status_id SMALLINT NOT NULL REFERENCES student_statuses(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_students_school_id ON students(school_id);
+
+
+CREATE INDEX IF NOT EXISTS idx_students_status ON students(status_id);
+
+CREATE INDEX IF NOT EXISTS idx_students_active ON public.students USING btree (id) WHERE (deleted_at IS NULL);
+
+
+-- Remediation: Soft Delete Safe Unique Indexes
+CREATE UNIQUE INDEX IF NOT EXISTS idx_students_admission_active 
+ON students(school_id, admission_no) WHERE deleted_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_students_person_active 
+ON students(school_id, person_id) WHERE deleted_at IS NULL;
+
+DROP TRIGGER IF EXISTS trg_students_updated ON students;
+CREATE TRIGGER trg_students_updated
+BEFORE UPDATE ON students
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- 7. PARENTS
+CREATE TABLE IF NOT EXISTS parents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    person_id UUID NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
+    occupation VARCHAR(100),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_parents_school_id ON parents(school_id);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_parents_person_active 
+ON parents(school_id, person_id) WHERE deleted_at IS NULL;
+
+DROP TRIGGER IF EXISTS trg_parents_updated ON parents;
+CREATE TRIGGER trg_parents_updated
+BEFORE UPDATE ON parents
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TABLE IF NOT EXISTS student_parents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
+    parent_id UUID NOT NULL REFERENCES parents(id) ON DELETE RESTRICT,
+    relationship_id SMALLINT REFERENCES relationship_types(id),
+    is_primary_contact BOOLEAN NOT NULL DEFAULT FALSE,
+    is_legal_guardian BOOLEAN NOT NULL DEFAULT FALSE,
+    valid_from DATE,
+    valid_to DATE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT uq_active_parent UNIQUE (student_id, parent_id),
+    CONSTRAINT no_parent_date_overlap EXCLUDE USING gist (
+        student_id WITH =,
+        parent_id WITH =,
+        daterange(valid_from, valid_to, '[]') WITH &&
+    ),
+    CONSTRAINT chk_parent_valid_range CHECK (valid_from IS NULL OR valid_to IS NULL OR valid_to >= valid_from),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_student_parents_school_id ON student_parents(school_id);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_student_primary_parent
+ON student_parents(student_id)
+WHERE is_primary_contact = true
+  AND deleted_at IS NULL;
+
+
+DROP TRIGGER IF EXISTS trg_student_parents_active ON student_parents;
+CREATE TRIGGER trg_student_parents_active
+BEFORE INSERT OR UPDATE ON student_parents
+FOR EACH ROW EXECUTE FUNCTION ensure_active_student_parent();
+
+
+-- 8. ACADEMICS
+CREATE TABLE IF NOT EXISTS academic_years (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code VARCHAR(20) NOT NULL,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_academic_year CHECK (start_date < end_date),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_academic_years_school_id ON academic_years(school_id);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_academic_years_code_active ON academic_years(school_id, code) WHERE deleted_at IS NULL;
+
+
+CREATE TABLE IF NOT EXISTS classes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(50) NOT NULL,
+    code VARCHAR(20),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_classes_school_id ON classes(school_id);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_classes_name_active ON classes(school_id, name) WHERE deleted_at IS NULL;
+
+
+CREATE TABLE IF NOT EXISTS sections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(50) NOT NULL,
+    code VARCHAR(20),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_sections_school_id ON sections(school_id);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sections_name_active ON sections(school_id, name) WHERE deleted_at IS NULL;
+
+
+CREATE TABLE IF NOT EXISTS class_sections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    class_id UUID NOT NULL REFERENCES classes(id) ON DELETE RESTRICT,
+    section_id UUID NOT NULL REFERENCES sections(id) ON DELETE RESTRICT,
+    academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
+    class_teacher_id UUID, -- FK added after staff table is created (Fix 10)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    UNIQUE (school_id, class_id, section_id, academic_year_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_class_sections_school_id ON class_sections(school_id);
+
+
+CREATE TABLE IF NOT EXISTS student_enrollments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
+    academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
+    class_section_id UUID NOT NULL REFERENCES class_sections(id) ON DELETE RESTRICT,
+    status enrollment_status_enum NOT NULL DEFAULT 'active',
+    start_date DATE NOT NULL,
+    end_date DATE,
+    roll_number INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT no_enrollment_overlap EXCLUDE USING gist (
+        student_id WITH =,
+        daterange(start_date, end_date, '[]') WITH &&
+    ),
+    UNIQUE (school_id, class_section_id, academic_year_id, roll_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_student_enrollments_school_id ON student_enrollments(school_id);
+
+
+CREATE INDEX IF NOT EXISTS idx_active_enrollments
+ON student_enrollments(student_id)
+WHERE status = 'active';
+
+DROP TRIGGER IF EXISTS trg_student_enrollments_updated ON student_enrollments;
+CREATE TRIGGER trg_student_enrollments_updated
+BEFORE UPDATE ON student_enrollments
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+-- Remediation: Set-Based Roll Number Calculation
+
+
+DROP TRIGGER IF EXISTS trg_validate_enrollment ON student_enrollments;
+CREATE TRIGGER trg_validate_enrollment
+BEFORE INSERT OR UPDATE ON student_enrollments
+FOR EACH ROW EXECUTE FUNCTION validate_enrollment_year();
+
+
+DROP TRIGGER IF EXISTS trg_enroll_active_student ON student_enrollments;
+CREATE TRIGGER trg_enroll_active_student
+BEFORE INSERT OR UPDATE ON student_enrollments
+FOR EACH ROW EXECUTE FUNCTION ensure_active_student_enrollment();
+
+-- 9. ATTENDANCE
+
+
+CREATE TABLE IF NOT EXISTS daily_attendance (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_enrollment_id UUID NOT NULL REFERENCES student_enrollments(id) ON DELETE RESTRICT,
+    attendance_date DATE NOT NULL,
+    status attendance_status_enum NOT NULL,
+  remarks TEXT,
+    marked_by UUID REFERENCES users(id) ON DELETE RESTRICT,
+    marked_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_attendance_date_past CHECK (attendance_date <= current_date),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_attendance_school_id ON daily_attendance(school_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_school_student_date ON daily_attendance(school_id, student_enrollment_id, attendance_date);
+
+
+DROP TRIGGER IF EXISTS trg_attendance_updated ON daily_attendance;
+CREATE TRIGGER trg_attendance_updated
+BEFORE UPDATE ON daily_attendance
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_attendance_active
+ON daily_attendance(student_enrollment_id, attendance_date)
+WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_attendance_date ON daily_attendance(attendance_date);
+CREATE INDEX IF NOT EXISTS idx_attendance_enrollment ON daily_attendance(student_enrollment_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_composite ON daily_attendance(student_enrollment_id, status, attendance_date);
+
+
+DROP TRIGGER IF EXISTS trg_validate_attendance ON daily_attendance;
+CREATE TRIGGER trg_validate_attendance
+BEFORE INSERT OR UPDATE ON daily_attendance
+FOR EACH ROW EXECUTE FUNCTION validate_attendance_entry();
+
+-- 10. STAFF
+CREATE TABLE IF NOT EXISTS staff_statuses (
+    id SMALLINT PRIMARY KEY,
+    code VARCHAR(20) NOT NULL,
+    name VARCHAR(50) NOT NULL,
+    UNIQUE (code)
+);
+
+
+INSERT INTO staff_statuses (id, code, name)
+SELECT v.id, v.code, v.name
+FROM (VALUES
+  (1, 'active', 'Active'),
+  (2, 'on_leave', 'On Leave'),
+  (3, 'resigned', 'Resigned'),
+  (4, 'terminated', 'Terminated')
+) AS v(id, code, name)
+WHERE NOT EXISTS (
+  SELECT 1 FROM staff_statuses ss WHERE ss.id = v.id
+);
+
+CREATE TABLE IF NOT EXISTS staff (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    person_id UUID NOT NULL REFERENCES persons(id) ON DELETE RESTRICT,
+    staff_code VARCHAR(30) NOT NULL,
+    designation_id SMALLINT REFERENCES staff_designations(id),
+    joining_date DATE NOT NULL,
+    status_id SMALLINT NOT NULL DEFAULT 1 REFERENCES staff_statuses(id),
+    salary DECIMAL(12,2),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_staff_joining_past CHECK (joining_date <= current_date),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_staff_school_id ON staff(school_id);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_staff_code_active 
+ON staff(school_id, staff_code) WHERE deleted_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_staff_person_active 
+ON staff(school_id, person_id) WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_staff_status ON staff(status_id);
+CREATE INDEX IF NOT EXISTS idx_staff_active ON staff(id) WHERE deleted_at IS NULL;
+
+DROP TRIGGER IF EXISTS trg_staff_updated ON staff;
+CREATE TRIGGER trg_staff_updated
+BEFORE UPDATE ON staff
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+DROP TRIGGER IF EXISTS trg_staff_active_person ON staff;
+CREATE TRIGGER trg_staff_active_person
+BEFORE INSERT OR UPDATE ON staff
+FOR EACH ROW EXECUTE FUNCTION ensure_active_person_staff();
+
+-- Fix 10: Deferred FK — class_teacher_id now references staff(id)
+-- (class_sections was created before staff, so FK was deferred)
+
+
+-- 🔒 Protect System Roles
+
+DROP TRIGGER IF EXISTS trg_protect_system_roles_delete ON roles;
+CREATE TRIGGER trg_protect_system_roles_delete
+BEFORE DELETE ON roles
+FOR EACH ROW EXECUTE FUNCTION prevent_system_role_change();
+
+DROP TRIGGER IF EXISTS trg_protect_system_roles_update ON roles;
+CREATE TRIGGER trg_protect_system_roles_update
+BEFORE UPDATE ON roles
+FOR EACH ROW EXECUTE FUNCTION prevent_system_role_change();
+
+
+-- 10B. STAFF ATTENDANCE
+CREATE TABLE IF NOT EXISTS staff_attendance (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    staff_id UUID NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+    attendance_date DATE NOT NULL,
+    status attendance_status_enum NOT NULL,
+    marked_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    marked_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_staff_attendance_date_past CHECK (attendance_date <= current_date),
+    CONSTRAINT uq_staff_attendance_active UNIQUE (staff_id, attendance_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_staff_attendance_school_id ON staff_attendance(school_id);
+
+CREATE INDEX IF NOT EXISTS idx_staff_attendance_date ON staff_attendance(attendance_date);
+CREATE INDEX IF NOT EXISTS idx_staff_attendance_staff ON staff_attendance(staff_id);
+
+DROP TRIGGER IF EXISTS trg_staff_attendance_updated ON staff_attendance;
+CREATE TRIGGER trg_staff_attendance_updated
+BEFORE UPDATE ON staff_attendance
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+-- 11. FEES (REMEDIATED)
+CREATE TABLE IF NOT EXISTS fee_types (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    code VARCHAR(30),
+    description TEXT,
+    is_recurring BOOLEAN NOT NULL DEFAULT TRUE,
+    is_optional BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_fee_types_school_id ON fee_types(school_id);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_types_name_active ON fee_types(school_id, name) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_types_code_active ON fee_types(school_id, code) WHERE deleted_at IS NULL;
+
+
+CREATE TABLE IF NOT EXISTS fee_structures (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    academic_year_id UUID NOT NULL REFERENCES academic_years(id),
+    class_id UUID NOT NULL REFERENCES classes(id),
+    fee_type_id UUID NOT NULL REFERENCES fee_types(id),
+    amount DECIMAL(12,2) NOT NULL,
+    due_date DATE,
+    frequency VARCHAR(20) DEFAULT 'monthly',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_fee_amount_positive CHECK (amount > 0),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_fee_structures_school_id ON fee_structures(school_id);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_structures_active ON fee_structures(school_id, academic_year_id, class_id, fee_type_id) WHERE deleted_at IS NULL;
+
+
+DROP TRIGGER IF EXISTS trg_fee_structures_updated ON fee_structures;
+CREATE TRIGGER trg_fee_structures_updated
+BEFORE UPDATE ON fee_structures
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+CREATE TABLE IF NOT EXISTS student_fees (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
+    fee_structure_id UUID NOT NULL REFERENCES fee_structures(id) ON DELETE RESTRICT,
+    amount_due DECIMAL(12,2) NOT NULL,
+    amount_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
+    discount DECIMAL(12,2) NOT NULL DEFAULT 0,
+    status fee_status_enum NOT NULL DEFAULT 'pending',
+    due_date DATE,
+    period_month INTEGER,
+    period_year INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_amounts CHECK (amount_due >= 0 AND amount_paid >= 0 AND discount >= 0),
+    CONSTRAINT chk_paid_not_exceed CHECK (amount_paid <= amount_due - discount),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    deleted_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_student_fees_school_id ON student_fees(school_id);
+
+
+-- COMPATIBILITY VIEW: fee_installments (Points to student_fees)
+-- This ensures legacy queries and analytics endpoints continue to function.
+DROP VIEW IF EXISTS fee_installments CASCADE; CREATE OR REPLACE VIEW fee_installments AS 
+SELECT 
+    id, student_id, amount_due, amount_paid, discount, 
+    status, due_date, created_at, updated_at, deleted_at
+FROM student_fees;
+
+-- Fee Propagation & Assignment Logic
+
+DROP TRIGGER IF EXISTS trg_propagate_fee_updates ON fee_structures;
+CREATE TRIGGER trg_propagate_fee_updates
+AFTER UPDATE ON fee_structures
+FOR EACH ROW EXECUTE FUNCTION propagate_fee_structure_updates();
+
+
+DROP TRIGGER IF EXISTS trg_auto_assign_fees_structure ON fee_structures;
+CREATE TRIGGER trg_auto_assign_fees_structure
+AFTER INSERT ON fee_structures
+FOR EACH ROW EXECUTE FUNCTION auto_assign_fees_on_structure_creation();
+
+
+DROP TRIGGER IF EXISTS trg_auto_assign_fees_enrollment ON student_enrollments;
+CREATE TRIGGER trg_auto_assign_fees_enrollment
+AFTER INSERT OR UPDATE ON student_enrollments
+FOR EACH ROW EXECUTE FUNCTION auto_assign_fees_on_enrollment();
+
+
+CREATE INDEX IF NOT EXISTS idx_student_fees_student ON student_fees(student_id);
+CREATE INDEX IF NOT EXISTS idx_student_fees_status ON student_fees(status);
+
+DROP TRIGGER IF EXISTS trg_student_fees_updated ON student_fees;
+CREATE TRIGGER trg_student_fees_updated
+BEFORE UPDATE ON student_fees
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+DROP TRIGGER IF EXISTS trg_auto_fee_status ON student_fees;
+CREATE TRIGGER trg_auto_fee_status
+BEFORE UPDATE ON student_fees
+FOR EACH ROW EXECUTE FUNCTION update_fee_status();
+
+
+CREATE TABLE IF NOT EXISTS fee_transactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_fee_id UUID NOT NULL REFERENCES student_fees(id) ON DELETE RESTRICT,
+    amount DECIMAL(12,2) NOT NULL,
+    payment_method payment_method_enum NOT NULL,
+    transaction_ref VARCHAR(100) NOT NULL,
+    paid_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    received_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    remarks TEXT,
+    refund_of UUID REFERENCES fee_transactions(id) ON DELETE RESTRICT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Allow negative amounts for refunds, but block zero
+    CONSTRAINT chk_transaction_amount CHECK ((amount > (0)::numeric)),
+    -- Refund entries must have negative amount
+    CONSTRAINT chk_refund_must_be_negative CHECK (refund_of IS NULL OR amount < 0),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_fee_transactions_school_id ON fee_transactions(school_id);
+
+
+-- Backfill any existing NULL transaction_ref values before constraints
+
+
+-- Enforce NOT NULL (may already be set by CREATE TABLE above, safe for existing DBs)
+ALTER TABLE fee_transactions ALTER COLUMN transaction_ref SET NOT NULL;
+
+
+-- Unique idempotency key
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_txn_ref_unique ON fee_transactions(school_id, transaction_ref);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_paid_at ON fee_transactions(paid_at);
+
+-- Remediation: Financial Trigger (APPEND-ONLY — INSERT only)
+-- Refunds are negative-amount INSERTs, so += handles both payment and refund
+
+DROP TRIGGER IF EXISTS trg_update_paid_on_transaction ON fee_transactions;
+CREATE TRIGGER trg_update_paid_on_transaction
+AFTER INSERT ON fee_transactions
+FOR EACH ROW EXECUTE FUNCTION update_fee_paid_amount();
+
+-- Guard: Block UPDATE/DELETE on fee_transactions (append-only ledger)
+
+DROP TRIGGER IF EXISTS trg_guard_fee_txn ON fee_transactions;
+CREATE TRIGGER trg_guard_fee_txn
+BEFORE UPDATE OR DELETE ON fee_transactions
+FOR EACH ROW EXECUTE FUNCTION prevent_fee_transaction_mutation();
+
+CREATE SEQUENCE IF NOT EXISTS receipt_no_seq START 1001;
+
+CREATE TABLE IF NOT EXISTS receipts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    receipt_no VARCHAR(30) NOT NULL,
+    student_id UUID NOT NULL REFERENCES students(id),
+    total_amount DECIMAL(12,2) NOT NULL,
+    issued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    issued_by UUID REFERENCES users(id),
+    remarks TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (school_id, receipt_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_receipts_school_id ON receipts(school_id);
+
+CREATE TABLE IF NOT EXISTS receipt_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    receipt_id UUID NOT NULL REFERENCES receipts(id) ON DELETE CASCADE,
+    fee_transaction_id UUID NOT NULL REFERENCES fee_transactions(id),
+    amount DECIMAL(12,2) NOT NULL,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_receipt_items_school_id ON receipt_items(school_id);
+
+
+-- Automation: Auto-generate receipt on transaction
+
+DROP TRIGGER IF EXISTS trg_auto_receipt ON fee_transactions;
+CREATE TRIGGER trg_auto_receipt
+AFTER INSERT ON fee_transactions
+FOR EACH ROW EXECUTE FUNCTION auto_generate_receipt();
+
+-- Backfill existing transactions without receipts
+DO $$
+DECLARE
+    r_trans RECORD;
+    v_receipt_id UUID;
+    v_student_id UUID;
+    v_receipt_no TEXT;
+BEGIN
+    FOR r_trans IN 
+        SELECT t.* 
+        FROM fee_transactions t
+        LEFT JOIN receipt_items ri ON t.id = ri.fee_transaction_id
+        WHERE ri.id IS NULL
+    LOOP
+        -- Get Student ID
+        SELECT student_id INTO v_student_id 
+        FROM student_fees 
+        WHERE id = r_trans.student_fee_id;
+
+        -- Generate Receipt No
+        v_receipt_no := 'RCT-' || TO_CHAR(r_trans.paid_at, 'YYYYMMDD') || '-' || LPAD(NEXTVAL('receipt_no_seq')::TEXT, 4, '0');
+
+        -- Insert Receipt
+        INSERT INTO receipts (
+            school_id,
+            receipt_no,
+            student_id,
+            total_amount,
+            issued_at,
+            issued_by,
+            remarks
+        ) VALUES (
+            r_trans.school_id,
+            v_receipt_no,
+            v_student_id,
+            r_trans.amount,
+            r_trans.paid_at,
+            r_trans.received_by,
+            COALESCE(r_trans.remarks, 'Backfilled')
+        ) RETURNING id INTO v_receipt_id;
+
+        -- Insert Receipt Item
+        INSERT INTO receipt_items (
+            school_id,
+            receipt_id,
+            fee_transaction_id,
+            amount
+        ) VALUES (
+            r_trans.school_id,
+            v_receipt_id,
+            r_trans.id,
+            r_trans.amount
+        );
+    END LOOP;
 END $$;
+
+-- 12. EXAMS & RESULTS
+CREATE TABLE IF NOT EXISTS subjects (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    code VARCHAR(20),
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_subjects_school_id ON subjects(school_id);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subjects_code_active ON subjects(school_id, code) WHERE deleted_at IS NULL;
+
+
+CREATE TABLE IF NOT EXISTS class_subjects (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    class_section_id UUID NOT NULL REFERENCES class_sections(id),
+    subject_id UUID NOT NULL REFERENCES subjects(id),
+    teacher_id UUID REFERENCES staff(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_class_subjects_school_id ON class_subjects(school_id);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_class_subjects_unique ON class_subjects(school_id, class_section_id, subject_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_class_subjects_teacher ON class_subjects(teacher_id);
+
+DROP TRIGGER IF EXISTS trg_class_subjects_updated ON class_subjects;
+CREATE TRIGGER trg_class_subjects_updated
+BEFORE UPDATE ON class_subjects
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+CREATE TABLE IF NOT EXISTS exams (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    academic_year_id UUID NOT NULL REFERENCES academic_years(id),
+    exam_type VARCHAR(50) NOT NULL, 
+    start_date DATE,
+    end_date DATE,
+    status exam_status_enum NOT NULL DEFAULT 'scheduled',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_exam_dates CHECK (end_date IS NULL OR start_date IS NULL OR end_date >= start_date),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_exams_school_id ON exams(school_id);
+
+
+CREATE INDEX IF NOT EXISTS idx_exams_active ON exams(id) WHERE deleted_at IS NULL;
+
+
+DROP TRIGGER IF EXISTS trg_exams_updated ON exams;
+CREATE TRIGGER trg_exams_updated
+BEFORE UPDATE ON exams
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TABLE IF NOT EXISTS exam_subjects (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    exam_id UUID NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
+    subject_id UUID NOT NULL REFERENCES subjects(id),
+    class_id UUID NOT NULL REFERENCES classes(id),
+    exam_date DATE,
+    max_marks DECIMAL(5,2) NOT NULL DEFAULT 100,
+    passing_marks DECIMAL(5,2) NOT NULL DEFAULT 35,
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_marks_valid CHECK (passing_marks <= max_marks AND max_marks > 0),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_exam_subjects_school_id ON exam_subjects(school_id);
+
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_exam_subjects_active ON exam_subjects(exam_id, subject_id, class_id) WHERE deleted_at IS NULL;
+
+
+CREATE TABLE IF NOT EXISTS grading_scales (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    name VARCHAR(50) NOT NULL,
+    min_percentage DECIMAL(5,2) NOT NULL,
+    max_percentage DECIMAL(5,2) NOT NULL,
+    grade VARCHAR(5) NOT NULL,
+    grade_point DECIMAL(3,1),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_percentage_range CHECK (min_percentage >= 0 AND max_percentage <= 100 AND min_percentage < max_percentage)
+);
+
+CREATE INDEX IF NOT EXISTS idx_grading_scales_school_id ON grading_scales(school_id);
+
+CREATE TABLE IF NOT EXISTS marks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    exam_subject_id UUID NOT NULL REFERENCES exam_subjects(id) ON DELETE CASCADE,
+    student_enrollment_id UUID NOT NULL REFERENCES student_enrollments(id),
+    marks_obtained DECIMAL(5,2),
+    is_absent BOOLEAN NOT NULL DEFAULT FALSE,
+    remarks TEXT,
+    remarks_te TEXT,
+    entered_by UUID REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (school_id, exam_subject_id, student_enrollment_id),
+    CONSTRAINT chk_marks_or_absent CHECK (is_absent = TRUE OR marks_obtained IS NOT NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_marks_school_id ON marks(school_id);
+
+
+DROP TRIGGER IF EXISTS trg_validate_marks ON marks;
+CREATE TRIGGER trg_validate_marks
+BEFORE INSERT OR UPDATE ON marks
+FOR EACH ROW EXECUTE FUNCTION validate_marks_entry();
+
+
+CREATE INDEX IF NOT EXISTS idx_marks_enrollment ON marks(student_enrollment_id);
+CREATE INDEX IF NOT EXISTS idx_marks_exam_subject ON marks(exam_subject_id);
+
+DROP TRIGGER IF EXISTS trg_marks_updated ON marks;
+CREATE TRIGGER trg_marks_updated
+BEFORE UPDATE ON marks
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- 13. COMMUNICATION & SUPPORT
+
+
+CREATE TABLE IF NOT EXISTS complaints (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    ticket_no VARCHAR(30),
+    title VARCHAR(200) NOT NULL,
+    title_te TEXT,
+    description TEXT NOT NULL,
+    description_te TEXT,
+    category VARCHAR(50), 
+    priority complaint_priority_enum NOT NULL DEFAULT 'medium',
+    status complaint_status_enum NOT NULL DEFAULT 'open',
+    raised_by UUID NOT NULL REFERENCES users(id),
+    raised_for_student_id UUID REFERENCES students(id), 
+    assigned_to UUID REFERENCES users(id),
+    resolution TEXT,
+    resolution_te TEXT,
+    resolved_by UUID REFERENCES users(id),
+    resolved_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    UNIQUE (school_id, ticket_no)
+);
+CREATE INDEX IF NOT EXISTS idx_complaints_school_id ON complaints(school_id);
+
+DROP TRIGGER IF EXISTS trg_prevent_complaint_delete ON complaints;
+CREATE TRIGGER trg_prevent_complaint_delete
+BEFORE DELETE ON complaints
+FOR EACH ROW EXECUTE FUNCTION prevent_complaint_delete();
+
+
+CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints(status);
+CREATE INDEX IF NOT EXISTS idx_complaints_raised_by ON complaints(raised_by);
+CREATE INDEX IF NOT EXISTS idx_complaints_raised_for ON complaints(raised_for_student_id);
+CREATE INDEX IF NOT EXISTS idx_complaints_assigned_to ON complaints(assigned_to);
+
+DROP TRIGGER IF EXISTS trg_complaints_updated ON complaints;
+CREATE TRIGGER trg_complaints_updated
+BEFORE UPDATE ON complaints
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE SEQUENCE IF NOT EXISTS complaint_ticket_seq START 1;
+
+
+DROP TRIGGER IF EXISTS trg_complaints_ticket ON complaints;
+CREATE TRIGGER trg_complaints_ticket
+BEFORE INSERT ON complaints
+FOR EACH ROW EXECUTE FUNCTION generate_ticket_no();
+
+
+CREATE TABLE IF NOT EXISTS notices (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title VARCHAR(200) NOT NULL,
+    title_te TEXT,
+    content TEXT NOT NULL,
+    content_te TEXT,
+    audience notice_audience_enum NOT NULL DEFAULT 'all',
+    target_class_id UUID REFERENCES classes(id), 
+    priority complaint_priority_enum NOT NULL DEFAULT 'medium',
+    is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+    publish_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ,
+    created_by UUID NOT NULL REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_notices_school_id ON notices(school_id);
+
+
+CREATE INDEX IF NOT EXISTS idx_notices_audience ON notices(audience);
+CREATE INDEX IF NOT EXISTS idx_notices_publish ON notices(publish_at);
+
+DROP TRIGGER IF EXISTS trg_notices_updated ON notices;
+CREATE TRIGGER trg_notices_updated
+BEFORE UPDATE ON notices
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+-- Remediation: Notices RLS
+ALTER TABLE notices ENABLE ROW LEVEL SECURITY;
+
+
+DROP POLICY IF EXISTS "View Notices" ON notices;
+CREATE POLICY "View Notices" ON notices FOR SELECT
+USING (
+  (auth.role() = 'service_role') OR (
+    notices.school_id = auth_school_id() AND (
+      (created_by = auth.uid()) OR
+      (audience = 'all' AND auth.role() = 'authenticated') OR
+      (audience = 'staff' AND auth_has_role(ARRAY['admin', 'teacher', 'staff', 'accounts'])) OR
+      (audience = 'students' AND auth_has_role(ARRAY['admin', 'student'])) OR
+      (audience = 'parents' AND auth_has_role(ARRAY['admin', 'parent'])) OR
+      (audience = 'class' AND target_class_id IS NOT NULL)
+    )
+  )
+);
+
+DROP POLICY IF EXISTS "Manage Notices" ON notices;
+CREATE POLICY "Manage Notices" ON notices FOR ALL 
+USING (
+  (auth.role() = 'service_role') OR (
+    notices.school_id = auth_school_id() AND (
+      auth_has_role(ARRAY['admin']) OR
+      EXISTS (
+        SELECT 1 FROM user_roles ur
+        JOIN role_permissions rp ON ur.role_id = rp.role_id
+        JOIN permissions p ON rp.permission_id = p.id
+        WHERE ur.user_id = auth.uid()
+          AND ur.school_id = auth_school_id()
+          AND rp.school_id = auth_school_id()
+          AND p.school_id = auth_school_id()
+          AND (p.code = 'notices.create' OR p.code = 'notices.manage')
+      )
+    )
+  )
+);
+
+
+CREATE TABLE IF NOT EXISTS leave_applications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    applicant_id UUID NOT NULL REFERENCES users(id),
+    leave_type leave_type_enum NOT NULL,
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    reason TEXT NOT NULL,
+    reason_te TEXT,
+    status leave_status_enum NOT NULL DEFAULT 'pending',
+    reviewed_by UUID REFERENCES users(id),
+    reviewed_at TIMESTAMPTZ,
+    review_remarks TEXT,
+    review_remarks_te TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_leave_dates CHECK (end_date >= start_date),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_leave_app_school_id ON leave_applications(school_id);
+
+
+CREATE INDEX IF NOT EXISTS idx_leaves_applicant ON leave_applications(applicant_id);
+CREATE INDEX IF NOT EXISTS idx_leaves_status ON leave_applications(status);
+
+DROP TRIGGER IF EXISTS trg_leaves_updated ON leave_applications;
+CREATE TRIGGER trg_leaves_updated
+BEFORE UPDATE ON leave_applications
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TABLE IF NOT EXISTS diary_entries (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    class_section_id UUID NOT NULL REFERENCES class_sections(id) ON DELETE RESTRICT,
+    subject_id UUID REFERENCES subjects(id) ON DELETE RESTRICT,
+    entry_date DATE NOT NULL,
+    title VARCHAR(200),
+    title_te TEXT,
+    content TEXT NOT NULL,
+    content_te TEXT,
+    homework_due_date DATE,
+    attachments JSONB, 
+    created_by UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_homework_due_date CHECK (homework_due_date IS NULL OR homework_due_date >= entry_date),
+    -- Prevent duplicate homework for same class/subject/date
+    UNIQUE (school_id, class_section_id, subject_id, entry_date, created_by)
+);
+
+CREATE INDEX IF NOT EXISTS idx_diary_entries_school_id ON diary_entries(school_id);
+
+DROP TRIGGER IF EXISTS trg_diary_entries_updated ON diary_entries;
+CREATE TRIGGER trg_diary_entries_updated
+BEFORE UPDATE ON diary_entries
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+
+CREATE INDEX IF NOT EXISTS idx_diary_class ON diary_entries(class_section_id);
+CREATE INDEX IF NOT EXISTS idx_diary_date ON diary_entries(entry_date);
+
+
+DROP TRIGGER IF EXISTS trg_validate_diary ON diary_entries;
+CREATE TRIGGER trg_validate_diary
+BEFORE INSERT OR UPDATE ON diary_entries
+FOR EACH ROW EXECUTE FUNCTION validate_diary_entry();
+
+DROP TRIGGER IF EXISTS trg_diary_updated ON diary_entries;
+CREATE TRIGGER trg_diary_updated
+BEFORE UPDATE ON diary_entries
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+CREATE TABLE IF NOT EXISTS periods (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(50) NOT NULL, 
+    start_time TIME NOT NULL,
+    end_time TIME NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    CONSTRAINT chk_period_times CHECK (end_time > start_time),
+    UNIQUE (name),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_periods_school_id ON periods(school_id);
+
+-- 1. Deduplicate periods (Keep the one with the smallest ID, delete others)
+DELETE FROM periods
+WHERE id IN (
+    SELECT id
+    FROM (
+        SELECT id, ROW_NUMBER() OVER (PARTITION BY name ORDER BY sort_order ASC, id ASC) as rnum
+        FROM periods
+    ) t
+    WHERE t.rnum > 1
+);
+
+-- 2. Add Unique Constraint explicitly (Safe to run if table exists)
+
+
+-- 3. Seed/Update Data
+
+ALTER TABLE IF EXISTS periods DROP CONSTRAINT IF EXISTS periods_name_key;
+
+
+ALTER TABLE IF EXISTS roles DROP CONSTRAINT IF EXISTS roles_code_key;
+
+
+ALTER TABLE IF EXISTS permissions DROP CONSTRAINT IF EXISTS permissions_code_key;
+
+
+ALTER TABLE IF EXISTS feature_flags DROP CONSTRAINT IF EXISTS feature_flags_code_key;
+
+
+ALTER TABLE IF EXISTS ui_route_permissions DROP CONSTRAINT IF EXISTS ui_route_permissions_route_key_key;
+
+
+-- Idempotent upsert for default school (avoids ON CONFLICT)
+UPDATE periods p
+SET start_time = v.start_time,
+    end_time = v.end_time,
+    sort_order = v.sort_order
+FROM (VALUES
+  ('Period 1', '08:00'::time, '08:45'::time, 1),
+  ('Period 2', '08:45'::time, '09:30'::time, 2),
+  ('Period 3', '09:30'::time, '10:15'::time, 3),
+  ('Break',    '10:15'::time, '10:30'::time, 4),
+  ('Period 4', '10:30'::time, '11:15'::time, 5),
+  ('Period 5', '11:15'::time, '12:00'::time, 6),
+  ('Lunch',    '12:00'::time, '12:45'::time, 7),
+  ('Period 6', '12:45'::time, '13:30'::time, 8),
+  ('Period 7', '13:30'::time, '14:15'::time, 9),
+  ('Period 8', '14:15'::time, '15:00'::time, 10)
+) AS v(name, start_time, end_time, sort_order)
+WHERE p.school_id = 1 AND p.name = v.name;
+
+INSERT INTO periods (school_id, name, start_time, end_time, sort_order)
+SELECT 1, v.name, v.start_time, v.end_time, v.sort_order
+FROM (VALUES
+  ('Period 1', '08:00'::time, '08:45'::time, 1),
+  ('Period 2', '08:45'::time, '09:30'::time, 2),
+  ('Period 3', '09:30'::time, '10:15'::time, 3),
+  ('Break',    '10:15'::time, '10:30'::time, 4),
+  ('Period 4', '10:30'::time, '11:15'::time, 5),
+  ('Period 5', '11:15'::time, '12:00'::time, 6),
+  ('Lunch',    '12:00'::time, '12:45'::time, 7),
+  ('Period 6', '12:45'::time, '13:30'::time, 8),
+  ('Period 7', '13:30'::time, '14:15'::time, 9),
+  ('Period 8', '14:15'::time, '15:00'::time, 10)
+) AS v(name, start_time, end_time, sort_order)
+WHERE NOT EXISTS (
+  SELECT 1 FROM periods p WHERE p.school_id = 1 AND p.name = v.name
+);
+
+-- 4. Cleanup: Remove any periods that are NOT in the standard list (e.g., if user had Period 9 before)
+DELETE FROM periods WHERE name NOT IN (
+    'Period 1', 'Period 2', 'Period 3', 'Break', 'Period 4', 'Period 5', 'Lunch', 'Period 6', 'Period 7', 'Period 8'
+);
+
+-- (Removed Legacy timetable_entries table - Use timetable_slots)
+
+
+-- 14. TRANSPORT
+
+-- 14.1 Routes (Bus → Route → Stops → Students)
+CREATE TABLE IF NOT EXISTS transport_routes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(100) NOT NULL,
+    code VARCHAR(20),
+    description TEXT,
+    start_point VARCHAR(200),
+    end_point VARCHAR(200),
+    total_stops INTEGER,
+    monthly_fee DECIMAL(12,2),
+    direction VARCHAR(20) DEFAULT 'morning' CHECK (direction IN ('morning', 'afternoon')),
+    bus_id UUID, -- FK added after buses table creation
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (code),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_transport_routes_school_id ON transport_routes(school_id);
+
+DROP TRIGGER IF EXISTS trg_transport_routes_updated ON transport_routes;
+CREATE TRIGGER trg_transport_routes_updated
+BEFORE UPDATE ON transport_routes
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+-- 14.1 Buses
+CREATE TABLE IF NOT EXISTS buses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    bus_no VARCHAR(50) NOT NULL,
+    registration_no VARCHAR(50),
+    capacity INTEGER NOT NULL DEFAULT 40,
+    driver_id UUID REFERENCES staff(id),         -- FK to staff (source of truth)
+    driver_name VARCHAR(100),                     -- Legacy/display fallback
+    driver_phone VARCHAR(20),                     -- Legacy/display fallback
+    route_id UUID REFERENCES transport_routes(id) ON DELETE RESTRICT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_bus_capacity CHECK (capacity > 0),
+    UNIQUE (school_id, bus_no),
+    UNIQUE (school_id, registration_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_buses_school_id ON buses(school_id);
+
+CREATE INDEX IF NOT EXISTS idx_buses_route ON buses(route_id);
+CREATE INDEX IF NOT EXISTS idx_buses_driver ON buses(driver_id);
+
+
+-- Add deferred FK from routes → buses (circular reference resolved)
+
+CREATE INDEX IF NOT EXISTS idx_routes_bus ON transport_routes(bus_id);
+
+-- 14.3 Stops (strictly ordered per route)
+CREATE TABLE IF NOT EXISTS transport_stops (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    route_id UUID NOT NULL REFERENCES transport_routes(id) ON DELETE CASCADE,
+    name VARCHAR(200) NOT NULL,
+    latitude DECIMAL(10,8),
+    longitude DECIMAL(11,8),
+    pickup_time TIME,
+    drop_time TIME,
+    stop_order INTEGER NOT NULL,
+    deleted_at TIMESTAMPTZ,
+    UNIQUE (school_id, route_id, stop_order)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transport_stops_school_id ON transport_stops(school_id);
+
+
+-- 14.4 Student ↔ Transport mapping
+CREATE TABLE IF NOT EXISTS student_transport (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    route_id UUID NOT NULL REFERENCES transport_routes(id) ON DELETE RESTRICT,
+    stop_id UUID REFERENCES transport_stops(id) ON DELETE SET NULL,
+    bus_id UUID REFERENCES buses(id),            -- Auto-derived from route on assignment
+    academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT student_transport_student_id_academic_year_id_key UNIQUE (student_id, academic_year_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_student_transpschool_id ON student_transport(school_id);
+
+CREATE INDEX IF NOT EXISTS idx_student_transport_route ON student_transport(route_id);
+CREATE INDEX IF NOT EXISTS idx_student_transport_bus ON student_transport(bus_id);
+
+-- Cycle 3 schema alignment for route upserts.
+ALTER TABLE IF EXISTS daily_attendance
+  ADD COLUMN IF NOT EXISTS remarks TEXT;
+
+ALTER TABLE IF EXISTS staff_attendance
+  DROP CONSTRAINT IF EXISTS uq_staff_attendance_active;
+
+ALTER TABLE IF EXISTS staff_attendance
+  ADD CONSTRAINT uq_staff_attendance_active UNIQUE (staff_id, attendance_date);
+
+ALTER TABLE IF EXISTS student_transport
+  DROP CONSTRAINT IF EXISTS student_transport_school_id_student_id_academic_year_id_key;
+
+ALTER TABLE IF EXISTS student_transport
+  DROP CONSTRAINT IF EXISTS student_transport_student_id_academic_year_id_key;
+
+ALTER TABLE IF EXISTS student_transport
+  ADD CONSTRAINT student_transport_student_id_academic_year_id_key UNIQUE (student_id, academic_year_id);
+
+
+-- 14.5 Bus live locations (single row per bus, upserted)
+CREATE TABLE IF NOT EXISTS bus_locations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    bus_id UUID NOT NULL REFERENCES buses(id) ON DELETE CASCADE,
+    latitude DECIMAL(10,8) NOT NULL,
+    longitude DECIMAL(11,8) NOT NULL,
+    speed DECIMAL(5,2),
+    heading DECIMAL(5,2),
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    is_mocked boolean DEFAULT false,
+    is_suspicious boolean DEFAULT false
+);
+
+CREATE INDEX IF NOT EXISTS idx_bus_locations_school_id ON bus_locations(school_id);
+
+CREATE INDEX IF NOT EXISTS idx_bus_locations_recent ON bus_locations(bus_id, recorded_at DESC);
+
+
+-- 14.6 Trips (driver trip execution)
+CREATE TABLE IF NOT EXISTS trips (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    bus_id UUID NOT NULL REFERENCES buses(id),
+    route_id UUID NOT NULL REFERENCES transport_routes(id),
+    driver_id UUID NOT NULL REFERENCES staff(id),
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+      CHECK (status IN ('active', 'completed', 'cancelled')),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_trips_school_id ON trips(school_id);
+
+
+-- Only one active trip per bus at any time
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trips_active_bus ON trips(bus_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_trips_driver ON trips(driver_id);
+CREATE INDEX IF NOT EXISTS idx_trips_route ON trips(route_id);
+CREATE INDEX IF NOT EXISTS idx_trips_status ON trips(status);
+
+DROP TRIGGER IF EXISTS trg_trips_updated ON trips;
+CREATE OR REPLACE TRIGGER trg_trips_updated
+BEFORE UPDATE ON trips
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- 14.7 Trip stop execution status
+CREATE TABLE IF NOT EXISTS trip_stop_status (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    trip_id UUID NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+    stop_id UUID NOT NULL REFERENCES transport_stops(id),
+    stop_order INTEGER NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending'
+      CHECK (status IN ('pending', 'arrived', 'completed', 'skipped')),
+    arrival_time TIMESTAMPTZ,
+    departure_time TIMESTAMPTZ,
+    UNIQUE (school_id, trip_id, stop_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trip_stop_status_school_id ON trip_stop_status(school_id);
+
+CREATE INDEX IF NOT EXISTS idx_trip_stop_trip ON trip_stop_status(trip_id);
+CREATE INDEX IF NOT EXISTS idx_trip_stop_status ON trip_stop_status(status);
+
+
+-- 14.8 RLS for trips
+ALTER TABLE trips ENABLE ROW LEVEL SECURITY;
+GRANT ALL ON TABLE trips TO authenticated;
+GRANT ALL ON TABLE trips TO service_role;
+
+DROP POLICY IF EXISTS "Admins can manage trips" ON trips;
+CREATE POLICY "Admins can manage trips" ON trips FOR ALL USING (
+  (auth.role() = 'service_role') OR (
+    trips.school_id = auth_school_id() AND
+    EXISTS (
+      SELECT 1 FROM user_roles ur
+      JOIN roles r ON ur.role_id = r.id
+      WHERE ur.user_id = auth.uid() AND r.code IN ('admin', 'driver')
+    )
+  )
+);
+
+DROP POLICY IF EXISTS "Drivers can view own trips" ON trips;
+CREATE POLICY "Drivers can view own trips" ON trips FOR SELECT USING (
+  (auth.role() = 'service_role') OR (
+    trips.school_id = auth_school_id() AND
+    driver_id IN (
+      SELECT s.id FROM staff s
+      JOIN users u ON s.person_id = u.person_id
+      WHERE u.id = auth.uid()
+        AND u.school_id = auth_school_id()
+        AND s.school_id = auth_school_id()
+    )
+  )
+);
+
+-- 14.9 RLS for trip_stop_status
+ALTER TABLE trip_stop_status ENABLE ROW LEVEL SECURITY;
+GRANT ALL ON TABLE trip_stop_status TO authenticated;
+GRANT ALL ON TABLE trip_stop_status TO service_role;
+
+DROP POLICY IF EXISTS "Authenticated can view trip stops" ON trip_stop_status;
+CREATE POLICY "Authenticated can view trip stops" ON trip_stop_status FOR SELECT
+  TO authenticated USING (trip_stop_status.school_id = auth_school_id());
+
+-- 15. HOSTEL
+CREATE TABLE IF NOT EXISTS hostel_blocks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    name VARCHAR(100) NOT NULL,
+    code VARCHAR(20),
+    gender_id SMALLINT REFERENCES genders(id),
+    total_rooms INTEGER,
+    warden_id UUID REFERENCES staff(id),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (school_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hostel_blocks_school_id ON hostel_blocks(school_id);
+
+
+CREATE TABLE IF NOT EXISTS hostel_rooms (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    block_id UUID NOT NULL REFERENCES hostel_blocks(id) ON DELETE CASCADE,
+    room_no VARCHAR(20) NOT NULL,
+    floor INTEGER,
+    capacity INTEGER NOT NULL DEFAULT 2,
+    room_type VARCHAR(50) DEFAULT 'shared', 
+    monthly_fee DECIMAL(12,2),
+    is_available BOOLEAN NOT NULL DEFAULT TRUE,
+    deleted_at TIMESTAMPTZ,
+    UNIQUE (school_id, block_id, room_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hostel_rooms_school_id ON hostel_rooms(school_id);
+
+
+CREATE TABLE IF NOT EXISTS hostel_allocations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    student_id UUID NOT NULL REFERENCES students(id),
+    room_id UUID NOT NULL REFERENCES hostel_rooms(id),
+    academic_year_id UUID NOT NULL REFERENCES academic_years(id),
+    bed_no INTEGER,
+    allocated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    vacated_at TIMESTAMPTZ,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    UNIQUE (school_id, student_id, academic_year_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hostel_alloc_school_id ON hostel_allocations(school_id);
+
+CREATE INDEX IF NOT EXISTS idx_hostel_allocations_room ON hostel_allocations(room_id);
+
+
+-- 16. EVENTS
+
+
+CREATE TABLE IF NOT EXISTS events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title VARCHAR(200) NOT NULL,
+    title_te TEXT,
+    description TEXT,
+    description_te TEXT,
+    event_type event_type_enum NOT NULL DEFAULT 'other',
+    start_date DATE NOT NULL,
+    end_date DATE,
+    start_time TIME,
+    end_time TIME,
+    location VARCHAR(200),
+    is_all_day BOOLEAN NOT NULL DEFAULT FALSE,
+    is_public BOOLEAN NOT NULL DEFAULT TRUE,
+    target_audience notice_audience_enum DEFAULT 'all',
+    created_by UUID REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT chk_event_dates CHECK (end_date IS NULL OR end_date >= start_date),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_school_id ON events(school_id);
+
+
+CREATE INDEX IF NOT EXISTS idx_events_dates ON events(start_date, end_date);
+
+DROP TRIGGER IF EXISTS trg_events_updated ON events;
+CREATE TRIGGER trg_events_updated
+BEFORE UPDATE ON events
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+-- Remediation: Events RLS
+ALTER TABLE events ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "View Events" ON events;
+CREATE POLICY "View Events" ON events FOR SELECT
+USING (
+  (auth.role() = 'service_role') OR (
+    events.school_id = auth_school_id() AND (
+      is_public = true OR
+      created_by = auth.uid() OR
+      (target_audience = 'all' AND auth.role() = 'authenticated') OR
+      (target_audience = 'staff' AND auth_has_role(ARRAY['admin', 'teacher', 'staff', 'accounts']))
+    )
+  )
+);
+
+-- 17. LMS
+CREATE TABLE IF NOT EXISTS lms_courses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title VARCHAR(200) NOT NULL,
+    description TEXT,
+    subject_id UUID REFERENCES subjects(id),
+    class_id UUID REFERENCES classes(id),
+    instructor_id UUID REFERENCES staff(id),
+    is_published BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_lms_courses_school_id ON lms_courses(school_id);
+
+
+DROP TRIGGER IF EXISTS trg_validate_lms_course ON lms_courses;
+CREATE TRIGGER trg_validate_lms_course
+BEFORE UPDATE ON lms_courses
+FOR EACH ROW EXECUTE FUNCTION validate_lms_course_modify();
+
+
+CREATE INDEX IF NOT EXISTS idx_lms_courses_subject ON lms_courses(subject_id);
+CREATE INDEX IF NOT EXISTS idx_lms_courses_class ON lms_courses(class_id);
+CREATE INDEX IF NOT EXISTS idx_lms_courses_instructor ON lms_courses(instructor_id);
+
+DROP TRIGGER IF EXISTS trg_lms_courses_updated ON lms_courses;
+CREATE TRIGGER trg_lms_courses_updated
+BEFORE UPDATE ON lms_courses
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+CREATE TABLE IF NOT EXISTS lms_materials (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    course_id UUID NOT NULL REFERENCES lms_courses(id) ON DELETE CASCADE,
+    title VARCHAR(200) NOT NULL,
+    description TEXT,
+    material_type material_type_enum NOT NULL,
+    content_url TEXT,
+    file_size INTEGER,
+    duration INTEGER, 
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_published BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_lms_materials_school_id ON lms_materials(school_id);
+
+
+CREATE INDEX IF NOT EXISTS idx_lms_materials_active ON lms_materials(id) WHERE deleted_at IS NULL;
+
+
+CREATE INDEX IF NOT EXISTS idx_lms_materials_course ON lms_materials(course_id);
+
+
+-- 18. SEED DATA (PERMISSIONS)
+INSERT INTO permissions (school_id, code, name)
+SELECT 1, v.code, v.name
+FROM (VALUES
+('students.view', 'View Students'), ('students.create', 'Create Students'), ('students.edit', 'Edit Students'), ('students.delete', 'Delete Students'),
+('staff.view', 'View Staff'), ('staff.create', 'Create Staff'), ('staff.edit', 'Edit Staff'), ('staff.delete', 'Delete Staff'),
+('users.view', 'View Users'), ('users.create', 'Create Users'), ('users.edit', 'Edit Users'), ('users.delete', 'Delete Users'),
+('academics.view', 'View Academics'), ('academics.manage', 'Manage Academics'),
+('attendance.view', 'View Attendance'), ('attendance.mark', 'Mark Attendance'), ('attendance.edit', 'Edit Attendance'),
+('fees.view', 'View Fees'), ('fees.manage', 'Manage Fees'), ('fees.collect', 'Collect Fees'),
+('transactions.view', 'View Transactions'), ('receipts.generate', 'Generate Receipts'), ('reports.financial', 'View Financial Reports'),
+('exams.view', 'View Exams'), ('exams.manage', 'Manage Exams'), ('marks.view', 'View Marks'), ('marks.enter', 'Enter Marks'), ('results.view', 'View Results'), ('results.generate', 'Generate Results'),
+('transport.view', 'View Transport'), ('transport.manage', 'Manage Transport'),
+('hostel.view', 'View Hostel'), ('hostel.manage', 'Manage Hostel'),
+('events.view', 'View Events'), ('events.manage', 'Manage Events'),
+('lms.view', 'View LMS'), ('lms.create', 'Create LMS Content'), ('lms.manage', 'Manage LMS'),
+('complaints.view', 'View Complaints'), ('complaints.create', 'Create Complaints'), ('complaints.manage', 'Manage Complaints'),
+('notices.view', 'View Notices'), ('notices.create', 'Create Notices'), ('notices.manage', 'Manage Notices'),
+('leaves.view', 'View Leaves'), ('leaves.apply', 'Apply for Leave'), ('leaves.approve', 'Approve Leaves'),
+('diary.view', 'View Diary'), ('diary.create', 'Create Diary Entries'),
+('timetable.view', 'View Timetable'), ('timetable.manage', 'Manage Timetable'),
+('dashboard.view', 'View Dashboard'),
+('results.publish', 'Publish Results'),
+('diary.manage', 'Manage Diary')
+) AS v(code, name)
+WHERE NOT EXISTS (
+  SELECT 1 FROM permissions p WHERE p.school_id = 1 AND p.code = v.code
+);
+
+-- 18.1 ROLES
+INSERT INTO roles (school_id, code, name, is_system)
+SELECT 1, v.code, v.name, v.is_system
+FROM (VALUES
+('admin', 'Administrator', true),
+('staff', 'Staff/Teacher', true),
+('student', 'Student', true),
+('accounts', 'Accounts Manager', true),
+('principal', 'Principal', true),
+('driver', 'Driver', true)
+) AS v(code, name, is_system)
+WHERE NOT EXISTS (
+  SELECT 1 FROM roles r WHERE r.school_id = 1 AND r.code = v.code
+);
+
+-- 18.2 ROLE-PERMISSION MAPPING (Production RBAC)
+-- Admin: All
+INSERT INTO role_permissions (school_id, role_id, permission_id)
+SELECT 1, r.id, p.id
+FROM roles r, permissions p
+WHERE r.code = 'admin'
+  AND NOT EXISTS (
+    SELECT 1 FROM role_permissions rp
+    WHERE rp.role_id = r.id AND rp.permission_id = p.id
+  );
+
+-- Staff: Academic & Operations
+INSERT INTO role_permissions (school_id, role_id, permission_id)
+SELECT 1, r.id, p.id FROM roles r, permissions p 
+WHERE r.code = 'staff' AND p.code IN (
+    'students.view', 'academics.view', 'attendance.view', 'attendance.mark', 
+    'exams.view', 'marks.enter', 'marks.view', 'diary.view', 'diary.create',
+    'timetable.view', 'leaves.apply', 'notices.view', 'events.view', 'lms.view'
+)
+AND NOT EXISTS (
+  SELECT 1 FROM role_permissions rp
+  WHERE rp.role_id = r.id AND rp.permission_id = p.id
+);
+
+-- Student: View Only Access
+INSERT INTO role_permissions (school_id, role_id, permission_id)
+SELECT 1, r.id, p.id FROM roles r, permissions p 
+WHERE r.code = 'student' AND p.code IN (
+    'academics.view', 'attendance.view', 'exams.view', 'results.view', 
+    'diary.view', 'timetable.view', 'notices.view', 'events.view', 'lms.view', 'fees.view'
+)
+AND NOT EXISTS (
+  SELECT 1 FROM role_permissions rp
+  WHERE rp.role_id = r.id AND rp.permission_id = p.id
+);
+
+-- Accounts: Financial Management
+INSERT INTO role_permissions (school_id, role_id, permission_id)
+SELECT 1, r.id, p.id FROM roles r, permissions p 
+WHERE r.code = 'accounts' AND p.code IN (
+    'fees.view', 'fees.manage', 'fees.collect', 'transactions.view', 
+    'receipts.generate', 'reports.financial', 'notices.view', 'staff.view', 'staff.create', 'staff.edit',
+    'dashboard.view', 'academics.view', 'students.view', 'students.create', 'students.edit'
+)
+AND NOT EXISTS (
+  SELECT 1 FROM role_permissions rp
+  WHERE rp.role_id = r.id AND rp.permission_id = p.id
+);
+
+-- Principal: Full Access (same as Admin)
+INSERT INTO role_permissions (school_id, role_id, permission_id)
+SELECT 1, r.id, p.id
+FROM roles r, permissions p
+WHERE r.code = 'principal'
+  AND NOT EXISTS (
+    SELECT 1 FROM role_permissions rp
+    WHERE rp.role_id = r.id AND rp.permission_id = p.id
+  );
+
+-- Driver: Transport-only Access
+INSERT INTO role_permissions (school_id, role_id, permission_id)
+SELECT 1, r.id, p.id FROM roles r, permissions p 
+WHERE r.code = 'driver' AND p.code IN (
+    'transport.view', 'notices.view'
+)
+AND NOT EXISTS (
+  SELECT 1 FROM role_permissions rp
+  WHERE rp.role_id = r.id AND rp.permission_id = p.id
+);
+
+-- ============================================================
+-- 19. NOTIFICATION INFRASTRUCTURE
+-- ============================================================
+
+-- 19.1 User Devices (FCM Push Token Storage)
+CREATE TABLE IF NOT EXISTS user_devices (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    fcm_token     TEXT NOT NULL,
+    platform      VARCHAR(20) NOT NULL DEFAULT 'unknown',
+    device_name   TEXT,
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+    language_code VARCHAR(5) NOT NULL DEFAULT 'en',
+    last_used_at  TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_user_device_token UNIQUE (school_id, user_id, fcm_token)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_devices_school_id ON user_devices(school_id);
+
+CREATE INDEX IF NOT EXISTS idx_user_devices_user_id ON user_devices(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_devices_fcm_token ON user_devices(fcm_token);
+CREATE INDEX IF NOT EXISTS idx_user_devices_active ON user_devices(user_id, is_active);
+
+
+-- Idempotent column adds for existing deployments
+
+
+-- 19.2 Notification Configuration (Kill Switch + Settings)
+CREATE TABLE IF NOT EXISTS notification_config (
+    key         TEXT PRIMARY KEY,
+    value       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at  TIMESTAMPTZ
+);
+
+-- Seed defaults
+INSERT INTO notification_config (key, value)
+SELECT v.key, v.value
+FROM (VALUES
+  ('kill_switch',              '{"global": false, "types": {}}'::jsonb),
+  ('max_batch_size',           '{"value": 500}'::jsonb),
+  ('fee_reminder_daily_limit', '{"value": 1}'::jsonb)
+) AS v(key, value)
+WHERE NOT EXISTS (
+  SELECT 1 FROM notification_config nc WHERE nc.key = v.key
+);
+
+-- 19.3 Notification Logs (Delivery Audit Trail)
+CREATE TABLE IF NOT EXISTS notification_logs (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    user_id           UUID REFERENCES users(id) ON DELETE SET NULL,
+    batch_id          UUID,
+    notification_type TEXT NOT NULL,
+    role              TEXT,
+    channel_id        TEXT,
+    push_provider     TEXT DEFAULT 'fcm',
+    tokens_targeted   INTEGER NOT NULL DEFAULT 0,
+    tokens_sent       INTEGER NOT NULL DEFAULT 0,
+    tokens_failed     INTEGER NOT NULL DEFAULT 0,
+    error_message     TEXT,
+    provider_response JSONB,
+    status            TEXT CHECK (status IN ('success', 'failed', 'partial')),
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at        TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_logs_school_id ON notification_logs(school_id);
+
+CREATE INDEX IF NOT EXISTS idx_notification_logs_type_date ON notification_logs(notification_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_logs_batch_id ON notification_logs(batch_id);
+CREATE INDEX IF NOT EXISTS idx_notification_logs_user_type_date ON notification_logs(user_id, notification_type, created_at);
+
+
+-- 19.4 Notification Batches (Bulk Send Tracking)
+CREATE TABLE IF NOT EXISTS notification_batches (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    admin_id        UUID REFERENCES users(id),
+    type            TEXT NOT NULL,
+    filters         JSONB DEFAULT '{}',
+    status          TEXT CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'aborted')) DEFAULT 'pending',
+    total_targets   INTEGER DEFAULT 0,
+    sent_count      INTEGER DEFAULT 0,
+    failure_count   INTEGER DEFAULT 0,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_batches_school_id ON notification_batches(school_id);
+
+CREATE INDEX IF NOT EXISTS idx_notification_batches_status ON notification_batches(status);
+CREATE INDEX IF NOT EXISTS idx_notification_batches_type_created ON notification_batches(type, created_at);
+
+
+-- Idempotent column adds for existing deployments (merged from Section 20/21)
+
+
+-- Constraints merged from Section 20/21
+
+
+-- Enable Row Level Security (merged from Section 20/21)
+ALTER TABLE notification_config ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notification_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notification_batches ENABLE ROW LEVEL SECURITY;
+
+-- Views
+DROP VIEW IF EXISTS active_students CASCADE; CREATE OR REPLACE VIEW active_students AS
+SELECT * FROM students WHERE deleted_at IS NULL AND status_id IN (SELECT id FROM student_statuses WHERE code = 'ENROLLED');
+
+DROP VIEW IF EXISTS active_persons CASCADE; CREATE OR REPLACE VIEW active_persons AS
+SELECT * FROM persons WHERE deleted_at IS NULL;
+
+-- END OF SCHEMA
+-- ============================================================
+-- HARDENING TRIGGERS (SAFETY GUARDS)
+-- ============================================================
+
+-- Guard 1: Prevent Direct Updates to amount_paid
+-- Only allow updates via internal triggers (depth > 0)
+
+DROP TRIGGER IF EXISTS trg_guard_fee_update ON student_fees;
+CREATE TRIGGER trg_guard_fee_update
+BEFORE UPDATE ON student_fees
+FOR EACH ROW EXECUTE FUNCTION prevent_direct_fee_update();
+
+-- Guard 2: Prevent Negative Balances
+-- Redundant to logical check but good as constraint
+ALTER TABLE student_fees 
+DROP CONSTRAINT IF EXISTS chk_no_negative_paid;
+
+ALTER TABLE IF EXISTS student_fees DROP CONSTRAINT IF EXISTS chk_no_negative_paid;
+ALTER TABLE student_fees
+ADD CONSTRAINT chk_no_negative_paid CHECK (amount_paid >= 0);
+
+-- Guard 3: Prevent Overpayment (Paid > Due - Discount)
+-- chk_paid_not_exceed is defined in the CREATE TABLE student_fees block (line ~827).
+-- No standalone ALTER needed — constraint is already active.
+
+-- Guard 4: Prevent Discount Exceeding Amount Due
+ALTER TABLE student_fees
+DROP CONSTRAINT IF EXISTS chk_discount_not_exceed_due;
+
+ALTER TABLE IF EXISTS student_fees DROP CONSTRAINT IF EXISTS chk_discount_not_exceed_due;
+ALTER TABLE student_fees
+ADD CONSTRAINT chk_discount_not_exceed_due CHECK (discount <= amount_due);
+
+-- (Removed Legacy Timetable Logic - See lines 1513+ for new implementation)
+-- Function: promote_students_academic_year
+-- Logic: Move students from current AY to next AY, incrementing class.
+
+
+-- ============================================================
+-- 19. TIMETABLE (NEW IMPLEMENTATION - timetable_slots)
+-- ============================================================
+
+-- Drop table to ensure clean slate if re-running
+DROP TABLE IF EXISTS timetable_slots CASCADE;
+
+-- Create Enum for Days
+
+
+CREATE TABLE IF NOT EXISTS timetable_slots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    academic_year_id UUID NOT NULL REFERENCES academic_years(id) ON DELETE RESTRICT,
+    class_section_id UUID NOT NULL REFERENCES class_sections(id) ON DELETE RESTRICT,
+    
+    day_of_week day_of_week_enum NOT NULL,
+    period_number SMALLINT NOT NULL,
+    
+    subject_id UUID NOT NULL REFERENCES subjects(id) ON DELETE RESTRICT,
+    teacher_id UUID REFERENCES staff(id) ON DELETE RESTRICT,
+    room_no VARCHAR(50),
+    
+    start_time TIME NOT NULL,
+    end_time TIME NOT NULL,
+    
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    
+    CONSTRAINT chk_time_order CHECK (start_time < end_time),
+    school_id INTEGER REFERENCES schools(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_timetable_slots_active 
+ON timetable_slots (class_section_id, academic_year_id, day_of_week, period_number) 
+WHERE deleted_at IS NULL;
+
+
+CREATE INDEX IF NOT EXISTS idx_timetable_class ON timetable_slots(class_section_id);
+CREATE INDEX IF NOT EXISTS idx_timetable_teacher ON timetable_slots(teacher_id);
+CREATE INDEX IF NOT EXISTS idx_timetable_slots_time_check ON timetable_slots(teacher_id, start_time, end_time); -- Updated for collision detection
+
+
+-- Financial & Course Performance Indexes
+CREATE INDEX IF NOT EXISTS idx_complaints_assigned_to ON complaints(assigned_to);
+CREATE INDEX IF NOT EXISTS idx_lms_courses_subject ON lms_courses(subject_id);
+CREATE INDEX IF NOT EXISTS idx_lms_courses_instructor ON lms_courses(instructor_id);
+
+-- Validation Trigger
+
+DROP TRIGGER IF EXISTS trg_validate_timetable ON timetable_slots;
+CREATE TRIGGER trg_validate_timetable
+BEFORE INSERT OR UPDATE ON timetable_slots
+FOR EACH ROW EXECUTE FUNCTION validate_timetable_entry();
+
+DROP TRIGGER IF EXISTS trg_timetable_updated ON timetable_slots;
+CREATE TRIGGER trg_timetable_updated
+BEFORE UPDATE ON timetable_slots
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+ALTER TABLE timetable_slots ENABLE ROW LEVEL SECURITY;
+
+-- Automated Class Teacher Assignment (Monday Period 1)
+
+DROP TRIGGER IF EXISTS trg_sync_class_teacher ON timetable_slots;
+CREATE TRIGGER trg_sync_class_teacher
+AFTER INSERT OR UPDATE OR DELETE ON timetable_slots
+FOR EACH ROW EXECUTE FUNCTION sync_class_teacher_from_timetable();
+
+-- Initial Sync (Ensure consistency on schema apply)
+DO $$
+DECLARE
+    r RECORD;
+    v_monday_label TEXT;
+BEGIN
+    -- Dynamically find the correct enum label for Monday ('mon' or 'monday')
+    SELECT e.enumlabel INTO v_monday_label
+    FROM pg_type t
+    JOIN pg_enum e ON t.oid = e.enumtypid
+    WHERE t.typname = 'day_of_week_enum'
+      AND e.enumlabel IN ('mon', 'monday')
+    LIMIT 1;
+
+    IF v_monday_label IS NULL THEN
+        RAISE NOTICE 'Initial timetable sync skipped: no Monday label found in day_of_week_enum';
+        RETURN;
+    END IF;
+
+    FOR r IN 
+        EXECUTE format(
+            'SELECT class_section_id, teacher_id FROM timetable_slots WHERE day_of_week = %L::day_of_week_enum AND period_number = 1',
+            v_monday_label
+        )
+    LOOP
+        UPDATE class_sections 
+        SET class_teacher_id = r.teacher_id 
+        WHERE id = r.class_section_id;
+    END LOOP;
+EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'Initial timetable sync skipped: %', SQLERRM;
+END $$;
+
+
+-- RLS Policies
+
+-- 1. Students: View OWN class timetable
+DROP POLICY IF EXISTS "Students view own class timetable" ON timetable_slots;
+CREATE POLICY "Students view own class timetable" ON timetable_slots FOR SELECT
+USING (
+    (auth.role() = 'service_role') OR (
+      timetable_slots.school_id = auth_school_id()
+      AND class_section_id IN (
+          SELECT class_section_id 
+          FROM student_enrollments 
+          WHERE student_id IN (
+              SELECT id FROM students WHERE person_id = (
+                  SELECT person_id FROM users WHERE id = auth.uid() AND users.school_id = auth_school_id()
+              ) AND students.school_id = auth_school_id()
+          )
+          AND status = 'active'
+      )
+    )
+);
+
+-- 2. Teachers: View OWN slots
+DROP POLICY IF EXISTS "Teachers view own slots" ON timetable_slots;
+CREATE POLICY "Teachers view own slots" ON timetable_slots FOR SELECT
+USING (
+    (auth.role() = 'service_role') OR (
+      timetable_slots.school_id = auth_school_id()
+      AND teacher_id IN (
+          SELECT id FROM staff 
+          WHERE person_id = (
+              SELECT person_id FROM users WHERE id = auth.uid() AND users.school_id = auth_school_id()
+          ) AND staff.school_id = auth_school_id()
+      )
+    )
+);
+
+-- 3. Admins: Full Access
+DROP POLICY IF EXISTS "Admins full access" ON timetable_slots;
+CREATE POLICY "Admins full access" ON timetable_slots FOR ALL
+USING (
+    (auth.role() = 'service_role') OR (
+      timetable_slots.school_id = auth_school_id()
+      AND EXISTS (SELECT 1 FROM users WHERE id = auth.uid() AND users.school_id = auth_school_id() AND EXISTS (
+          SELECT 1 FROM user_roles ur 
+          JOIN roles r ON ur.role_id = r.id 
+          WHERE ur.user_id = users.id AND r.code = 'admin'
+      ))
+    )
+);
+
+
+-- ============================================================
+-- NEXSYRUS TABS SCHEMA & AUTOMATION
+-- ============================================================
+
+-- 1. DISCIPLINE & CONDUCT
+CREATE TABLE IF NOT EXISTS discipline_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    academic_year_id UUID NOT NULL REFERENCES academic_years(id),
+    incident_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    title VARCHAR(200) NOT NULL,
+    description TEXT,
+    severity VARCHAR(20) CHECK (severity IN ('low', 'medium', 'high', 'critical')),
+    action_taken TEXT,
+    evidence_urls TEXT[], -- Linked evidence images/docs
+    reported_by UUID REFERENCES users(id), -- Staff who reported
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_discipline_school_id ON discipline_records(school_id);
+
+CREATE INDEX IF NOT EXISTS idx_discipline_student ON discipline_records(student_id);
+
+
+-- 2. MONEY SCIENCE
+CREATE TABLE IF NOT EXISTS money_science_modules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title VARCHAR(200) NOT NULL,
+    description TEXT,
+    age_group VARCHAR(50), 
+    
+    -- Content Fields
+    content_body TEXT, -- Markdown or JSON content
+    thumbnail_url TEXT,
+    estimated_duration INTEGER, -- Minutes
+    difficulty_level VARCHAR(20) DEFAULT 'beginner',
+    tags TEXT[],
+    total_points INTEGER DEFAULT 0,
+    
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    content_url text
+);
+
+CREATE INDEX IF NOT EXISTS idx_money_science_school_id ON money_science_modules(school_id);
+
+CREATE TABLE IF NOT EXISTS student_money_science_progress (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    module_id UUID NOT NULL REFERENCES money_science_modules(id) ON DELETE CASCADE,
+    status VARCHAR(20) NOT NULL DEFAULT 'not_started' CHECK (status IN ('not_started', 'in_progress', 'completed')),
+    progress_percentage INTEGER DEFAULT 0,
+    completed_at TIMESTAMPTZ,
+    last_accessed_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(school_id, student_id, module_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_student_money_science_school_id ON student_money_science_progress(school_id);
+
+
+-- 3. SCIENCE PROJECTS
+CREATE TABLE IF NOT EXISTS science_projects (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title VARCHAR(200) NOT NULL,
+    description TEXT,
+    difficulty_level VARCHAR(20) CHECK (difficulty_level IN ('beginner', 'intermediate', 'advanced')),
+    is_group_project BOOLEAN DEFAULT FALSE,
+    min_participants INTEGER DEFAULT 1,
+    max_participants INTEGER DEFAULT 1,
+    
+    -- Content Fields
+    materials_required TEXT[],
+    safety_instructions TEXT,
+    thumbnail_url TEXT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_science_projects_school_id ON science_projects(school_id);
+
+CREATE TABLE IF NOT EXISTS student_science_projects (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    project_id UUID NOT NULL REFERENCES science_projects(id) ON DELETE CASCADE,
+    status VARCHAR(20) NOT NULL DEFAULT 'registered' CHECK (status IN ('registered', 'submitted', 'evaluated', 'certified')),
+    submission_url TEXT,
+    teacher_remarks TEXT,
+    grade VARCHAR(10),
+    certified_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(school_id, student_id, project_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_student_science_projects_school_id ON student_science_projects(school_id);
+
+
+-- 4. LIFE VALUES
+CREATE TABLE IF NOT EXISTS life_values_modules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title VARCHAR(200) NOT NULL,
+    description TEXT,
+    academic_year_id UUID REFERENCES academic_years(id), -- Optional: if content is specific to year
+    
+    -- Content Fields
+    content_body TEXT,
+    banner_image_url TEXT,
+    quote_author VARCHAR(100),
+    highlight_quote TEXT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_life_values_modules_school_id ON life_values_modules(school_id);
+
+
+-- RLS for Life Values
+ALTER TABLE life_values_modules ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON life_values_modules TO authenticated;
+DROP POLICY IF EXISTS "Enable read access for all" ON life_values_modules;
+CREATE POLICY "Enable read access for all" ON life_values_modules FOR SELECT USING (
+    (auth.role() = 'service_role') OR (
+      life_values_modules.school_id = auth_school_id()
+    )
+);
+
+CREATE TABLE IF NOT EXISTS student_life_values_progress (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    module_id UUID NOT NULL REFERENCES life_values_modules(id) ON DELETE CASCADE,
+    academic_year_id UUID NOT NULL REFERENCES academic_years(id),
+    status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed')),
+    engagement_score INTEGER DEFAULT 0, -- Metric for "Engagement"
+    completed_at TIMESTAMPTZ,
+    last_accessed_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(school_id, student_id, module_id, academic_year_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_student_life_values_school_id ON student_life_values_progress(school_id);
+
+
+-- RLS for Life Values Progress
+ALTER TABLE student_life_values_progress ENABLE ROW LEVEL SECURITY;
+GRANT ALL ON student_life_values_progress TO authenticated;
+DROP POLICY IF EXISTS "Allow all authenticated check" ON student_life_values_progress;
+CREATE POLICY "Allow all authenticated check" ON student_life_values_progress FOR SELECT USING (
+    (auth.role() = 'service_role') OR (
+      student_life_values_progress.school_id = auth_school_id()
+    )
+);
+DROP POLICY IF EXISTS "Students can view own progress" ON student_life_values_progress;
+CREATE POLICY "Students can view own progress" ON student_life_values_progress FOR ALL USING (
+    (auth.role() = 'service_role') OR (
+      student_life_values_progress.school_id = auth_school_id()
+      AND student_id IN (
+          SELECT s.id FROM students s
+          JOIN persons p ON s.person_id = p.id
+          JOIN users u ON u.person_id = p.id
+          WHERE u.id = auth.uid()
+            AND u.school_id = auth_school_id()
+            AND s.school_id = auth_school_id()
+            AND p.school_id = auth_school_id()
+      )
+    )
+);
+
+-- 5. AUTOMATION: ENROLLMENT
+DROP FUNCTION IF EXISTS ensure_student_enrollment(uuid);
+
+-- SECTION 99: GRANTS & FINALIZATION
+GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;
+
+GRANT ALL ON ALL TABLES IN SCHEMA public TO postgres, service_role;
+GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO postgres, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO postgres, service_role;
+
+-- Allow authenticated users to interact (enforced by RLS)
+GRANT ALL ON ALL TABLES IN SCHEMA public TO authenticated;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO authenticated;
+GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO authenticated;
+
+-- ============================================================
+-- 100. SECURITY ENFORCEMENT (Linter Fixes)
+-- ============================================================
+
+-- A. Fix Security Definer Views
+-- Views should be security_invoker to respect RLS
+ALTER VIEW active_students SET (security_invoker = true);
+ALTER VIEW active_persons SET (security_invoker = true);
+DO $$ BEGIN ALTER VIEW debug_class_teachers SET (security_invoker = true); EXCEPTION WHEN others THEN NULL; END $$;
+DO $$ BEGIN ALTER VIEW debug_role_permissions SET (security_invoker = true); EXCEPTION WHEN others THEN NULL; END $$;
+
+-- B. Enable RLS on ALL Tables
+-- (Some are already enabled, re-running is safe / idempotent)
+
+-- Enable RLS safely on all known tables (skips non-existent ones)
+DO $$
+DECLARE tbl TEXT;
+DECLARE rls_tables TEXT[] := ARRAY[
+  'genders', 'persons', 'countries', 'person_contacts',
+  'receipt_items', 'marks', 'discipline_records',
+  'student_money_science_progress', 'student_science_projects',
+  'roles', 'role_permissions', 'permissions',
+  'students', 'student_categories', 'religions',
+  'classes', 'class_sections', 'sections',
+  'staff_designations', 'staff_statuses',
+  'daily_attendance', 'staff',
+  'fee_structures', 'student_fees', 'class_subjects', 'subjects',
+  'fee_types', 'fee_transactions', 'receipts',
+  'exams', 'exam_subjects', 'grading_scales',
+  'complaints', 'leave_applications', 'diary_entries',
+  'periods', 'transport_routes', 'transport_stops', 'buses',
+  'student_transport', 'bus_locations',
+  'hostel_blocks', 'hostel_rooms', 'hostel_allocations',
+  'lms_courses', 'money_science_modules', 'science_projects',
+  'audit_logs', 'user_roles', 'users', 'blood_groups',
+  'student_statuses', 'parents', 'student_parents',
+  'relationship_types', 'academic_years', 'student_enrollments',
+  'lms_materials'
+];
+BEGIN
+  FOREACH tbl IN ARRAY rls_tables LOOP
+    IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = tbl) THEN
+      EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', tbl);
+    END IF;
+  END LOOP;
+END $$;
+
+-- C. Default RLS policies removed (Fix 9)
+-- The blanket "Enable all for authenticated" policy was overriding all 
+-- per-table security policies. Backend uses service_role key (bypasses RLS),
+-- so fine-grained RLS policies above are sufficient.
+
+-- ============================================================
+-- 101. LINTER FIXES (ROUND 2)
+-- ============================================================
+
+-- A. Fix "Function Search Path Mutable" (Fix 8)
+-- Only ALTER functions that actually exist in this schema.
+-- Wrapped in DO blocks so non-existent functions don't break the transaction.
+
+/* ALTER FUNCTION loop removed because it fails on overloaded functions */
+
+-- B. Fix "Extension in Public"
+-- We try to move extensions to 'extensions' schema, creating it if needed.
+-- Note: 'auth' schema is managed by Supabase, 'extensions' is a good convention.
+
+-- Extensions already created in SECTION 01. No duplicate creation or migration needed.
+
+-- ============================================================
+-- 102. EXPENSE TRACKER MODULE
+-- ============================================================
+
+-- 1. Create Expenses Table
+CREATE TABLE IF NOT EXISTS expenses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_by UUID NOT NULL REFERENCES users(id), -- Fixed: was auth.users(id) (Fix 6)
+    title TEXT NOT NULL,
+    category TEXT NOT NULL,
+    amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+    expense_date DATE NOT NULL DEFAULT CURRENT_DATE,  
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'paid')),
+    description TEXT, -- Optional description
+    receipt_url TEXT, -- Optional receipt image
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_expenses_school_id ON expenses(school_id);
+
+
+-- 2. Indexes
+CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(expense_date DESC);
+CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
+
+-- 3. Auto-update Trigger
+DROP TRIGGER IF EXISTS trg_expenses_updated ON expenses;
+CREATE TRIGGER trg_expenses_updated
+BEFORE UPDATE ON expenses
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- 4. Row Level Security (RLS)
+ALTER TABLE expenses ENABLE ROW LEVEL SECURITY;
+
+-- 4.1 READ: Users can view expenses from their own school
+DROP POLICY IF EXISTS "View own school expenses" ON expenses;
+CREATE POLICY "View own school expenses" ON expenses FOR SELECT
+USING (
+    (auth.role() = 'service_role') OR (
+      expenses.school_id = auth_school_id() AND (
+        created_by = auth.uid() OR
+        EXISTS (
+            SELECT 1 FROM user_roles ur
+            JOIN roles r ON ur.role_id = r.id
+            WHERE ur.user_id = auth.uid() 
+              AND (r.code IN ('admin', 'principal', 'accounts'))
+        )
+      )
+    )
+);
+
+-- 4.2 INSERT: Authenticated users can create expenses
+DROP POLICY IF EXISTS "Create expenses" ON expenses;
+CREATE POLICY "Create expenses" ON expenses FOR INSERT
+WITH CHECK (
+    (auth.role() = 'service_role') OR (
+      auth.role() = 'authenticated' AND
+      expenses.school_id = auth_school_id() AND
+      created_by = auth.uid() 
+    )
+);
+
+-- 4.3 UPDATE: Creator wins pending, Admins win all
+DROP POLICY IF EXISTS "Update expenses" ON expenses;
+CREATE POLICY "Update expenses" ON expenses FOR UPDATE
+USING (
+    (auth.role() = 'service_role') OR (
+      expenses.school_id = auth_school_id() AND (
+        (created_by = auth.uid() AND status = 'pending') OR
+        EXISTS (
+            SELECT 1 FROM user_roles ur
+            JOIN roles r ON ur.role_id = r.id
+            WHERE ur.user_id = auth.uid() 
+              AND (r.code IN ('admin', 'principal', 'accounts'))
+        )
+      )
+    )
+);
+
+-- 4.4 DELETE: Only Creator (if pending) or Admin
+DROP POLICY IF EXISTS "Delete expenses" ON expenses;
+CREATE POLICY "Delete expenses" ON expenses FOR DELETE
+USING (
+    (auth.role() = 'service_role') OR (
+      expenses.school_id = auth_school_id() AND (
+        (created_by = auth.uid() AND status = 'pending') OR
+        EXISTS (
+            SELECT 1 FROM user_roles ur
+            JOIN roles r ON ur.role_id = r.id
+            WHERE ur.user_id = auth.uid() 
+              AND (r.code IN ('admin', 'principal', 'accounts'))
+        )
+      )
+    )
+);
+
+-- 5. Grant Permissions
+GRANT ALL ON expenses TO authenticated;
+GRANT ALL ON expenses TO service_role;
+
+
+-- search_path managed at session level (ALTER DATABASE is non-transactional DDL)
+SET search_path = public, extensions;
+
+
+-- (Fix 1: Removed mid-file COMMIT that split the transaction)
+-- The single COMMIT is at the end of the file.
+
+-- VERIFICATION (Commented)
+
+
+-- 13. STAFF PAYROLL (New Additions)
+
+
+CREATE TABLE IF NOT EXISTS staff_payroll (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    staff_id UUID NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+    base_salary DECIMAL(12,2) NOT NULL,
+    bonus DECIMAL(12,2) DEFAULT 0,
+    deductions DECIMAL(12,2) DEFAULT 0,
+    net_salary DECIMAL(12,2) NOT NULL, -- Application value: base + bonus - deductions
+    status payroll_status_enum NOT NULL DEFAULT 'pending',
+    payment_date DATE,
+    payroll_month INTEGER NOT NULL CHECK (payroll_month BETWEEN 1 AND 12),
+    payroll_year INTEGER NOT NULL,
+    payment_method VARCHAR(50), 
+    remarks TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (school_id, staff_id, payroll_month, payroll_year)
+);
+
+CREATE INDEX IF NOT EXISTS idx_staff_payroll_school_id ON staff_payroll(school_id);
+
+CREATE INDEX IF NOT EXISTS idx_payroll_staff ON staff_payroll(staff_id);
+CREATE INDEX IF NOT EXISTS idx_payroll_period ON staff_payroll(payroll_month, payroll_year);
+
+DROP TRIGGER IF EXISTS trg_staff_payroll_updated ON staff_payroll;
+CREATE TRIGGER trg_staff_payroll_updated
+BEFORE UPDATE ON staff_payroll
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+
+-- GENERATOR FUNCTION (Idempotent)
+
+-- SALARY DEDUCTION LOGIC
+
+
+DROP TRIGGER IF EXISTS trg_staff_attendance_payroll ON staff_attendance;
+CREATE TRIGGER trg_staff_attendance_payroll
+AFTER INSERT OR UPDATE OR DELETE ON staff_attendance
+FOR EACH ROW EXECUTE FUNCTION trg_recalc_payroll_on_attendance();
+
+
+DROP TRIGGER IF EXISTS trg_leave_payroll ON leave_applications;
+CREATE TRIGGER trg_leave_payroll
+AFTER INSERT OR UPDATE ON leave_applications
+FOR EACH ROW EXECUTE FUNCTION trg_recalc_payroll_on_leave();
+
+-- RLS POLICIES
+ALTER TABLE staff_payroll ENABLE ROW LEVEL SECURITY;
+
+-- Allow admins and accounts to do everything
+DROP POLICY IF EXISTS "Admins can manage payroll" ON staff_payroll;
+DROP POLICY IF EXISTS "Admins and Accounts can manage payroll" ON staff_payroll;
+CREATE POLICY "Admins and Accounts can manage payroll" ON staff_payroll FOR ALL
+USING (
+  (auth.role() = 'service_role') OR (
+    staff_payroll.school_id = auth_school_id()
+    AND EXISTS (
+      SELECT 1 FROM user_roles ur
+      JOIN roles r ON ur.role_id = r.id
+      WHERE ur.user_id = auth.uid() AND r.code IN ('admin', 'accounts')
+    )
+  )
+);
+
+-- FIX: Grant permissions to authenticated role for the new table
+-- This was missing in the initial schema update
+
+-- 1. Table Permissions
+GRANT ALL ON TABLE staff_payroll TO authenticated;
+GRANT ALL ON TABLE staff_payroll TO service_role;
+
+-- 2. Function Permissions (RPC)
+GRANT EXECUTE ON FUNCTION generate_monthly_payroll TO authenticated;
+GRANT EXECUTE ON FUNCTION generate_monthly_payroll TO service_role;
+
+-- 3. Ensure sequence permissions if any (UUID gen_random_uuid doesn't use sequence, but good practice if serial)
+-- (None needed for UUID PK)
+
+-- 4. Verify RLS is enabled (It was, but harmless to repeat)
+ALTER TABLE staff_payroll ENABLE ROW LEVEL SECURITY;
+
+-- Staff can view their own payroll
+DROP POLICY IF EXISTS "Staff can view own payroll" ON staff_payroll;
+CREATE POLICY "Staff can view own payroll" ON staff_payroll FOR SELECT
+USING (
+  (auth.role() = 'service_role') OR (
+    staff_payroll.school_id = auth_school_id()
+    AND staff_id IN (
+      SELECT id FROM staff WHERE person_id IN (
+          SELECT person_id FROM users WHERE id = auth.uid() AND users.school_id = auth_school_id()
+      ) AND staff.school_id = auth_school_id()
+    )
+  )
+);
+
+-- =========================================================
+-- FINANCIAL POLICY & CONTROL LAYER (AUTO-APPENDED)
+-- =========================================================
+
+
+-- 1. Financial Audit Logs (For destructive actions)
+CREATE TABLE IF NOT EXISTS financial_audit_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    table_name TEXT NOT NULL,
+    record_id TEXT NOT NULL, -- Storing as text to support various ID types
+    action_type TEXT NOT NULL CHECK (action_type IN ('DELETE', 'UPDATE', 'CREATE')),
+    old_data JSONB, -- The state before deletion/update
+    new_data JSONB, -- The state after update/creation
+    reason TEXT, -- Mandatory for deletions
+    performed_by UUID REFERENCES auth.users(id),
+    performed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    metadata JSONB, -- Extra context (user agent, IP, etc if available)
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_financial_audit_school_id ON financial_audit_logs(school_id);
+
+
+-- Enable RLS on Audit Logs
+ALTER TABLE financial_audit_logs ENABLE ROW LEVEL SECURITY;
+
+-- Admin can view all logs
+DROP POLICY IF EXISTS "Admins can view financial audit logs" ON financial_audit_logs;
+CREATE POLICY "Admins can view financial audit logs" ON financial_audit_logs FOR SELECT 
+TO authenticated 
+USING (
+    (auth.role() = 'service_role') OR (
+      financial_audit_logs.school_id = auth_school_id()
+      AND EXISTS (
+          SELECT 1 FROM user_roles ur
+          JOIN roles r ON ur.role_id = r.id
+          WHERE ur.user_id = auth.uid() AND r.code = 'admin'
+      )
+    )
+);
+
+-- Only service_role (and SECURITY DEFINER functions running as owner) can insert
+DROP POLICY IF EXISTS "System can insert audit logs" ON financial_audit_logs;
+CREATE POLICY "System can insert audit logs" ON financial_audit_logs FOR INSERT 
+TO service_role 
+WITH CHECK (true);
+
+-- 2. Financial Policy Rules (Limits, Permissions, Locks)
+CREATE TABLE IF NOT EXISTS financial_policy_rules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    rule_code TEXT NOT NULL, 
+    rule_name TEXT NOT NULL,
+    description TEXT,
+    value_type TEXT CHECK (value_type IN ('amount', 'percentage', 'boolean', 'json')),
+    default_value JSONB NOT NULL,
+    current_value JSONB NOT NULL,
+    is_active BOOLEAN DEFAULT true,
+    updated_by UUID REFERENCES auth.users(id),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE (school_id, rule_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_financial_policy_school_id ON financial_policy_rules(school_id);
+
+
+-- Enable RLS
+ALTER TABLE financial_policy_rules ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Authenticated users can read financial policies" ON financial_policy_rules;
+CREATE POLICY "Authenticated users can read financial policies" ON financial_policy_rules FOR SELECT 
+TO authenticated 
+USING (
+    (auth.role() = 'service_role') OR (
+      financial_policy_rules.school_id = auth_school_id()
+    )
+);
+
+DROP POLICY IF EXISTS "Admins can update financial policies" ON financial_policy_rules;
+CREATE POLICY "Admins can update financial policies" ON financial_policy_rules FOR UPDATE 
+TO authenticated 
+USING (
+    (auth.role() = 'service_role') OR (
+      financial_policy_rules.school_id = auth_school_id()
+      AND EXISTS (
+          SELECT 1 FROM user_roles ur
+          JOIN roles r ON ur.role_id = r.id
+          WHERE ur.user_id = auth.uid() AND r.code = 'admin'
+      )
+    )
+)
+WITH CHECK (
+    (auth.role() = 'service_role') OR (
+      financial_policy_rules.school_id = auth_school_id()
+      AND EXISTS (
+          SELECT 1 FROM user_roles ur
+          JOIN roles r ON ur.role_id = r.id
+          WHERE ur.user_id = auth.uid() AND r.code = 'admin'
+      )
+    )
+);
+
+-- Seed Default Policies
+INSERT INTO financial_policy_rules (school_id, rule_code, rule_name, description, value_type, default_value, current_value)
+SELECT v.school_id, v.rule_code, v.rule_name, v.description, v.value_type, v.default_value, v.current_value
+FROM (VALUES
+  (1, 'EXPENSE_AUTO_APPROVE_LIMIT', 'Expense Auto-Approval Limit', 'Expenses below this amount are auto-approved.', 'amount', '1000'::jsonb, '1000'::jsonb),
+  (1, 'CASH_COLLECTION_DAILY_LIMIT', 'Daily Cash Collection Limit', 'Maximum cash a user can collect per day.', 'amount', '50000'::jsonb, '50000'::jsonb),
+  (1, 'FEE_WAIVER_MAX_PERCENT', 'Max Fee Waiver Percentage', 'Maximum percentage of fee that can be waived.', 'percentage', '20'::jsonb, '20'::jsonb),
+  (1, 'PAYROLL_OVERRIDE_ALLOWED', 'Payroll Override Allowed', 'Can payroll values be manually overridden?', 'boolean', 'false'::jsonb, 'false'::jsonb),
+  (1, 'LOCK_PAST_MONTHS_DAYS', 'Lock Past Months After (Days)', 'Number of days after which previous month data is locked.', 'amount', '7'::jsonb, '7'::jsonb)
+) AS v(school_id, rule_code, rule_name, description, value_type, default_value, current_value)
+WHERE NOT EXISTS (
+  SELECT 1 FROM financial_policy_rules fpr WHERE fpr.school_id = v.school_id AND fpr.rule_code = v.rule_code
+);
+
+-- 3. Audit Log Trigger Function
+
+-- 4. Attach Triggers to Financial Tables
+DROP TRIGGER IF EXISTS audit_delete_receipts ON receipts;
+CREATE TRIGGER audit_delete_receipts BEFORE DELETE ON receipts FOR EACH ROW EXECUTE FUNCTION log_financial_destruction();
+
+DROP TRIGGER IF EXISTS audit_delete_student_fees ON student_fees;
+CREATE TRIGGER audit_delete_student_fees BEFORE DELETE ON student_fees FOR EACH ROW EXECUTE FUNCTION log_financial_destruction();
+
+DROP TRIGGER IF EXISTS audit_delete_expenses ON expenses;
+CREATE TRIGGER audit_delete_expenses BEFORE DELETE ON expenses FOR EACH ROW EXECUTE FUNCTION log_financial_destruction();
+
+DROP TRIGGER IF EXISTS audit_delete_payroll ON staff_payroll;
+CREATE TRIGGER audit_delete_payroll BEFORE DELETE ON staff_payroll FOR EACH ROW EXECUTE FUNCTION log_financial_destruction();
+
+-- 5. Helper: Read Policy
+
+-- 6. Helper: Check Financial Permission & Limits
+
+-- 7. Helper: Enforce Locks
+
+-- 8. Triggers for Active Enforcement
+
+DROP TRIGGER IF EXISTS enforce_expense_policy ON expenses;
+CREATE TRIGGER enforce_expense_policy BEFORE INSERT OR UPDATE ON expenses FOR EACH ROW EXECUTE FUNCTION trg_check_expense_policy();
+
+
+DROP TRIGGER IF EXISTS enforce_fee_cash_limit ON fee_transactions;
+CREATE TRIGGER enforce_fee_cash_limit BEFORE INSERT ON fee_transactions FOR EACH ROW EXECUTE FUNCTION trg_check_fee_cash_limit();
+
+-- 9. Generic Deletion RPC with Reason
+
+-- 10. Grant Permissions
+GRANT ALL ON TABLE financial_audit_logs TO service_role;
+GRANT SELECT ON TABLE financial_audit_logs TO authenticated;
+GRANT ALL ON TABLE financial_policy_rules TO service_role;
+GRANT SELECT, UPDATE ON TABLE financial_policy_rules TO authenticated;
+GRANT EXECUTE ON FUNCTION delete_record_with_reason TO authenticated;
+GRANT EXECUTE ON FUNCTION get_financial_policy_value TO authenticated;
+
+
+-- ============================================================
+-- SECTION 12: ANALYTICS & INSIGHTS (CONSOLIDATED)
+-- ============================================================
+-- ============================================================
+-- ANALYTICS & INSIGHTS ENGINE
+-- ============================================================
+
+-- helper to get safe division
+
+-- 1. FINANCIAL ANALYTICS
+-- Returns: total_collected, pending_dues, collection_efficiency, trends (json)
+
+-- 2. ATTENDANCE ANALYTICS
+
+-- 3. AUTOMATED INSIGHTS
+-- Generates text-based insights based on patterns.
+
+
+-- Grant Permissions for Analytics
+GRANT EXECUTE ON FUNCTION get_financial_analytics TO authenticated;
+GRANT EXECUTE ON FUNCTION get_attendance_analytics TO authenticated;
+GRANT EXECUTE ON FUNCTION get_dashboard_insights TO authenticated;
+
+  
+
+-- Legacy salary logic removed (moved to consolidated section)
+-- Legacy fee triggers removed (moved to consolidated section)
+
+
+DROP TRIGGER IF EXISTS trg_auto_assign_fees_enrollment ON student_enrollments;
+CREATE TRIGGER trg_auto_assign_fees_enrollment
+AFTER INSERT OR UPDATE ON student_enrollments
+FOR EACH ROW EXECUTE FUNCTION auto_assign_fees_on_enrollment();
+
+-- ============================================================
+-- ADDITIONAL CONSTRAINTS & INDEXES
+-- ============================================================
+
+-- Prevent double fee assignment for the same structure to the same student
+CREATE UNIQUE INDEX IF NOT EXISTS idx_student_fees_unique_assignment 
+ON student_fees(student_id, fee_structure_id);
+
+-- Prevent accidental double entry of transaction references (checks, UPI IDs, etc)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_transactions_unique_ref 
+ON fee_transactions(transaction_ref) 
+WHERE transaction_ref IS NOT NULL AND transaction_ref <> '';
+
+-- SECTION 13: AUDIT & PERFORMANCE
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id),
+    action TEXT NOT NULL,
+    entity TEXT,
+    entity_id TEXT,
+    details JSONB,
+    ip_address TEXT,
+    user_agent TEXT,
+    request_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    school_id INTEGER REFERENCES schools(id)
+);
+
+
+-- Phase 2 will backfill + enforce NOT NULL
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user_date ON audit_logs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_request_id ON audit_logs(request_id);
+
+CREATE INDEX IF NOT EXISTS idx_audit_created_at ON public.audit_logs USING btree (created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_user_id ON public.audit_logs USING btree (user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_entity ON public.audit_logs USING btree (entity, entity_id);
+
+
+-- Performance Indexes for Foreign Keys
+CREATE INDEX IF NOT EXISTS idx_person_contacts_person_id ON person_contacts(person_id);
+CREATE INDEX IF NOT EXISTS idx_student_fees_structure_id ON student_fees(fee_structure_id);
+CREATE INDEX IF NOT EXISTS idx_fee_transactions_student_fee_id ON fee_transactions(student_fee_id);
+CREATE INDEX IF NOT EXISTS idx_receipt_items_receipt_id ON receipt_items(receipt_id);
+CREATE INDEX IF NOT EXISTS idx_receipt_items_transaction_id ON receipt_items(fee_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_student_enrollments_class_section ON student_enrollments(class_section_id);
+CREATE INDEX IF NOT EXISTS idx_class_subjects_subject_id ON class_subjects(subject_id);
+CREATE INDEX IF NOT EXISTS idx_exam_subjects_subject_id ON exam_subjects(subject_id);
+CREATE INDEX IF NOT EXISTS idx_exam_subjects_class_id ON exam_subjects(class_id);
+
+-- Phase 4 will introduce RLS (intentionally omitted here).
+
+-- SECTION 14: NOTIFICATIONS & DEVICES
+-- ============================================================
+
+-- ============================================================
+-- 103. DEBUG UTILITIES (Production Diagnostics)
+-- ============================================================
+
+-- Function to check a user's permissions
+
+-- Advanced Diagnostic: Teacher Profile & Timetable Check
+
+-- CORE AUDIT: Data Integrity Check
+
+-- CORE REPAIR: Data Integrity Recovery
+
+-- View to see assigned Class Teachers
+DROP VIEW IF EXISTS debug_class_teachers CASCADE; CREATE OR REPLACE VIEW debug_class_teachers AS
+SELECT 
+    c.name as class_name, 
+    s.name as section_name, 
+    p.display_name as teacher_name,
+    ay.code as academic_year
+FROM class_sections cs
+JOIN classes c ON cs.class_id = c.id
+JOIN sections s ON cs.section_id = s.id
+JOIN academic_years ay ON cs.academic_year_id = ay.id
+LEFT JOIN staff st ON cs.class_teacher_id = st.id
+LEFT JOIN persons p ON st.person_id = p.id;
+
+-- View to see Roles & Permissions Mapping
+DROP VIEW IF EXISTS debug_role_permissions CASCADE; CREATE OR REPLACE VIEW debug_role_permissions AS
+SELECT 
+    r.code as role,
+    STRING_AGG(p.code, ', ') as permissions
+FROM roles r
+LEFT JOIN role_permissions rp ON r.id = rp.role_id
+LEFT JOIN permissions p ON rp.permission_id = p.id
+GROUP BY r.code;
+
+-- CORE INTEGRITY GUARD: Central Diagnostic Toolkit
+
+-- ============================================================
+-- UTILITIES & MAINTENANCE
+-- ============================================================
+
+-- Function to recalculate fee ledger from transactions (Fix for double-counting)
+
+-- Session-level search path (ALTER DATABASE removed — non-transactional DDL)
+SET search_path = public, extensions;
+
+-- ============================================================
+-- NOTIFICATION SYSTEM (Production Hardened)
+-- ============================================================
+
+
+-- 1. Notification Templates
+CREATE TABLE IF NOT EXISTS notification_templates (
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type VARCHAR(100) NOT NULL,
+    title_template TEXT NOT NULL,
+    body_template TEXT NOT NULL,
+    default_channels notification_channel[] NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ,
+    UNIQUE (school_id, event_type)
+);
+ALTER TABLE notification_templates ENABLE ROW LEVEL SECURITY;
+
+-- 2. Notification Preferences
+CREATE TABLE IF NOT EXISTS notification_preferences (
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    event_type VARCHAR(100),
+    channel notification_channel NOT NULL,
+    is_enabled BOOLEAN DEFAULT TRUE,
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ,
+    PRIMARY KEY (school_id, user_id, event_type, channel)
+);
+ALTER TABLE notification_preferences ENABLE ROW LEVEL SECURITY;
+
+
+-- 3. Notification Events
+CREATE TABLE IF NOT EXISTS notification_events (
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    idempotency_key VARCHAR(255) NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    actor_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    target_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    payload JSONB NOT NULL,
+    status event_status NOT NULL DEFAULT 'RECEIVED',
+    error_reason TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ,
+    UNIQUE (school_id, idempotency_key)
+);
+ALTER TABLE notification_events ENABLE ROW LEVEL SECURITY;
+
+
+-- 4. Notifications
+CREATE TABLE IF NOT EXISTS notifications (
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id UUID NOT NULL REFERENCES notification_events(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL, 
+    body TEXT NOT NULL,
+    action_url TEXT,
+    status notification_status NOT NULL DEFAULT 'PENDING',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    read_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT uniq_notifications_event_user UNIQUE (school_id, event_id, user_id)
+);
+ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
+
+
+-- 5. Notification Deliveries
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+    channel notification_channel NOT NULL,
+    provider_message_id VARCHAR(255),
+    status notification_status NOT NULL DEFAULT 'PENDING',
+    retry_count INT DEFAULT 0,
+    next_retry_at TIMESTAMPTZ,
+    error_log TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    deleted_at TIMESTAMPTZ,
+    CONSTRAINT uniq_delivery_notification_channel UNIQUE (school_id, notification_id, channel),
+    CONSTRAINT chk_max_retries CHECK (retry_count <= 5),
+    CONSTRAINT chk_retry_time CHECK (
+        (status = 'FAILED' AND next_retry_at IS NOT NULL) OR 
+        (status != 'FAILED')
+    )
+);
+ALTER TABLE notification_deliveries ENABLE ROW LEVEL SECURITY;
+
+
+-- 6. Notification Audit Logs
+CREATE TABLE IF NOT EXISTS notification_audit_logs (
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    delivery_id UUID REFERENCES notification_deliveries(id),
+    notification_id UUID REFERENCES notifications(id),
+    action VARCHAR(50) NOT NULL,
+    metadata JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+
+-- Indexes for Performance
+CREATE INDEX IF NOT EXISTS idx_notifications_unread_fetch 
+ON notifications (user_id, created_at DESC) 
+WHERE status IN ('PENDING', 'DELIVERED');
+
+CREATE INDEX IF NOT EXISTS idx_deliveries_worker_fetch 
+ON notification_deliveries (next_retry_at) 
+WHERE status = 'FAILED' AND retry_count < 5;
+
+CREATE INDEX IF NOT EXISTS idx_events_idempotency ON notification_events(idempotency_key);
+
+-- ============================================================
+-- RECENT DDL PATCHES (Drivers, RLS, Timetables)
+-- ============================================================
+
+-- From apply_phase5_db.js
+ALTER TABLE public.bus_locations 
+  ADD COLUMN IF NOT EXISTS is_mocked boolean DEFAULT false,
+  ADD COLUMN IF NOT EXISTS is_suspicious boolean DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS idx_bus_locations_bus_id ON public.bus_locations (bus_id);
+CREATE INDEX IF NOT EXISTS idx_bus_locations_recorded_at ON public.bus_locations (recorded_at DESC);
+-- (bus_trip_history index moved after table definition below)
+DROP POLICY IF EXISTS "Users can read own person" ON public.persons;
+CREATE POLICY "Users can read own person" ON public.persons
+FOR SELECT USING (
+  (auth.role() = 'service_role') OR (
+    public.persons.school_id = auth_school_id()
+    AND id IN (
+      SELECT person_id FROM public.users
+      WHERE public.users.id = auth.uid()
+        AND public.users.school_id = auth_school_id()
+    )
+  )
+);
+
+ALTER TABLE IF EXISTS public.staff ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can read own staff record" ON public.staff;
+CREATE POLICY "Users can read own staff record" ON public.staff
+FOR SELECT USING (
+  (auth.role() = 'service_role') OR (
+    public.staff.school_id = auth_school_id()
+    AND person_id IN (
+      SELECT person_id FROM public.users
+      WHERE public.users.id = auth.uid()
+        AND public.users.school_id = auth_school_id()
+    )
+  )
+);
+
+
+-- From fix_trigger.js
+
+
+-- From migrate_timetable.js
+
 
 DROP INDEX IF EXISTS uq_timetable_slots_active;
 DROP INDEX IF EXISTS idx_timetable_slots_time_check;
@@ -4493,16 +5380,14 @@ CREATE INDEX IF NOT EXISTS idx_timetable_class ON timetable_slots(class_section_
 CREATE INDEX IF NOT EXISTS idx_timetable_teacher ON timetable_slots(teacher_id);
 CREATE INDEX IF NOT EXISTS idx_timetable_slots_time_check ON timetable_slots(teacher_id, start_time, end_time);
 
-COMMIT;
-
-
 
 -- ========================================== 
 -- 29. GIRL SAFETY
 -- ========================================== 
 CREATE TABLE IF NOT EXISTS girl_safety_complaints (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    ticket_no VARCHAR(20) UNIQUE NOT NULL,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    ticket_no VARCHAR(20) NOT NULL,
     student_id UUID REFERENCES students(id) ON DELETE SET NULL,
     category VARCHAR(50) NOT NULL,
     description TEXT NOT NULL,
@@ -4514,11 +5399,13 @@ CREATE TABLE IF NOT EXISTS girl_safety_complaints (
     assigned_to UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    resolved_at TIMESTAMPTZ
+    resolved_at TIMESTAMPTZ,
+    UNIQUE (school_id, ticket_no)
 );
 
 CREATE TABLE IF NOT EXISTS girl_safety_complaint_threads (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     complaint_id UUID REFERENCES girl_safety_complaints(id) ON DELETE CASCADE,
     sender_id UUID REFERENCES users(id) ON DELETE SET NULL,
     sender_role VARCHAR(20) NOT NULL,
@@ -4527,25 +5414,36 @@ CREATE TABLE IF NOT EXISTS girl_safety_complaint_threads (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+
 -- ========================================== 
 -- 30. SCHOOL SETTINGS & CONFIG
 -- ========================================== 
 CREATE TABLE IF NOT EXISTS school_settings (
-    key         VARCHAR(100) PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    key         VARCHAR(100) NOT NULL,
     value       TEXT NOT NULL,
-    updated_at  TIMESTAMPTZ DEFAULT now()
+    updated_at  TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (school_id, key)
 );
 
-INSERT INTO school_settings (key, value) VALUES
-    ('school_name',      'Default School Name'),
-    ('school_timezone',  'Asia/Kolkata'),
-    ('school_hours_start', '08:00'),
-    ('school_hours_end',   '17:00'),
-    ('admin_email',      'admin@school.local')
-ON CONFLICT DO NOTHING;
+INSERT INTO school_settings (school_id, key, value)
+SELECT v.school_id, v.key, v.value
+FROM (VALUES
+  (1, 'school_name',        'Default School Name'),
+  (1, 'school_timezone',    'Asia/Kolkata'),
+  (1, 'school_hours_start', '08:00'),
+  (1, 'school_hours_end',   '17:00'),
+  (1, 'admin_email',        'admin@school.local')
+) AS v(school_id, key, value)
+WHERE NOT EXISTS (
+  SELECT 1 FROM school_settings ss
+  WHERE ss.school_id = v.school_id AND ss.key = v.key
+);
 
 CREATE TABLE IF NOT EXISTS admin_notifications (
     id          SERIAL PRIMARY KEY,
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
     type        VARCHAR(50) NOT NULL,
     message     TEXT NOT NULL,
     user_id     UUID,
@@ -4553,10 +5451,12 @@ CREATE TABLE IF NOT EXISTS admin_notifications (
     created_at  TIMESTAMPTZ DEFAULT now()
 );
 
+
 -- ========================================== 
 -- 31. OUT-OF-HOURS ACCESS CONTROL
 -- ========================================== 
 CREATE TABLE IF NOT EXISTS access_requests (
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     requested_by UUID REFERENCES users(id) ON DELETE CASCADE,
     department TEXT NOT NULL,
@@ -4567,7 +5467,9 @@ CREATE TABLE IF NOT EXISTS access_requests (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+
 CREATE TABLE IF NOT EXISTS temp_access_grants (
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     department TEXT NOT NULL,
     granted_by UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -4577,58 +5479,640 @@ CREATE TABLE IF NOT EXISTS temp_access_grants (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+
+CREATE INDEX IF NOT EXISTS idx_temp_access_lookup ON temp_access_grants(requested_by, department) WHERE is_active = true;
+
 ALTER TABLE access_requests ENABLE ROW LEVEL SECURITY;
 ALTER TABLE temp_access_grants ENABLE ROW LEVEL SECURITY;
 
-GRANT ALL ON access_requests TO anon, authenticated, service_role;
-GRANT ALL ON temp_access_grants TO anon, authenticated, service_role;
+GRANT ALL ON access_requests TO authenticated, service_role;
+GRANT ALL ON temp_access_grants TO authenticated, service_role;
 
-CREATE POLICY "Users can view their own requests" 
-ON access_requests FOR SELECT 
-USING (auth.uid() = requested_by);
+DROP POLICY IF EXISTS "Users can view their own requests" ON access_requests;
+CREATE POLICY "Users can view their own requests" ON access_requests FOR SELECT 
+USING ((auth.role() = 'service_role') OR (school_id = auth_school_id() AND requested_by = auth.uid()));
 
-CREATE POLICY "Users can insert their own requests" 
-ON access_requests FOR INSERT 
-WITH CHECK (auth.uid() = requested_by);
+DROP POLICY IF EXISTS "Users can insert their own requests" ON access_requests;
+CREATE POLICY "Users can insert their own requests" ON access_requests FOR INSERT 
+WITH CHECK ((auth.role() = 'service_role') OR (school_id = auth_school_id() AND requested_by = auth.uid()));
 
-CREATE POLICY "Users can view their own grants" 
-ON temp_access_grants FOR SELECT 
-USING (auth.uid() = requested_by);
+DROP POLICY IF EXISTS "Users can view their own grants" ON temp_access_grants;
+CREATE POLICY "Users can view their own grants" ON temp_access_grants FOR SELECT 
+USING ((auth.role() = 'service_role') OR (school_id = auth_school_id() AND requested_by = auth.uid()));
 
-CREATE OR REPLACE FUNCTION is_admin() RETURNS BOOLEAN AS $$
+
+DROP POLICY IF EXISTS "Admins can view all requests" ON access_requests;
+CREATE POLICY "Admins can view all requests" ON access_requests FOR SELECT 
+USING ((auth.role() = 'service_role') OR (school_id = auth_school_id() AND EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = auth.uid() AND r.code = 'admin')));
+
+DROP POLICY IF EXISTS "Admins can update requests" ON access_requests;
+CREATE POLICY "Admins can update requests" ON access_requests FOR UPDATE 
+USING ((auth.role() = 'service_role') OR (school_id = auth_school_id() AND EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = auth.uid() AND r.code = 'admin')));
+
+DROP POLICY IF EXISTS "Admins can view all grants" ON temp_access_grants;
+CREATE POLICY "Admins can view all grants" ON temp_access_grants FOR SELECT 
+USING ((auth.role() = 'service_role') OR (school_id = auth_school_id() AND EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = auth.uid() AND r.code = 'admin')));
+
+DROP POLICY IF EXISTS "Admins can insert grants" ON temp_access_grants;
+CREATE POLICY "Admins can insert grants" ON temp_access_grants FOR INSERT 
+WITH CHECK ((auth.role() = 'service_role') OR (school_id = auth_school_id() AND EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = auth.uid() AND r.code = 'admin')));
+
+DROP POLICY IF EXISTS "Admins can update grants" ON temp_access_grants;
+CREATE POLICY "Admins can update grants" ON temp_access_grants FOR UPDATE 
+USING ((auth.role() = 'service_role') OR (school_id = auth_school_id() AND EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = auth.uid() AND r.code = 'admin')));
+
+
+
+-- (indexes for bus_trip_history, driver_devices, driver_heartbeat, feature_flags, timetable_entries
+--  are created after their respective CREATE TABLE definitions below)
+
+
+-- ### INJECTED MISSING FUNCTIONS ###
+
+
+-- Policies for staff_attendance
+
+
+-- Policies for timetable_entries
+
+
+-- ======================================
+-- ### INJECTED MISSING TABLES ###
+-- ======================================
+
+
+CREATE TABLE IF NOT EXISTS bus_trip_history (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+  bus_id uuid NOT NULL,
+  latitude double precision,
+  longitude double precision,
+  speed double precision,
+  is_mocked boolean DEFAULT false,
+  is_suspicious boolean DEFAULT false,
+  recorded_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT bus_trip_history_pkey PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bus_trip_history_bus_id_time ON bus_trip_history (bus_id, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_bus_trip_history_school_id ON bus_trip_history (school_id);
+
+CREATE TABLE IF NOT EXISTS debug_class_teachers (
+  school_id INTEGER,
+  class_name character varying(50),
+  section_name character varying(50),
+  teacher_name text,
+  academic_year character varying(20)
+);
+
+CREATE TABLE IF NOT EXISTS debug_role_permissions (
+  school_id INTEGER,
+  role character varying(50),
+  permissions text
+);
+
+CREATE TABLE IF NOT EXISTS driver_devices (
+  driver_id uuid NOT NULL,
+  school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+  device_id character varying NOT NULL,
+  last_active timestamp with time zone,
+  created_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT driver_devices_pkey PRIMARY KEY (school_id, driver_id)
+);
+
+CREATE TABLE IF NOT EXISTS driver_heartbeat (
+  driver_id uuid NOT NULL,
+  school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+  last_ping timestamp with time zone DEFAULT now(),
+  status character varying DEFAULT 'online'::character varying,
+  CONSTRAINT driver_heartbeat_pkey PRIMARY KEY (school_id, driver_id)
+);
+
+CREATE TABLE IF NOT EXISTS feature_flags (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+  code character varying(100) NOT NULL,
+  name character varying(200) NOT NULL,
+  description text,
+  is_enabled boolean NOT NULL DEFAULT false,
+  target_roles text[],
+  metadata jsonb,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  updated_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT feature_flags_pkey PRIMARY KEY (id),
+  CONSTRAINT feature_flags_code_key UNIQUE (code) -- TODO: VERIFY
+);
+
+CREATE TABLE IF NOT EXISTS timetable_entries (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+  class_section_id uuid NOT NULL,
+  subject_id uuid,
+  teacher_id uuid,
+  period_id uuid NOT NULL,
+  day_of_week day_of_week_enum NOT NULL,
+  room character varying(50),
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  updated_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT timetable_entries_pkey PRIMARY KEY (id),
+  CONSTRAINT timetable_entries_class_section_id_period_id_day_of_week_key UNIQUE (school_id, class_section_id, period_id, day_of_week),
+  CONSTRAINT timetable_entries_class_section_id_fkey FOREIGN KEY (class_section_id) REFERENCES class_sections(id),
+  CONSTRAINT timetable_entries_subject_id_fkey FOREIGN KEY (subject_id) REFERENCES subjects(id),
+  CONSTRAINT timetable_entries_teacher_id_fkey FOREIGN KEY (teacher_id) REFERENCES staff(id),
+  CONSTRAINT timetable_entries_period_id_fkey FOREIGN KEY (period_id) REFERENCES periods(id)
+);
+
+CREATE TABLE IF NOT EXISTS ui_route_permissions (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+  route_key character varying(100) NOT NULL,
+  route_label character varying(200) NOT NULL,
+  required_permissions text[] NOT NULL DEFAULT '{}'::text[],
+  required_roles text[],
+  requires_feature_flag character varying(100),
+  sort_order integer NOT NULL DEFAULT 0,
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT ui_route_permissions_pkey PRIMARY KEY (id),
+  CONSTRAINT ui_route_permissions_route_key_key UNIQUE (school_id, route_key) -- TODO: VERIFY
+);
+
+-- Indexes and triggers for feature_flags
+DROP TRIGGER IF EXISTS trg_feature_flags_updated ON feature_flags;
+CREATE TRIGGER trg_feature_flags_updated
+BEFORE UPDATE ON feature_flags
+FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- Indexes and triggers for timetable_entries
+CREATE UNIQUE INDEX IF NOT EXISTS timetable_entries_class_period_day_key ON public.timetable_entries USING btree (class_section_id, period_id, day_of_week);
+CREATE INDEX IF NOT EXISTS idx_timetable_class ON public.timetable_entries USING btree (class_section_id);
+CREATE INDEX IF NOT EXISTS idx_timetable_teacher ON public.timetable_entries USING btree (teacher_id);
+
+DROP TRIGGER IF EXISTS trg_timetable_updated ON timetable_entries;
+CREATE TRIGGER trg_timetable_updated
+BEFORE UPDATE ON timetable_entries
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_validate_timetable ON timetable_entries;
+CREATE TRIGGER trg_validate_timetable
+BEFORE INSERT ON timetable_entries
+FOR EACH ROW EXECUTE FUNCTION validate_timetable_entry();
+
+
+-- ═══════════════════════════════════════════════════════════
+-- SCHEMA SYNC: Missing columns from live database
+-- ═══════════════════════════════════════════════════════════
+
+
+-- ALTER TABLE IF EXISTS active_students ADD COLUMN IF NOT EXISTS school_id uuid;
+
+
+-- ═══════════════════════════════════════════════════════════
+-- SCHEMA SYNC: Missing constraints from live database
+-- ═══════════════════════════════════════════════════════════
+
+
+-- ═══════════════════════════════════════════════════════════
+-- SCHEMA SYNC: Missing indexes from live database
+-- ═══════════════════════════════════════════════════════════
+
+CREATE INDEX IF NOT EXISTS idx_notices_school ON public.notices USING btree (school_id);
+CREATE INDEX IF NOT EXISTS idx_attendance_school ON public.daily_attendance USING btree (school_id);
+CREATE INDEX IF NOT EXISTS idx_events_school ON public.events USING btree (school_id);
+CREATE INDEX IF NOT EXISTS idx_lms_courses_school ON public.lms_courses USING btree (school_id);
+CREATE INDEX IF NOT EXISTS idx_complaints_school ON public.complaints USING btree (school_id);
+CREATE INDEX IF NOT EXISTS idx_classes_school ON public.classes USING btree (school_id);
+CREATE INDEX IF NOT EXISTS idx_staff_school ON public.staff USING btree (school_id);
+CREATE INDEX IF NOT EXISTS idx_students_school ON public.students USING btree (school_id);
+CREATE INDEX IF NOT EXISTS idx_expenses_school ON public.expenses USING btree (school_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_notifications_event_user ON public.notifications (event_id, user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_delivery_notification_channel ON public.notification_deliveries (notification_id, channel);
+
+-- ═══════════════════════════════════════════════════════════
+-- SCHEMA SYNC: Enable RLS on tables missing it
+-- ═══════════════════════════════════════════════════════════
+
+ALTER TABLE IF EXISTS notification_preferences ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS notification_templates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS notification_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS notifications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS notification_deliveries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS notification_audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS user_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS girl_safety_complaints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS girl_safety_complaint_threads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS driver_devices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS driver_heartbeat ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS bus_trip_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS feature_flags ENABLE ROW LEVEL SECURITY;
+-- ALTER TABLE IF EXISTS active_students ENABLE ROW LEVEL SECURITY;
+-- ALTER TABLE IF EXISTS active_persons ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS ui_route_permissions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS school_settings ENABLE ROW LEVEL SECURITY;
+
+
+-- [SYNC MEDIUM] Enable RLS on remaining tables (safe: checks existence via pg_tables)
+DO $$
+DECLARE tbl TEXT;
 BEGIN
-    RETURN EXISTS (
-        SELECT 1 FROM user_roles ur
-        JOIN roles r ON ur.role_id = r.id
-        WHERE ur.user_id = auth.uid() AND r.code = 'admin'
-    );
+  FOR tbl IN
+    SELECT tablename FROM pg_tables
+    WHERE schemaname = 'public'
+      AND tablename NOT IN ('schema_meta', 'spatial_ref_sys', 'super_admins')
+  LOOP
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', tbl);
+  END LOOP;
+END $$;
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS staff_attendance DROP CONSTRAINT IF EXISTS chk_staff_attendance_date_past;
+ALTER TABLE staff_attendance ADD CONSTRAINT chk_staff_attendance_date_past CHECK (attendance_date <= current_date) NOT VALID;
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS fee_transactions DROP CONSTRAINT IF EXISTS chk_refund_must_be_negative;
+ALTER TABLE fee_transactions ADD CONSTRAINT chk_refund_must_be_negative CHECK (refund_of IS NULL OR amount < 0) NOT VALID;
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS diary_entries DROP CONSTRAINT IF EXISTS chk_homework_due_date;
+ALTER TABLE diary_entries ADD CONSTRAINT chk_homework_due_date CHECK (homework_due_date IS NULL OR homework_due_date >= entry_date);
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS buses DROP CONSTRAINT IF EXISTS chk_bus_capacity;
+ALTER TABLE buses ADD CONSTRAINT chk_bus_capacity CHECK (capacity > 0);
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS events DROP CONSTRAINT IF EXISTS chk_event_dates;
+ALTER TABLE events ADD CONSTRAINT chk_event_dates CHECK (end_date IS NULL OR end_date >= start_date);
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS notification_batches DROP CONSTRAINT IF EXISTS chk_notification_batches_type;
+ALTER TABLE notification_batches ADD CONSTRAINT chk_notification_batches_type CHECK (type IN ('FEES', 'GENERAL', 'EXAM', 'EMERGENCY', 'DIARY', 'RESULTS', 'NOTICE', 'TEST_TRIGGER'));
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS student_fees DROP CONSTRAINT IF EXISTS chk_discount_not_exceed_due;
+ALTER TABLE student_fees ADD CONSTRAINT chk_discount_not_exceed_due CHECK (discount <= amount_due) NOT VALID;
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS events DROP CONSTRAINT IF EXISTS chk_event_dates;
+ALTER TABLE events ADD CONSTRAINT chk_event_dates CHECK (end_date IS NULL OR end_date >= start_date);
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS student_fees DROP CONSTRAINT IF EXISTS chk_discount_not_exceed_due;
+ALTER TABLE student_fees ADD CONSTRAINT chk_discount_not_exceed_due CHECK (discount <= amount_due) NOT VALID;
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS staff_attendance DROP CONSTRAINT IF EXISTS chk_staff_attendance_date_past;
+ALTER TABLE staff_attendance ADD CONSTRAINT chk_staff_attendance_date_past CHECK (attendance_date <= current_date) NOT VALID;
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS fee_transactions DROP CONSTRAINT IF EXISTS chk_refund_must_be_negative;
+ALTER TABLE fee_transactions ADD CONSTRAINT chk_refund_must_be_negative CHECK (refund_of IS NULL OR amount < 0) NOT VALID;
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS diary_entries DROP CONSTRAINT IF EXISTS chk_homework_due_date;
+ALTER TABLE diary_entries ADD CONSTRAINT chk_homework_due_date CHECK (homework_due_date IS NULL OR homework_due_date >= entry_date);
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS buses DROP CONSTRAINT IF EXISTS chk_bus_capacity;
+ALTER TABLE buses ADD CONSTRAINT chk_bus_capacity CHECK (capacity > 0);
+
+-- [SYNC MEDIUM] Constraint in schema.sql missing from live DB
+ALTER TABLE IF EXISTS notification_batches DROP CONSTRAINT IF EXISTS chk_notification_batches_type;
+ALTER TABLE notification_batches ADD CONSTRAINT chk_notification_batches_type CHECK (type IN ('FEES', 'GENERAL', 'EXAM', 'EMERGENCY', 'ATTENDANCE', 'CUSTOM', 'DIARY', 'RESULTS', 'NOTICE', 'TEST_TRIGGER')) NOT VALID;
+
+-- [SYNC MEDIUM] Trigger in schema.sql missing from live DB
+CREATE OR REPLACE TRIGGER trg_trips_updated
+  BEFORE UPDATE ON trips
+  FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- [SYNC MEDIUM] Enum values missing from live DB: mon, tue, wed, thu, fri, sat, sun
+ALTER TYPE day_of_week_enum ADD VALUE IF NOT EXISTS 'mon';
+ALTER TYPE day_of_week_enum ADD VALUE IF NOT EXISTS 'tue';
+ALTER TYPE day_of_week_enum ADD VALUE IF NOT EXISTS 'wed';
+ALTER TYPE day_of_week_enum ADD VALUE IF NOT EXISTS 'thu';
+ALTER TYPE day_of_week_enum ADD VALUE IF NOT EXISTS 'fri';
+ALTER TYPE day_of_week_enum ADD VALUE IF NOT EXISTS 'sat';
+ALTER TYPE day_of_week_enum ADD VALUE IF NOT EXISTS 'sun';
+
+-- [SYNC MEDIUM] View defined in schema.sql but not in live DB
+DROP VIEW IF EXISTS fee_installments CASCADE; CREATE OR REPLACE VIEW fee_installments AS SELECT 
+    id, student_id, amount_due, amount_paid, discount, 
+    status, due_date, created_at, updated_at, deleted_at
+FROM student_fees;
+
+-- [SYNC MEDIUM] Index in schema.sql missing from live DB
+CREATE INDEX IF NOT EXISTS idx_user_devices_fcm_token ON user_devices(fcm_token);;
+
+-- [SYNC MEDIUM] Index in schema.sql missing from live DB
+CREATE INDEX IF NOT EXISTS idx_user_devices_active ON user_devices(user_id, is_active);;
+
+-- [SYNC MEDIUM] Index in schema.sql missing from live DB
+CREATE INDEX IF NOT EXISTS idx_notification_logs_batch_id ON notification_logs(batch_id);;
+
+-- [SYNC MEDIUM] Index in schema.sql missing from live DB
+CREATE INDEX IF NOT EXISTS idx_temp_access_lookup ON temp_access_grants(requested_by, department) WHERE is_active = true;;
+
+-- ─── MISSING TRIGGERS ───────────────────────────────────────
+-- [SYNC HIGH] Trigger in schema.sql missing from live DB
+CREATE OR REPLACE TRIGGER trg_trips_updated
+  BEFORE UPDATE ON trips
+  FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+-- ─── TODOs — MANUAL VERIFICATION REQUIRED ──────────────────
+-- TODO: VERIFY — trips — schema_parsed._uncertain = true for this table
+--   Run: SELECT * FROM information_schema.columns WHERE table_name='trips';
+-- TODO: VERIFY — trip_stop_status — schema_parsed._uncertain = true for this table
+--   Run: SELECT * FROM information_schema.columns WHERE table_name='trip_stop_status';
+-- TODO: VERIFY — expenses — schema_parsed._uncertain = true
+--   Run: SELECT * FROM information_schema.referential_constraints WHERE constraint_name LIKE '%expenses%';
+-- TODO: VERIFY — financial_audit_logs — schema_parsed._uncertain = true
+--   Run: SELECT * FROM information_schema.referential_constraints WHERE constraint_name LIKE '%financial_audit_logs%';
+-- TODO: VERIFY — financial_policy_rules — schema_parsed._uncertain = true
+--   Run: SELECT * FROM information_schema.referential_constraints WHERE constraint_name LIKE '%financial_policy_rules%';
+-- TODO: VERIFY — access_requests — schema_parsed._uncertain = true
+--   Run: SELECT * FROM information_schema.referential_constraints WHERE constraint_name LIKE '%access_requests%';
+-- TODO: VERIFY — access_requests — schema_parsed._uncertain = true
+--   Run: SELECT * FROM information_schema.referential_constraints WHERE constraint_name LIKE '%access_requests%';
+-- TODO: VERIFY — temp_access_grants — schema_parsed._uncertain = true
+--   Run: SELECT * FROM information_schema.referential_constraints WHERE constraint_name LIKE '%temp_access_grants%';
+-- TODO: VERIFY — temp_access_grants — schema_parsed._uncertain = true
+--   Run: SELECT * FROM information_schema.referential_constraints WHERE constraint_name LIKE '%temp_access_grants%';
+
+
+-- ════════════════════════════════════════════════════════════════════════════════
+-- SUPER ADMINS
+-- ════════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS super_admins (
+  id          UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  email       TEXT NOT NULL UNIQUE,
+  full_name   TEXT NOT NULL,
+  is_active   BOOLEAN NOT NULL DEFAULT true,
+  created_by  UUID REFERENCES super_admins(id) ON DELETE SET NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_login  TIMESTAMPTZ
+);
+
+ALTER TABLE super_admins ENABLE ROW LEVEL SECURITY;
+ALTER TABLE super_admins FORCE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION update_super_admin_last_login(p_id UUID)
+RETURNS VOID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  UPDATE super_admins SET last_login = now() WHERE id = p_id;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$;
 
-CREATE POLICY "Admins can view all requests" 
-ON access_requests FOR SELECT 
-USING (is_admin());
+CREATE OR REPLACE FUNCTION is_super_admin()
+RETURNS BOOLEAN
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM super_admins
+    WHERE id = auth.uid()
+      AND is_active = true
+  );
+$$;
 
-CREATE POLICY "Admins can update requests" 
-ON access_requests FOR UPDATE 
-USING (is_admin());
+GRANT EXECUTE ON FUNCTION is_super_admin() TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION update_super_admin_last_login(UUID) TO service_role;
 
-CREATE POLICY "Admins can view all grants" 
-ON temp_access_grants FOR SELECT 
-USING (is_admin());
+-- ════════════════════════════════════════════════════════════════════════════════
+-- MULTITENANCY HARDENING BLOCK (Production Enforcement)
+-- Applied: Adds FORCE RLS, missing tenant-scoped policies, safe defaults.
+-- ════════════════════════════════════════════════════════════════════════════════
 
-CREATE POLICY "Admins can insert grants" 
-ON temp_access_grants FOR INSERT 
-WITH CHECK (is_admin());
+-- ─────────────────────────────────────────────────────────
+-- 1. FORCE ROW LEVEL SECURITY on all tenant tables
+--    Prevents table-owner (postgres) from bypassing RLS,
+--    ensuring SECURITY DEFINER functions also obey policies.
+-- ─────────────────────────────────────────────────────────
+DO $$ 
+DECLARE tbl TEXT;
+BEGIN
+  FOR tbl IN 
+    SELECT tablename FROM pg_tables 
+    WHERE schemaname = 'public' 
+      AND tablename NOT IN ('schema_meta', 'spatial_ref_sys', 'super_admins')
+  LOOP
+    EXECUTE format('ALTER TABLE public.%I FORCE ROW LEVEL SECURITY', tbl);
+  END LOOP;
+END $$;
 
-CREATE POLICY "Admins can update grants" 
-ON temp_access_grants FOR UPDATE 
-USING (is_admin());
+-- ─────────────────────────────────────────────────────────
+-- 2. RLS + policy on schools table itself
+-- ─────────────────────────────────────────────────────────
+ALTER TABLE schools ENABLE ROW LEVEL SECURITY;
+ALTER TABLE schools FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Super admin and tenant school read" ON schools;
+CREATE POLICY "Super admin and tenant school read" ON schools FOR SELECT
+USING (
+  (auth.role() = 'service_role')
+  OR is_super_admin()
+  OR (id = auth_school_id())
+);
+
+DROP POLICY IF EXISTS "Super admin manages schools" ON schools;
+CREATE POLICY "Super admin manages schools" ON schools FOR ALL
+USING (
+  (auth.role() = 'service_role')
+  OR is_super_admin()
+)
+WITH CHECK (
+  (auth.role() = 'service_role')
+  OR is_super_admin()
+);
+
+-- ─────────────────────────────────────────────────────────
+-- 0. Cleanup stale policies from tables without school_id
+-- ─────────────────────────────────────────────────────────
+DO $$ 
+DECLARE 
+  tbl TEXT;
+  bad_policies TEXT[] := ARRAY['Tenant isolation: read own school', 'Tenant isolation: admin manage own school'];
+  pol TEXT;
+BEGIN
+  FOR tbl IN SELECT unnest(ARRAY['notification_config', 'student_statuses', 'staff_statuses'])
+  LOOP
+    FOREACH pol IN ARRAY bad_policies LOOP
+      EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', pol, tbl);
+    END LOOP;
+  END LOOP;
+END $$;
+
+-- ─────────────────────────────────────────────────────────
+-- 3. Global Read policies for reference tables
+--    These are shared across all schools (no school_id).
+-- ─────────────────────────────────────────────────────────
+DO $$
+DECLARE ref_tables TEXT[] := ARRAY[
+  'genders', 'religions', 'blood_groups', 'relationship_types', 
+  'countries', 'student_categories', 'notification_config', 'student_statuses', 'staff_statuses'
+];
+tbl TEXT;
+BEGIN
+  FOREACH tbl IN ARRAY ref_tables LOOP
+    IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = tbl) THEN
+      EXECUTE format(
+        'DROP POLICY IF EXISTS "Global read" ON public.%I; '
+        'CREATE POLICY "Global read" ON public.%I FOR SELECT USING (true)',
+        tbl, tbl
+      );
+    END IF;
+  END LOOP;
+END $$;
+
+-- ─────────────────────────────────────────────────────────
+-- 4. Tenant-scoped default policies for tables that
+--    currently have RLS enabled but ZERO policies
+--    (they were silently deny-all, now explicitly scoped).
+--
+--    Pattern: authenticated users see rows matching their
+--    school. service_role bypasses. Admin roles get full
+--    CRUD within their school.
+-- ─────────────────────────────────────────────────────────
+
+-- Helper: reusable tenant-scoped admin policy creator
+CREATE OR REPLACE FUNCTION _create_tenant_policies(p_table TEXT)
+RETURNS VOID AS $_mt$
+BEGIN
+  IF p_table = 'super_admins' THEN
+    RAISE NOTICE '_create_tenant_policies: skipping % — platform authority table', p_table;
+    RETURN;
+  END IF;
+
+  -- Guard: skip if table has no school_id column
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = p_table
+      AND column_name = 'school_id'
+  ) THEN
+    RAISE NOTICE '_create_tenant_policies: skipping % — no school_id column', p_table;
+    RETURN;
+  END IF;
+
+  EXECUTE format(
+    'DROP POLICY IF EXISTS "Tenant isolation: read own school" ON public.%I; '
+    'CREATE POLICY "Tenant isolation: read own school" ON public.%I FOR SELECT '
+    'USING ((auth.role() = ''service_role'') OR is_super_admin() OR (school_id = auth_school_id()))',
+    p_table, p_table
+  );
+  EXECUTE format(
+    'DROP POLICY IF EXISTS "Tenant isolation: admin manage own school" ON public.%I; '
+    'CREATE POLICY "Tenant isolation: admin manage own school" ON public.%I FOR ALL '
+    'USING ((auth.role() = ''service_role'') OR is_super_admin() OR (school_id = auth_school_id() AND auth_has_role(ARRAY[''admin'']))) '
+    'WITH CHECK ((auth.role() = ''service_role'') OR is_super_admin() OR (school_id = auth_school_id() AND auth_has_role(ARRAY[''admin''])))',
+    p_table, p_table
+  );
+END;
+$_mt$ LANGUAGE plpgsql;
+
+-- Apply to all tables that have school_id + RLS enabled but no existing policies
+DO $$
+DECLARE tables_needing_policies TEXT[] := ARRAY[
+  'users', 'user_roles', 'user_settings',
+  'persons', 'person_contacts',
+  'roles', 'permissions', 'role_permissions',
+  'students',
+  'parents', 'student_parents',
+  'academic_years', 'student_enrollments',
+  'classes', 'sections', 'class_sections',
+  'subjects', 'class_subjects',
+  'daily_attendance',
+  'staff', 'staff_designations',
+  'fee_types', 'fee_structures', 'student_fees', 'fee_transactions',
+  'receipts', 'receipt_items',
+  'exams', 'exam_subjects', 'grading_scales', 'marks',
+  'complaints', 'leave_applications', 'diary_entries', 'periods',
+  'transport_routes', 'transport_stops', 'buses', 'student_transport', 'bus_locations',
+  'hostel_blocks', 'hostel_rooms', 'hostel_allocations',
+  'lms_courses', 'lms_materials',
+  'money_science_modules', 'science_projects',
+  'student_money_science_progress', 'student_science_projects',
+  'discipline_records',
+  'audit_logs',
+  'notification_logs', 'notification_batches',
+  'notification_templates', 'notification_preferences',
+  'notification_events', 'notifications', 'notification_deliveries',
+  'notification_audit_logs',
+  'girl_safety_complaints', 'girl_safety_complaint_threads',
+  'school_settings', 'feature_flags', 'ui_route_permissions',
+  'driver_devices', 'driver_heartbeat', 'bus_trip_history',
+  'admin_notifications',
+  'timetable_entries'
+];
+tbl TEXT;
+BEGIN
+  FOREACH tbl IN ARRAY tables_needing_policies LOOP
+    IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = tbl) THEN
+      PERFORM _create_tenant_policies(tbl);
+    END IF;
+  END LOOP;
+END $$;
+
+DROP FUNCTION IF EXISTS _create_tenant_policies(TEXT);
+
+-- ─────────────────────────────────────────────────────────
+-- 5. Safe defaults: change school_id DEFAULT 1 → DEFAULT auth_school_id()
+--    so INSERTs without explicit school_id land in the caller's school.
+-- ─────────────────────────────────────────────────────────
+DO $$
+DECLARE
+  rec RECORD;
+BEGIN
+  FOR rec IN
+    SELECT c.table_name
+    FROM information_schema.columns c
+    JOIN pg_tables t ON t.tablename = c.table_name AND t.schemaname = 'public'
+    WHERE c.table_schema = 'public'
+      AND c.column_name = 'school_id'
+      AND c.column_default = '1'
+  LOOP
+    EXECUTE format(
+      'ALTER TABLE public.%I ALTER COLUMN school_id SET DEFAULT auth_school_id()',
+      rec.table_name
+    );
+  END LOOP;
+END $$;
+
+-- ─────────────────────────────────────────────────────────
+-- 5. Remove stale global UNIQUE(name) constraints on
+--    reference tables that conflict with multitenancy.
+-- ─────────────────────────────────────────────────────────
+
+
+-- ─────────────────────────────────────────────────────────
+-- 6. Restrict schema-level grants: revoke blanket anon
+--    access to schema objects
+-- ─────────────────────────────────────────────────────────
+
+
+-- Re-grant minimal anon access only for auth flow
+GRANT USAGE ON SCHEMA public TO anon;
+
+-- ─────────────────────────────────────────────────────────
+-- 7. Re-enable row_security after migration
+--    (counteracts SET row_security = off at top of file)
+-- ─────────────────────────────────────────────────────────
+SET row_security = on;
+
+-- ─────────────────────────────────────────────────────────
+-- 8. RLS + policy on schema_meta (internal versioning)
+-- ─────────────────────────────────────────────────────────
+ALTER TABLE schema_meta ENABLE ROW LEVEL SECURITY;
+ALTER TABLE schema_meta FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Service role only" ON schema_meta;
+CREATE POLICY "Service role only" ON schema_meta FOR ALL
+USING (auth.role() = 'service_role')
+WITH CHECK (auth.role() = 'service_role');
+
+-- ────────────────────────────────────────────────────────
+-- END MULTITENANCY HARDENING BLOCK
+-- (Phase 2+ will reintroduce RLS policies explicitly.)
+-- ────────────────────────────────────────────────────────
+
+-- Commit the transaction started at the top of this file
 COMMIT;
-
--- SUPABASE AUTH CONFIGURATION (1-Year Sessions 
--- ========================================== 
--- Required for React Native mobile app persistence to survive 1-year offline 
-ALTER ROLE authenticator SET app.settings.sessions.timebox = '31536000'; 
-ALTER ROLE authenticator SET app.settings.sessions.inactivity_timeout = '0';

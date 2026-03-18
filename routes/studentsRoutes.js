@@ -1,6 +1,7 @@
 import express from 'express';
 import sql, { supabaseAdmin } from '../db.js';
 import { requirePermission, requireAuth } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 
 const router = express.Router();
 
@@ -10,7 +11,7 @@ router.get('/', requirePermission('students.view'), async (req, res) => {
     const { search, limit = 20, page = 1, class_id, section_id, status_id, sort_by = 'name', sort_order = 'asc' } = req.query;
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
-    let whereClause = sql`s.deleted_at IS NULL`;
+    let whereClause = sql`s.deleted_at IS NULL AND s.school_id = ${req.schoolId}`;
 
     if (class_id) {
       whereClause = sql`${whereClause} AND c.id = ${class_id}`;
@@ -91,7 +92,7 @@ router.get('/', requirePermission('students.view'), async (req, res) => {
       WHERE ${whereClause}
     `;
 
-    res.json({
+    sendSuccess(res, req.schoolId, {
       data: students,
       meta: {
         total: countResult.total,
@@ -110,7 +111,7 @@ router.get('/', requirePermission('students.view'), async (req, res) => {
 router.get('/statuses', requirePermission('students.view'), async (req, res) => {
   try {
     const statuses = await sql`SELECT id, code as name FROM student_statuses ORDER BY id`;
-    res.json(statuses);
+    sendSuccess(res, req.schoolId, statuses);
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to fetch student statuses' });
@@ -123,10 +124,17 @@ router.get('/profile/me', requireAuth, async (req, res) => {
     const userId = req.user.id;
 
     // Get Person ID -> Student ID
-    const [userRecord] = await sql`SELECT person_id FROM users WHERE id = ${userId}`;
+    const [userRecord] = await sql`
+      SELECT person_id
+      FROM users
+      WHERE id = ${userId}
+        AND school_id = ${req.schoolId}
+        AND deleted_at IS NULL
+    `;
     if (!userRecord) return res.status(404).json({ error: 'User not found' });
 
-    const [studentRecord] = await sql`SELECT id FROM students WHERE person_id = ${userRecord.person_id}`;
+    // S1 FIX: Add school_id filter to student lookup to prevent cross-school profile access
+    const [studentRecord] = await sql`SELECT id FROM students WHERE person_id = ${userRecord.person_id} AND school_id = ${req.schoolId}`;
     if (!studentRecord) return res.status(404).json({ error: 'Student profile not found for this user' });
 
     const id = studentRecord.id;
@@ -198,11 +206,11 @@ router.get('/profile/me', requireAuth, async (req, res) => {
       FROM students s
       JOIN persons p ON s.person_id = p.id
       JOIN student_statuses st ON s.status_id = st.id
-      WHERE s.id = ${id}
+      WHERE s.id = ${id} AND s.school_id = ${req.schoolId}
     `;
 
     if (student.length === 0) return res.status(404).json({ error: 'Student not found' });
-    res.json(student[0]);
+    sendSuccess(res, req.schoolId, student[0]);
 
   } catch (error) {
 
@@ -221,7 +229,7 @@ router.get('/unenrolled', requirePermission('students.view'), async (req, res) =
     let targetAcademicYearId = academic_year_id;
 
     if (!targetAcademicYearId) {
-      const [ay] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
+      const [ay] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date AND school_id = ${req.schoolId} LIMIT 1`;
       if (ay) targetAcademicYearId = ay.id;
     }
 
@@ -239,6 +247,7 @@ router.get('/unenrolled', requirePermission('students.view'), async (req, res) =
             JOIN persons p ON s.person_id = p.id
             JOIN student_statuses st ON s.status_id = st.id
             WHERE s.deleted_at IS NULL
+            AND s.school_id = ${req.schoolId}
             AND st.code = 'active'
             AND NOT EXISTS (
                 SELECT 1 FROM student_enrollments se 
@@ -250,7 +259,7 @@ router.get('/unenrolled', requirePermission('students.view'), async (req, res) =
             ORDER BY p.first_name ASC
         `;
 
-    res.json(unenrolledStudents);
+    sendSuccess(res, req.schoolId, unenrolledStudents);
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to fetch unenrolled students' });
@@ -291,14 +300,14 @@ router.get('/:id', requirePermission('students.view'), async (req, res) => {
       FROM students s
       JOIN persons p ON s.person_id = p.id
       JOIN student_statuses st ON s.status_id = st.id
-      WHERE s.id = ${id}
+      WHERE s.id = ${id} AND s.school_id = ${req.schoolId}
     `;
 
     if (student.length === 0) {
       return res.status(404).json({ error: 'Student not found' });
     }
 
-    res.json(student[0]);
+    sendSuccess(res, req.schoolId, student[0]);
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to fetch student' });
@@ -327,7 +336,7 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
     }
 
     // Check for duplicate Admission Number
-    const [existingAdm] = await sql`SELECT id FROM students WHERE admission_no = ${admission_no} AND deleted_at IS NULL`;
+    const [existingAdm] = await sql`SELECT id FROM students WHERE admission_no = ${admission_no} AND school_id = ${req.schoolId} AND deleted_at IS NULL`;
     if (existingAdm) {
       return res.status(400).json({ error: `Admission Number '${admission_no}' already exists.` });
     }
@@ -335,9 +344,9 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
     const result = await sql.begin(async (sql) => {
       // 1. Create Person
       const [person] = await sql`
-        INSERT INTO persons (first_name, middle_name, last_name, dob, gender_id, display_name)
+        INSERT INTO persons (school_id, first_name, middle_name, last_name, dob, gender_id, display_name)
         VALUES (
-            ${first_name}, ${middle_name}, ${last_name}, ${dob}, ${gender_id}, 
+            ${req.schoolId}, ${first_name}, ${middle_name}, ${last_name}, ${dob}, ${gender_id}, 
             ${first_name + ' ' + last_name}
         )
         RETURNING id
@@ -346,11 +355,11 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
       // 2. Create Student
       const [student] = await sql`
         INSERT INTO students (
-          person_id, admission_no, admission_date, status_id, 
+          school_id, person_id, admission_no, admission_date, status_id, 
           category_id, religion_id, blood_group_id
         )
         VALUES (
-          ${person.id}, ${admission_no}, ${admission_date}, ${status_id},
+          ${req.schoolId}, ${person.id}, ${admission_no}, ${admission_date}, ${status_id},
           ${category_id}, ${religion_id}, ${blood_group_id}
         )
         RETURNING *
@@ -358,10 +367,10 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
 
       // 3. Contacts
       if (email) {
-        await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) VALUES (${person.id}, 'email', ${email}, true)`;
+        await sql`INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary) VALUES (${req.schoolId}, ${person.id}, 'email', ${email}, true)`;
       }
       if (phone) {
-        await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) VALUES (${person.id}, 'phone', ${phone}, true)`;
+        await sql`INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary) VALUES (${req.schoolId}, ${person.id}, 'phone', ${phone}, true)`;
       }
 
       // 4. Create User Login (Optional)
@@ -407,17 +416,17 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
         // Check if local user already exists (consistency check)
         const [existingLocalUser] = await sql`SELECT id FROM users WHERE id = ${authUserId}`;
         if (!existingLocalUser) {
-          const [user] = await sql`
-              INSERT INTO users (id, person_id, account_status)
-              VALUES (${authUserId}, ${person.id}, 'active')
+           const [user] = await sql`
+              INSERT INTO users (id, school_id, person_id, account_status)
+              VALUES (${authUserId}, ${req.schoolId}, ${person.id}, 'active')
               RETURNING id
             `;
           // Assign Role
           const roleCode = role_code || 'student';
-          const [role] = await sql`SELECT id FROM roles WHERE code = ${roleCode}`;
+          const [role] = await sql`SELECT id FROM roles WHERE code = ${roleCode} AND school_id = ${req.schoolId}`;
 
           if (role) {
-            await sql`INSERT INTO user_roles (user_id, role_id) VALUES (${user.id}, ${role.id})`;
+            await sql`INSERT INTO user_roles (user_id, role_id, school_id) VALUES (${user.id}, ${role.id}, ${req.schoolId})`;
           }
         }
       }
@@ -428,7 +437,7 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
 
       // 5a. Resolve Academic Year if not provided
       if (!targetAcademicYearId) {
-        const [ay] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
+        const [ay] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date AND school_id = ${req.schoolId} LIMIT 1`;
         if (ay) targetAcademicYearId = ay.id;
       }
 
@@ -449,6 +458,7 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
                 WHERE class_id = ${class_id} 
                 AND section_id = ${section_id} 
                 AND academic_year_id = ${targetAcademicYearId}
+                AND school_id = ${req.schoolId}
             `;
 
           if (!cs) {
@@ -462,7 +472,7 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
             const [rollData] = await sql`
                     SELECT COALESCE(MAX(roll_number), 0) + 1 as next_roll 
                     FROM student_enrollments 
-                    WHERE class_section_id = ${targetClassSectionId} 
+                    WHERE class_section_id = ${targetClassSectionId} AND school_id = ${req.schoolId} 
                     AND academic_year_id = ${targetAcademicYearId}
                     AND deleted_at IS NULL
                 `;
@@ -481,8 +491,8 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
 
       if (targetAcademicYearId) {
         await sql`
-            INSERT INTO student_enrollments (student_id, class_section_id, academic_year_id, status, start_date, roll_number)
-            VALUES (${student.id}, ${targetClassSectionId}, ${targetAcademicYearId}, ${enrollmentStatus}, ${admission_date}, ${nextRoll})
+            INSERT INTO student_enrollments (school_id, student_id, class_section_id, academic_year_id, status, start_date, roll_number)
+    VALUES (${req.schoolId}, ${student.id}, ${targetClassSectionId}, ${targetAcademicYearId}, ${enrollmentStatus}, ${admission_date}, ${nextRoll})
          `;
       } else {
 
@@ -494,11 +504,11 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
           // Check if mandatory fields exist
           if (!parentData.first_name || !parentData.last_name || !parentData.relation) continue;
 
-          // 6a. Create Parent Person
+          // S2 FIX: Add school_id to parent person INSERT
           const [parentPerson] = await sql`
-                INSERT INTO persons (first_name, last_name, gender_id, display_name)
+                INSERT INTO persons (school_id, first_name, last_name, gender_id, display_name)
                 VALUES (
-                    ${parentData.first_name}, ${parentData.last_name}, 
+                    ${req.schoolId}, ${parentData.first_name}, ${parentData.last_name},
                     ${parentData.relation === 'Mother' ? 2 : 1}, -- Rudimentary gender logic
                     ${parentData.first_name + ' ' + parentData.last_name}
                 )
@@ -508,15 +518,16 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
           // 6b. Add Parent Contact (Phone)
           if (parentData.phone) {
             await sql`
-                    INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) 
-                    VALUES (${parentPerson.id}, 'phone', ${parentData.phone}, true)
+                    INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary) 
+                    VALUES (${req.schoolId}, ${parentPerson.id}, 'phone', ${parentData.phone}, true)
                  `;
           }
 
           // 6c. Create Parent Record
+          // S2 FIX: Add school_id to parents INSERT
           const [parentRecord] = await sql`
-                INSERT INTO parents (person_id, occupation)
-                VALUES (${parentPerson.id}, ${parentData.occupation || null})
+                INSERT INTO parents (school_id, person_id, occupation)
+                VALUES (${req.schoolId}, ${parentPerson.id}, ${parentData.occupation || null})
                 RETURNING id
             `;
 
@@ -525,9 +536,9 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
           const relId = relationshipMap[parentData.relation] || 3;
 
           await sql`
-                INSERT INTO student_parents (student_id, parent_id, relationship_id, is_primary_contact, is_legal_guardian)
+                INSERT INTO student_parents (school_id, student_id, parent_id, relationship_id, is_primary_contact, is_legal_guardian)
                 VALUES (
-                    ${student.id}, ${parentRecord.id}, ${relId}, 
+                    ${req.schoolId}, ${student.id}, ${parentRecord.id}, ${relId}, 
                     ${parentData.is_primary || false}, 
                     ${parentData.is_guardian || false}
                 )
@@ -547,11 +558,12 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
       }
     }
 
-    res.status(201).json({
+    sendSuccess(res, req.schoolId, {
       message: 'Student created successfully',
       student: result
-    });
+    }, 201);
   } catch (error) {
+    console.error('[POST /students] Error:', error.message, error.stack);
     res.status(500).json({ error: 'Failed to create student', details: error.message });
   }
 });
@@ -566,14 +578,14 @@ router.post('/recalculate-rolls', requirePermission('students.create'), async (r
 
     const [classSection] = await sql`
             SELECT id FROM class_sections 
-            WHERE class_id = ${class_id} AND section_id = ${section_id}
+            WHERE class_id = ${class_id} AND section_id = ${section_id} AND school_id = ${req.schoolId}
         `;
 
     if (!classSection) return res.status(404).json({ error: 'Class section not found' });
 
     await sql`SELECT recalculate_section_rolls(${classSection.id}, ${academic_year_id})`;
 
-    res.json({ message: 'Roll numbers recalculated successfully' });
+    sendSuccess(res, req.schoolId, { message: 'Roll numbers recalculated successfully' });
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to recalculate rolls' });
@@ -590,23 +602,33 @@ router.put('/:id', requirePermission('students.edit'), async (req, res) => {
       email, phone
     } = req.body;
 
-    const result = await sql.begin(async (sql) => {
-      // 1. Get Person ID from Student
-      const [student] = await sql`SELECT person_id FROM students WHERE id = ${id}`;
-      if (!student) throw new Error('Student not found');
+    // Ownership check must short-circuit as 404, not throw into catch/500.
+    const [student] = await sql`
+      SELECT id, person_id
+      FROM students
+      WHERE id = ${id}
+        AND school_id = ${req.schoolId}
+        AND deleted_at IS NULL
+    `;
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
 
-      const personId = student.person_id;
+    const personId = student.person_id;
+
+    const result = await sql.begin(async (sql) => {
 
       // 2. Update Person
       await sql`
         UPDATE persons
         SET 
-          first_name = COALESCE(${first_name}, first_name),
-          middle_name = COALESCE(${middle_name}, middle_name),
-          last_name = COALESCE(${last_name}, last_name),
-          dob = COALESCE(${dob}, dob),
-          gender_id = COALESCE(${gender_id}, gender_id)
+          first_name = COALESCE(${first_name ?? null}, first_name),
+          middle_name = COALESCE(${middle_name ?? null}, middle_name),
+          last_name = COALESCE(${last_name ?? null}, last_name),
+          dob = COALESCE(${dob ?? null}, dob),
+          gender_id = COALESCE(${gender_id ?? null}, gender_id)
         WHERE id = ${personId}
+          AND school_id = ${req.schoolId}
       `;
 
       // 3. Update Student
@@ -615,6 +637,7 @@ router.put('/:id', requirePermission('students.edit'), async (req, res) => {
         const [existingAdm] = await sql`
           SELECT id FROM students 
           WHERE admission_no = ${admission_no} 
+          AND school_id = ${req.schoolId}
           AND id != ${id} 
           AND deleted_at IS NULL
         `;
@@ -626,13 +649,14 @@ router.put('/:id', requirePermission('students.edit'), async (req, res) => {
       const [updatedStudent] = await sql`
         UPDATE students
         SET 
-          admission_no = COALESCE(${admission_no}, admission_no),
-          admission_date = COALESCE(${admission_date}, admission_date),
-          status_id = COALESCE(${status_id}, status_id),
-          category_id = COALESCE(${category_id}, category_id),
-          religion_id = COALESCE(${religion_id}, religion_id),
-          blood_group_id = COALESCE(${blood_group_id}, blood_group_id)
+          admission_no = COALESCE(${admission_no ?? null}, admission_no),
+          admission_date = COALESCE(${admission_date ?? null}, admission_date),
+          status_id = COALESCE(${status_id ?? null}, status_id),
+          category_id = COALESCE(${category_id ?? null}, category_id),
+          religion_id = COALESCE(${religion_id ?? null}, religion_id),
+          blood_group_id = COALESCE(${blood_group_id ?? null}, blood_group_id)
         WHERE id = ${id}
+          AND school_id = ${req.schoolId}
         RETURNING *
       `;
 
@@ -644,9 +668,10 @@ router.put('/:id', requirePermission('students.edit'), async (req, res) => {
            WHERE person_id = ${personId} AND contact_type = 'email' AND is_primary = true
         `;
         if (existingEmail) {
-          await sql`UPDATE person_contacts SET contact_value = ${email} WHERE id = ${existingEmail.id}`;
+          await sql`UPDATE person_contacts SET contact_value = ${email} WHERE id = ${existingEmail.id}
+      AND school_id = ${req.schoolId}`;
         } else {
-          await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) VALUES (${personId}, 'email', ${email}, true)`;
+          await sql`INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary) VALUES (${req.schoolId}, ${personId}, 'email', ${email}, true)`;
         }
       }
 
@@ -657,16 +682,17 @@ router.put('/:id', requirePermission('students.edit'), async (req, res) => {
            WHERE person_id = ${personId} AND contact_type = 'phone' AND is_primary = true
         `;
         if (existingPhone) {
-          await sql`UPDATE person_contacts SET contact_value = ${phone} WHERE id = ${existingPhone.id}`;
+          await sql`UPDATE person_contacts SET contact_value = ${phone} WHERE id = ${existingPhone.id}
+      AND school_id = ${req.schoolId}`;
         } else {
-          await sql`INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary) VALUES (${personId}, 'phone', ${phone}, true)`;
+          await sql`INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary) VALUES (${req.schoolId}, ${personId}, 'phone', ${phone}, true)`;
         }
       }
 
       return updatedStudent;
     });
 
-    res.json({
+    sendSuccess(res, req.schoolId, {
       message: 'Student updated successfully',
       student: result
     });
@@ -685,7 +711,7 @@ router.delete('/:id', requirePermission('students.delete'), async (req, res) => 
     const result = await sql`
       UPDATE students 
       SET deleted_at = NOW() 
-      WHERE id = ${id} 
+      WHERE id = ${id} AND school_id = ${req.schoolId}
       RETURNING id
     `;
 
@@ -693,7 +719,7 @@ router.delete('/:id', requirePermission('students.delete'), async (req, res) => 
       return res.status(404).json({ error: 'Student not found' });
     }
 
-    res.json({ message: 'Student deleted successfully' });
+    sendSuccess(res, req.schoolId, { message: 'Student deleted successfully' });
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to delete student', details: error.message });
@@ -715,9 +741,13 @@ router.post('/:id/enrollments', requirePermission('students.edit'), async (req, 
       return res.status(400).json({ error: 'Class and Section are required' });
     }
 
+    // Verify Ownership
+    const [studentCheck] = await sql`SELECT id FROM students WHERE id = ${id} AND school_id = ${req.schoolId} AND deleted_at IS NULL`;
+    if (!studentCheck) return res.status(404).json({ error: 'Student not found' });
+
     let targetAcademicYearId = academic_year_id;
     if (!targetAcademicYearId) {
-      const [ay] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
+      const [ay] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date AND school_id = ${req.schoolId} LIMIT 1`;
       if (ay) targetAcademicYearId = ay.id;
     }
 
@@ -729,6 +759,7 @@ router.post('/:id/enrollments', requirePermission('students.edit'), async (req, 
             WHERE class_id = ${class_id} 
             AND section_id = ${section_id} 
             AND academic_year_id = ${targetAcademicYearId}
+            AND school_id = ${req.schoolId}
         `;
 
     if (!cs) return res.status(404).json({ error: 'Class Section not found for this Academic Year' });
@@ -748,7 +779,7 @@ router.post('/:id/enrollments', requirePermission('students.edit'), async (req, 
     const [rollData] = await sql`
             SELECT COALESCE(MAX(roll_number), 0) + 1 as next_roll 
             FROM student_enrollments 
-            WHERE class_section_id = ${cs.id} 
+            WHERE class_section_id = ${cs.id} AND school_id = ${req.schoolId} 
             AND academic_year_id = ${targetAcademicYearId}
             AND deleted_at IS NULL
         `;
@@ -758,21 +789,21 @@ router.post('/:id/enrollments', requirePermission('students.edit'), async (req, 
     // Create Enrollment
     const [enrollment] = await sql`
             INSERT INTO student_enrollments (
-                student_id, class_section_id, academic_year_id, 
+                school_id, student_id, class_section_id, academic_year_id, 
                 status, start_date, roll_number
             )
             VALUES (
-                ${id}, ${cs.id}, ${targetAcademicYearId}, 
+                ${req.schoolId}, ${id}, ${cs.id}, ${targetAcademicYearId}, 
                 'active', NOW(), ${nextRoll}
             )
             RETURNING *
         `;
 
-    res.status(201).json({ message: 'Enrollment created', enrollment });
+    sendSuccess(res, req.schoolId, { message: 'Enrollment created', enrollment }, 201);
 
   } catch (error) {
-
-    res.status(500).json({ error: 'Failed to create enrollment' });
+    console.error('[POST /:id/enrollments] Error:', error.message, error.stack);
+    res.status(500).json({ error: 'Failed to create enrollment', details: error.message });
   }
 });
 
@@ -787,12 +818,16 @@ router.get('/:id/enrollments', requirePermission('students.view'), async (req, r
 
     // Resolve Auth ID to Student ID if needed
     if (req.user && (id === 'me' || id === req.user.internal_id)) {
-      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id}`;
+      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id} AND u.school_id = ${req.schoolId} AND s.school_id = ${req.schoolId}`;
       if (s) targetStudentId = s.id;
     }
 
+    // S3 FIX: Student ownership check before returning enrollment data
+    const [studentCheck] = await sql`SELECT id FROM students WHERE id = ${targetStudentId} AND school_id = ${req.schoolId} AND deleted_at IS NULL`;
+    if (!studentCheck) return res.status(404).json({ error: 'Student not found' });
+
     const enrollments = await sql`
-      SELECT 
+      SELECT
         se.id, se.status, se.start_date, se.end_date, se.created_at,
         c.name as class_name, s.name as section_name,
         ay.code as academic_year
@@ -802,11 +837,12 @@ router.get('/:id/enrollments', requirePermission('students.view'), async (req, r
       JOIN sections s ON cs.section_id = s.id
       JOIN academic_years ay ON se.academic_year_id = ay.id
       WHERE se.student_id = ${targetStudentId}
+        AND se.school_id = ${req.schoolId}
         AND se.deleted_at IS NULL
       ORDER BY se.start_date DESC
     `;
 
-    res.json(enrollments);
+    sendSuccess(res, req.schoolId, enrollments);
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to fetch enrollments' });
@@ -824,7 +860,7 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
 
     // Resolve Auth ID to Student ID if needed
     if (id === 'me' || id === req.user.internal_id) {
-      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id}`;
+      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id} AND u.school_id = ${req.schoolId} AND s.school_id = ${req.schoolId}`;
       if (s) targetStudentId = s.id;
     }
 
@@ -837,7 +873,7 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
             SELECT s.id 
             FROM students s
             JOIN users u ON s.person_id = u.person_id
-            WHERE u.id = ${req.user.internal_id}
+            WHERE u.id = ${req.user.internal_id} AND u.school_id = ${req.schoolId} AND s.school_id = ${req.schoolId}
         `;
       if (student && student.id === targetStudentId) {
         isOwner = true;
@@ -861,6 +897,7 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
         JOIN classes c ON cs.class_id = c.id
         JOIN sections s ON cs.section_id = s.id
         WHERE se.student_id = ${targetStudentId}
+          AND se.school_id = ${req.schoolId}
           AND da.attendance_date BETWEEN ${from_date} AND ${to_date}
           AND da.deleted_at IS NULL
         ORDER BY da.attendance_date DESC
@@ -876,6 +913,7 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
         JOIN classes c ON cs.class_id = c.id
         JOIN sections s ON cs.section_id = s.id
         WHERE se.student_id = ${targetStudentId}
+          AND se.school_id = ${req.schoolId}
           AND da.deleted_at IS NULL
         ORDER BY da.attendance_date DESC
         LIMIT ${limit}
@@ -892,10 +930,11 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
       FROM daily_attendance da
       JOIN student_enrollments se ON da.student_enrollment_id = se.id
       WHERE se.student_id = ${targetStudentId}
+        AND se.school_id = ${req.schoolId}
         AND da.deleted_at IS NULL
     `;
 
-    res.json({
+    sendSuccess(res, req.schoolId, {
       summary: summary[0],
       records: attendance
     });
@@ -922,7 +961,7 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
             SELECT s.id 
             FROM students s
             JOIN users u ON s.person_id = u.person_id
-            WHERE u.id = ${req.user.internal_id}
+            WHERE u.id = ${req.user.internal_id} AND u.school_id = ${req.schoolId} AND s.school_id = ${req.schoolId}
         `;
       if (student && student.id === id) {
         isOwner = true;
@@ -948,6 +987,7 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
         JOIN fee_structures fs ON sf.fee_structure_id = fs.id
         JOIN fee_types ft ON fs.fee_type_id = ft.id
         WHERE sf.student_id = ${targetStudentId}
+          AND sf.school_id = ${req.schoolId}
           AND fs.academic_year_id = ${academic_year_id}
         ORDER BY sf.due_date DESC
       `;
@@ -961,6 +1001,7 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
         JOIN fee_types ft ON fs.fee_type_id = ft.id
         JOIN academic_years ay ON fs.academic_year_id = ay.id
         WHERE sf.student_id = ${targetStudentId}
+          AND sf.school_id = ${req.schoolId}
         ORDER BY sf.due_date DESC
         LIMIT 20
       `;
@@ -974,9 +1015,10 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
         COALESCE(SUM(amount_due - discount - amount_paid), 0) as balance
       FROM student_fees
       WHERE student_id = ${targetStudentId}
+        AND school_id = ${req.schoolId}
     `;
 
-    res.json({
+    sendSuccess(res, req.schoolId, {
       student_id: targetStudentId,
       summary: summary[0],
       fees
@@ -994,6 +1036,13 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
 router.get('/:id/results', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    let targetStudentId = id;
+
+    // Resolve Auth ID to Student ID if needed (for "me" or internal_id)
+    if (req.user && (id === 'me' || id === req.user.internal_id)) {
+      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id} AND u.school_id = ${req.schoolId} AND s.school_id = ${req.schoolId}`;
+      if (s) targetStudentId = s.id;
+    }
 
     // Check access
     const hasViewPermission = req.user.permissions?.includes('students.view') || req.user.roles?.includes('admin');
@@ -1004,9 +1053,9 @@ router.get('/:id/results', requireAuth, async (req, res) => {
             SELECT s.id 
             FROM students s
             JOIN users u ON s.person_id = u.person_id
-            WHERE u.id = ${req.user.internal_id}
+            WHERE u.id = ${req.user.internal_id} AND u.school_id = ${req.schoolId} AND s.school_id = ${req.schoolId}
         `;
-      if (student && student.id === id) {
+      if (student && student.id === targetStudentId) {
         isOwner = true;
       }
     }
@@ -1020,7 +1069,7 @@ router.get('/:id/results', requireAuth, async (req, res) => {
     if (exam_id) {
       results = await sql`
         SELECT 
-          m.marks_obtained, m.is_absent,
+          m.marks_obtained, m.is_absent, m.remarks,
           s.name as subject_name,
           es.max_marks, es.passing_marks,
           e.name as exam_name
@@ -1028,7 +1077,6 @@ router.get('/:id/results', requireAuth, async (req, res) => {
         JOIN exam_subjects es ON m.exam_subject_id = es.id
         JOIN subjects s ON es.subject_id = s.id
         JOIN exams e ON es.exam_id = e.id
-        JOIN student_enrollments se ON m.student_enrollment_id = se.id
         JOIN student_enrollments se ON m.student_enrollment_id = se.id
         WHERE se.student_id = ${targetStudentId}
           AND es.exam_id = ${exam_id}
@@ -1055,7 +1103,7 @@ router.get('/:id/results', requireAuth, async (req, res) => {
       `;
     }
 
-    res.json({
+    sendSuccess(res, req.schoolId, {
       student_id: targetStudentId,
       results
     });
@@ -1076,7 +1124,7 @@ router.get('/:id/parents', requirePermission('students.view'), async (req, res) 
 
     // Resolve Auth ID to Student ID if needed
     if (req.user && (id === 'me' || id === req.user.internal_id)) {
-      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id}`;
+      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id} AND u.school_id = ${req.schoolId} AND s.school_id = ${req.schoolId}`;
       if (s) targetStudentId = s.id;
     }
 
@@ -1095,12 +1143,13 @@ router.get('/:id/parents', requirePermission('students.view'), async (req, res) 
       JOIN persons p ON pa.person_id = p.id
       LEFT JOIN relationship_types rt ON sp.relationship_id = rt.id
       WHERE sp.student_id = ${id}
+        AND pa.school_id = ${req.schoolId}
         AND sp.deleted_at IS NULL
         AND pa.deleted_at IS NULL
       ORDER BY sp.is_primary_contact DESC
     `;
 
-    res.json(parents);
+    sendSuccess(res, req.schoolId, parents);
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to fetch parents' });
@@ -1120,13 +1169,21 @@ router.post('/:id/parents', requirePermission('students.edit'), async (req, res)
       return res.status(400).json({ error: 'parent_id is required' });
     }
 
+    // Verify Ownership
+    const [studentCheck] = await sql`SELECT id FROM students WHERE id = ${id} AND school_id = ${req.schoolId} AND deleted_at IS NULL`;
+    if (!studentCheck) return res.status(404).json({ error: 'Student not found' });
+
+    // Verify parent belongs to this school
+    const [parentCheck] = await sql`SELECT id FROM parents WHERE id = ${parent_id} AND school_id = ${req.schoolId} AND deleted_at IS NULL`;
+    if (!parentCheck) return res.status(404).json({ error: 'Parent not found' });
+
     const [link] = await sql`
-      INSERT INTO student_parents (student_id, parent_id, relationship_id, is_primary_contact, is_legal_guardian)
-      VALUES (${id}, ${parent_id}, ${relationship_id}, ${is_primary_contact || false}, ${is_legal_guardian || false})
+      INSERT INTO student_parents (school_id, student_id, parent_id, relationship_id, is_primary_contact, is_legal_guardian)
+    VALUES (${req.schoolId}, ${id}, ${parent_id}, ${relationship_id}, ${is_primary_contact || false}, ${is_legal_guardian || false})
       RETURNING *
     `;
 
-    res.status(201).json({ message: 'Parent linked successfully', link });
+    sendSuccess(res, req.schoolId, { message: 'Parent linked successfully', link }, 201);
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to link parent', details: error.message });

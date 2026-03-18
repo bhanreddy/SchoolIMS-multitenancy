@@ -1,6 +1,7 @@
 import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
 import { translateFields } from '../services/geminiTranslator.js';
@@ -12,7 +13,7 @@ const router = express.Router();
  * List notices (filtered by audience/role)
  */
 router.get('/', requirePermission('notices.view'), asyncHandler(async (req, res) => {
-  const { audience, class_id, pinned_only, page = 1, limit = 20 } = req.query;
+  const { audience, class_id, pinned_only, lastSyncedAt, page = 1, limit = 20 } = req.query;
   const offset = (page - 1) * limit;
 
   const notices = await sql`
@@ -30,15 +31,17 @@ router.get('/', requirePermission('notices.view'), asyncHandler(async (req, res)
     JOIN users u ON n.created_by = u.id
     JOIN persons creator ON u.person_id = creator.id
     WHERE n.publish_at <= NOW()
+      AND n.school_id = ${req.schoolId}
       AND (n.expires_at IS NULL OR n.expires_at > NOW())
       ${audience ? sql`AND (n.audience = ${audience} OR n.audience = 'all')` : sql``}
       ${class_id ? sql`AND (n.target_class_id = ${class_id} OR n.target_class_id IS NULL)` : sql``}
       ${pinned_only === 'true' ? sql`AND n.is_pinned = true` : sql``}
+      ${lastSyncedAt ? sql`AND (n.created_at >= ${lastSyncedAt} OR n.publish_at >= ${lastSyncedAt})` : sql``}
     ORDER BY n.is_pinned DESC, n.publish_at DESC
     LIMIT ${limit} OFFSET ${offset}
   `;
 
-  res.json(notices);
+  return sendSuccess(res, req.schoolId, notices);
 }));
 
 /**
@@ -57,14 +60,14 @@ router.get('/:id', requirePermission('notices.view'), asyncHandler(async (req, r
     LEFT JOIN classes c ON n.target_class_id = c.id
     JOIN users u ON n.created_by = u.id
     JOIN persons creator ON u.person_id = creator.id
-    WHERE n.id = ${id}
+    WHERE n.id = ${id} AND n.school_id = ${req.schoolId}
   `;
 
   if (!notice) {
     return res.status(404).json({ error: 'Notice not found' });
   }
 
-  res.json(notice);
+  return sendSuccess(res, req.schoolId, notice);
 }));
 
 /**
@@ -102,8 +105,8 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
     }
 
     const [notice] = await sql`
-        INSERT INTO notices (title, content, title_te, content_te, audience, target_class_id, priority, is_pinned, publish_at, expires_at, created_by)
-        VALUES (${title}, ${content}, ${title_te}, ${content_te}, ${safeAudience}, ${safeTargetClassId}, 
+        INSERT INTO notices (school_id, title, content, title_te, content_te, audience, target_class_id, priority, is_pinned, publish_at, expires_at, created_by)
+        VALUES (${req.schoolId}, ${title}, ${content}, ${title_te}, ${content_te}, ${safeAudience}, ${safeTargetClassId}, 
                 ${safePriority}, ${is_pinned || false}, ${safePublishAt}, ${expires_at || null}, ${req.user.internal_id})
         RETURNING *
       `;
@@ -120,6 +123,9 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
              JOIN student_enrollments se ON s.id = se.student_id
              JOIN class_sections cs ON se.class_section_id = cs.id
              WHERE cs.class_id = ${safeTargetClassId}
+               AND cs.school_id = ${req.schoolId}
+               AND se.school_id = ${req.schoolId}
+               AND u.school_id = ${req.schoolId}
                AND se.status = 'active'
                AND u.account_status = 'active'
 
@@ -130,30 +136,53 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
              JOIN parents p ON u.person_id = p.person_id
              JOIN student_parents sp ON p.id = sp.parent_id
              JOIN students s ON sp.student_id = s.id
-             JOIN student_enrollments se ON s.id = se.class_section_id
+             JOIN student_enrollments se ON s.id = se.student_id
              JOIN class_sections cs ON se.class_section_id = cs.id
              WHERE cs.class_id = ${safeTargetClassId}
+               AND s.school_id = ${req.schoolId}
+               AND cs.school_id = ${req.schoolId}
+               AND se.school_id = ${req.schoolId}
+               AND u.school_id = ${req.schoolId}
                AND se.status = 'active'
+               AND u.account_status = 'active'
+           `;
+        } else if (safeAudience === 'students') {
+          recips = await sql`
+             SELECT DISTINCT u.id
+             FROM users u
+             JOIN students s ON u.person_id = s.person_id
+             JOIN student_enrollments se ON s.id = se.student_id
+             WHERE se.school_id = ${req.schoolId}
+               AND u.school_id = ${req.schoolId}
+               AND se.status = 'active'
+               AND u.account_status = 'active'
+           `;
+        } else if (safeAudience === 'parents') {
+          recips = await sql`
+             SELECT DISTINCT u.id
+             FROM users u
+             JOIN parents p ON u.person_id = p.person_id
+             JOIN student_parents sp ON p.id = sp.parent_id
+             JOIN students s ON sp.student_id = s.id
+             WHERE s.school_id = ${req.schoolId}
+               AND u.school_id = ${req.schoolId}
+               AND u.account_status = 'active'
+           `;
+        } else if (safeAudience === 'staff') {
+          recips = await sql`
+             SELECT DISTINCT u.id
+             FROM users u
+             JOIN staff s ON u.person_id = s.person_id
+             WHERE s.school_id = ${req.schoolId}
+               AND u.school_id = ${req.schoolId}
+               AND s.deleted_at IS NULL
                AND u.account_status = 'active'
            `;
         } else if (safeAudience === 'all') {
           recips = await sql`
              SELECT DISTINCT u.id
              FROM users u
-             JOIN students s ON u.person_id = s.person_id
-             JOIN student_enrollments se ON s.id = se.student_id
-             WHERE se.status = 'active'
-               AND u.account_status = 'active'
-
-             UNION
-
-             SELECT DISTINCT u.id
-             FROM users u
-             JOIN parents p ON u.person_id = p.person_id
-             JOIN student_parents sp ON p.id = sp.parent_id
-             JOIN students s ON sp.student_id = s.id
-             JOIN student_enrollments se ON s.id = se.student_id
-             WHERE se.status = 'active'
+             WHERE u.school_id = ${req.schoolId}
                AND u.account_status = 'active'
            `;
         }
@@ -171,7 +200,7 @@ router.post('/', requirePermission('notices.create'), asyncHandler(async (req, r
       }
     })();
 
-    res.status(201).json({ message: 'Notice created', notice });
+    return sendSuccess(res, req.schoolId, { message: 'Notice created', notice }, 201);
   } catch (err) {
 
     res.status(500).json({ error: 'Failed to create notice: ' + err.message });
@@ -209,13 +238,13 @@ router.put('/:id', requirePermission('notices.manage'), asyncHandler(async (req,
       content = COALESCE(${content || null}, content),
       title_te = ${sql_title_te},
       content_te = ${sql_content_te},
-      audience = COALESCE(${audience}, audience),
-      target_class_id = COALESCE(${target_class_id}, target_class_id),
-      priority = COALESCE(${priority}, priority),
-      is_pinned = COALESCE(${is_pinned}, is_pinned),
-      publish_at = COALESCE(${publish_at}, publish_at),
-      expires_at = COALESCE(${expires_at}, expires_at)
-    WHERE id = ${id}
+      audience = COALESCE(${audience ?? null}, audience),
+      target_class_id = COALESCE(${target_class_id ?? null}, target_class_id),
+      priority = COALESCE(${priority ?? null}, priority),
+      is_pinned = COALESCE(${is_pinned ?? null}, is_pinned),
+      publish_at = COALESCE(${publish_at ?? null}, publish_at),
+      expires_at = COALESCE(${expires_at ?? null}, expires_at)
+    WHERE id = ${id} AND school_id = ${req.schoolId}
     RETURNING *
   `;
 
@@ -223,7 +252,7 @@ router.put('/:id', requirePermission('notices.manage'), asyncHandler(async (req,
     return res.status(404).json({ error: 'Notice not found' });
   }
 
-  res.json({ message: 'Notice updated', notice: updated });
+  return sendSuccess(res, req.schoolId, { message: 'Notice updated', notice: updated });
 }));
 
 /**
@@ -233,13 +262,13 @@ router.put('/:id', requirePermission('notices.manage'), asyncHandler(async (req,
 router.delete('/:id', requirePermission('notices.manage'), asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  const [deleted] = await sql`DELETE FROM notices WHERE id = ${id} RETURNING id`;
+  const [deleted] = await sql`DELETE FROM notices WHERE id = ${id} AND school_id = ${req.schoolId} AND school_id = ${req.schoolId} RETURNING id`;
 
   if (!deleted) {
     return res.status(404).json({ error: 'Notice not found' });
   }
 
-  res.json({ message: 'Notice deleted' });
+  return sendSuccess(res, req.schoolId, { message: 'Notice deleted' });
 }));
 
 export default router;

@@ -1,23 +1,26 @@
 import express from 'express';
-import fs from 'fs'; // Trigger Restart 2
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
+import compression from 'compression';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import morgan from 'morgan';
+import pinoHttp from 'pino-http';
 import config from './config/env.js';
+import logger from './utils/logger.js';
 // Accept self-signed certificates in local development
-if (config.nodeEnv !== 'production') {
+if (!config.isProduction) {
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 }
-// Forced restart to pick up route changes
 import { identifyUser } from './middleware/auth.js';
+import { requireSchoolId } from './middleware/schoolId.js';
 import { auditLogger } from './middleware/audit.js';
 import { errorHandler } from './utils/asyncHandler.js';
+import { sendSuccess } from './utils/apiResponse.js';
 import sql from './db.js';
 
 const app = express();
@@ -26,11 +29,12 @@ const port = config.port;
 // Security Middleware
 app.set('trust proxy', 1);
 app.use(helmet());
+app.disable('x-powered-by');
 
 // Rate Limiting
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: config.nodeEnv === 'production' ? 100 : 1000,
+    max: config.isProduction ? 100 : 1000,
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many requests, please try again later.' },
@@ -38,22 +42,89 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-// Logging
-app.use(morgan(config.nodeEnv === 'production' ? 'combined' : 'dev'));
+// Structured HTTP logging + request id
+app.use(pinoHttp({
+    logger,
+    genReqId: (req, res) => {
+        const headerId = req.headers['x-request-id'] || req.headers['request-id'];
+        const id = (Array.isArray(headerId) ? headerId[0] : headerId) || `req_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+        res.setHeader('x-request-id', id);
+        return id;
+    },
+    // Only log essential request info (no giant header dumps)
+    serializers: {
+        req(req) {
+            return {
+                method: req.method,
+                url: req.url,
+            };
+        },
+        res(res) {
+            return {
+                statusCode: res.statusCode,
+            };
+        },
+    },
+    // Custom success / error messages
+    customSuccessMessage(req, res) {
+        const status = res.statusCode;
+        const icon = status < 300 ? '✅' : status < 400 ? '↪️' : '⛔';
+        const tag  = status < 400 ? 'OK' : 'FAIL';
+        const ms   = res[Symbol.for('pino-http.startTime')]
+            ? `${Date.now() - res[Symbol.for('pino-http.startTime')]}ms`
+            : '';
+        return `${icon} ${req.method.padEnd(7)} ${status} │ ${req.url}${ms ? `  (${ms})` : ''}`;
+    },
+    customErrorMessage(req, res, err) {
+        return `💥 ${req.method.padEnd(7)} ${res.statusCode} │ ${req.url}  ▸ ${err.message}`;
+    },
+    // Custom log level based on status code
+    customLogLevel(req, res, err) {
+        if (res.statusCode >= 500 || err) return 'error';
+        if (res.statusCode >= 400) return 'warn';
+        return 'info';
+    },
+    // Skip logging noisy health-check polls
+    autoLogging: {
+        ignore: (req) => req.url === '/api/v1/health',
+    },
+}));
 
 // CORS - Allow all origins for mobile app (Restrict in production if possible)
 app.use(cors({
-    origin: config.nodeEnv === 'production' ? process.env.ALLOWED_ORIGINS?.split(',') || '*' : '*',
+    origin: (origin, cb) => {
+        const allow = config.cors.allowedOrigins;
+        if (!allow || allow.length === 0) {
+            // If nothing configured, default to permissive only outside production.
+            return cb(config.isProduction ? new Error('CORS is not configured') : null, !config.isProduction);
+        }
+        if (allow.includes('*')) return cb(null, true);
+        if (!origin) return cb(null, true); // server-to-server / curl
+        return cb(null, allow.includes(origin));
+    },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-request-id']
 }));
 
 // Middleware
-app.use(express.json());
+app.use(compression());
+app.use(cookieParser());
+app.use(express.json({ limit: config.bodyLimit }));
 
-// Auth & Audit Middleware (Global)
-app.use(identifyUser);
-app.use(auditLogger);
+// Auth & Audit Middleware (Global — skip super-admin routes which have own auth)
+app.use((req, res, next) => {
+    if (req.path.startsWith('/api/super-admin')) return next();
+    identifyUser(req, res, next);
+});
+app.use((req, res, next) => {
+    if (req.path.startsWith('/api/super-admin')) return next();
+    requireSchoolId(req, res, next);
+});
+app.use((req, res, next) => {
+    if (req.path.startsWith('/api/super-admin')) return next();
+    auditLogger(req, res, next);
+});
+
 
 // Import routes
 import authRouter from './routes/authRoutes.js';
@@ -78,19 +149,22 @@ import adminRouter from './routes/adminRoutes.js';
 import notificationRouter from './routes/notificationRoutes.js';
 import aiRouter from './routes/aiRoutes.js';
 import analyticsRouter from './routes/analyticsRoutes.js';
+import adminAnalyticsRouter from './routes/adminAnalyticsRoutes.js';
 import adminNotificationRoutes from './routes/adminNotificationRoutes.js';
 import invoicesRouter from './routes/invoicesRoutes.js';
 import expensesRouter from './routes/expensesRoutes.js';
 import payrollRouter from './routes/payrollRoutes.js';
 import logRouter from './routes/logRoutes.js';
 import schoolSettingsRouter from './routes/schoolSettingsRoutes.js';
+import girlSafetyRouter from './routes/girlSafetyRoutes.js';
+import superAdminRouter from './routes/superAdminRoutes.js';
 
-// Health check endpoint
+// Health check endpoint (requires school_id per multi-tenant contract)
 app.get('/api/v1/health', async (req, res) => {
     try {
         // Check DB connectivity
         await sql`SELECT 1`;
-        res.json({
+        sendSuccess(res, req.schoolId, {
             status: 'healthy',
             timestamp: new Date().toISOString(),
             uptime: process.uptime(),
@@ -129,7 +203,8 @@ app.get('/', (req, res) => {
             hostel: '/api/v1/hostel',
             events: '/api/v1/events',
             lms: '/api/v1/lms',
-            health: '/api/v1/health'
+            health: '/api/v1/health',
+            girlSafety: '/api/v1/girl-safety'
         }
     });
 });
@@ -157,12 +232,15 @@ app.use('/api/v1/lms', lmsRouter);
 app.use('/api/v1/notifications', notificationRouter);
 app.use('/api/v1/ai', aiRouter);
 app.use('/api/v1/analytics', analyticsRouter);
+app.use('/api/v1/admin/analytics', adminAnalyticsRouter);
 app.use('/api/v1/admin/notifications', adminNotificationRoutes);
 app.use('/api/v1/invoices', invoicesRouter);
 app.use('/api/v1/expenses', expensesRouter);
 app.use('/api/v1/payroll', payrollRouter);
 app.use('/api/v1/log', logRouter);
 app.use('/api/v1/school-settings', schoolSettingsRouter);
+app.use('/api/v1/girl-safety', girlSafetyRouter);
+app.use('/api/super-admin', superAdminRouter);
 
 // Legacy routes (for backward compatibility)
 app.use('/students', studentsRouter);
@@ -178,29 +256,141 @@ app.use((req, res) => {
 
 // Global Error Handler
 app.use((err, req, res, next) => {
-    console.error(`[${new Date().toISOString()}] [ERROR] ${req.method} ${req.url} - ${err.stack || err.message}`);
+    req.log?.error({ err: err.message, stack: err.stack }, `❌ ${req.method} ${req.url} — Unhandled error`);
 
     // Call the original errorHandler utility
     errorHandler(err, req, res, next);
 });
 
-// Prevent server crash on unhandled promise rejection (e.g. transient DB ECONNRESET)
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('[unhandledRejection]', reason);
+// Prevent silent failures; let process manager restart in production
+process.on('unhandledRejection', (reason) => {
+    logger.error({ reason: reason?.message || reason }, '⚠️  Unhandled Promise Rejection');
+    if (config.isProduction) process.exit(1);
 });
 process.on('uncaughtException', (err) => {
-    console.error('[uncaughtException]', err);
-    // Do NOT exit — let the server keep running for transient errors
+    logger.fatal({ err: err.message }, '💥 Uncaught Exception — shutting down');
+    process.exit(1);
 });
 
-app.listen(port, async () => {
-    console.log(`🚀 Server listening on port ${port}`);
-    console.log(`📚 API Docs: http://localhost:${port}/`);
+// ── ANSI helpers ─────────────────────────────────────────────────────
+const c = {
+    reset:   '\x1b[0m',
+    bold:    '\x1b[1m',
+    dim:     '\x1b[2m',
+    italic:  '\x1b[3m',
+    underline:'\x1b[4m',
+    // Foreground
+    black:   '\x1b[30m',
+    red:     '\x1b[31m',
+    green:   '\x1b[32m',
+    yellow:  '\x1b[33m',
+    blue:    '\x1b[34m',
+    magenta: '\x1b[35m',
+    cyan:    '\x1b[36m',
+    white:   '\x1b[37m',
+    gray:    '\x1b[90m',
+    // Background
+    bgBlack: '\x1b[40m',
+    bgRed:   '\x1b[41m',
+    bgGreen: '\x1b[42m',
+    bgYellow:'\x1b[43m',
+    bgBlue:  '\x1b[44m',
+    bgMagenta:'\x1b[45m',
+    bgCyan:  '\x1b[46m',
+    bgWhite: '\x1b[47m',
+};
 
+const server = app.listen(port, async () => {
+    // ── Perform DB health check FIRST (this may trigger noisy logs) ──
+    let dbOk = false;
     try {
         await sql`SELECT 1`;
-        console.log('✅ Database connection successful');
+        dbOk = true;
     } catch (error) {
-        console.error('❌ Database connection failed at startup:', error);
+        logger.error({ error: error.message }, '❌ Database connection failed at startup');
     }
+
+    // ── Build the entire banner in a buffer, then flush once ─────────
+    const W = 60; // inner width (between the two border chars)
+    const hr  = '─'.repeat(W);
+    const dhr = '━'.repeat(W);
+
+    const pad = (text, w = W) => {
+        const visible = text.replace(/\x1b\[[0-9;]*m/g, ''); // strip ANSI for length
+        const remaining = w - visible.length;
+        const left = Math.floor(remaining / 2);
+        const right = remaining - left;
+        return ' '.repeat(Math.max(left, 0)) + text + ' '.repeat(Math.max(right, 0));
+    };
+
+    const row = (content) => `${c.cyan}│${c.reset}${content}${c.cyan}│${c.reset}`;
+
+    const kvRow = (icon, label, value, valueColor = c.white) => {
+        const strVal = String(value);
+        const left = `  ${icon} ${c.white}${label}${c.reset}`;
+        const right = `${valueColor}${c.bold}${strVal}${c.reset}`;
+        // visible length of left = 2 + icon(1) + 1 + label.length = 4 + label.length
+        // visible length of right = strVal.length
+        const leftVisible = 4 + label.length;
+        const rightVisible = strVal.length;
+        const gap = W - leftVisible - rightVisible;
+        return row(`${left}${' '.repeat(Math.max(gap, 1))}${right}`);
+    };
+
+    const now = new Date();
+    const ts = now.toLocaleTimeString('en-GB', { hour12: false });
+    const uptime = process.uptime();
+    const uptimeStr = uptime < 60 ? `${uptime.toFixed(1)}s` : `${(uptime / 60).toFixed(1)}m`;
+
+    const logo = [
+        `${c.bold}${c.cyan} ███╗   ██╗███████╗██╗  ██╗${c.magenta}███████╗██╗   ██╗██████╗ ${c.yellow}██╗   ██╗███████╗${c.reset}`,
+        `${c.bold}${c.cyan} ████╗  ██║██╔════╝╚██╗██╔╝${c.magenta}██╔════╝╚██╗ ██╔╝██╔══██╗${c.yellow}██║   ██║██╔════╝${c.reset}`,
+        `${c.bold}${c.cyan} ██╔██╗ ██║█████╗   ╚███╔╝ ${c.magenta}███████╗ ╚████╔╝ ██████╔╝${c.yellow}██║   ██║███████╗${c.reset}`,
+        `${c.bold}${c.cyan} ██║╚██╗██║██╔══╝   ██╔██╗ ${c.magenta}╚════██║  ╚██╔╝  ██╔══██╗${c.yellow}██║   ██║╚════██║${c.reset}`,
+        `${c.bold}${c.cyan} ██║ ╚████║███████╗██╔╝ ██╗${c.magenta}███████║   ██║   ██║  ██║${c.yellow}╚██████╔╝███████║${c.reset}`,
+        `${c.bold}${c.cyan} ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝${c.magenta}╚══════╝   ╚═╝   ╚═╝  ╚═╝${c.yellow} ╚═════╝ ╚══════╝${c.reset}`,
+    ];
+
+    const dbIcon  = dbOk ? `${c.green}●${c.reset}` : `${c.red}●${c.reset}`;
+    const dbLabel = dbOk ? 'ONLINE' : 'OFFLINE';
+    const dbColor = dbOk ? c.green : c.red;
+    const modeColor = config.isProduction ? c.red : c.green;
+
+    const lines = [
+        '',
+        ...logo,
+        `${c.dim}${'─'.repeat(76)}${c.reset}`,
+        `${c.cyan}┌${hr}┐${c.reset}`,
+        row(pad(`${c.bold}${c.white}v2.0.0${c.reset}  ${c.dim}·${c.reset}  ${c.gray}API Engine${c.reset}  ${c.dim}·${c.reset}  ${c.gray}${ts}${c.reset}`)),
+        `${c.cyan}├${hr}┤${c.reset}`,
+        row(`${' '.repeat(W)}`),
+        kvRow(`${c.cyan}⬡${c.reset}`, 'PORT ·············', String(port), c.cyan),
+        kvRow(`${modeColor}◆${c.reset}`, 'MODE ·············', config.nodeEnv.toUpperCase(), modeColor),
+        kvRow(`${c.yellow}◈${c.reset}`, 'LOG LEVEL ········', config.logLevel.toUpperCase(), c.yellow),
+        kvRow(dbIcon, 'DATABASE ·········', dbLabel, dbColor),
+        kvRow(`${c.magenta}◉${c.reset}`, 'UPTIME ···········', uptimeStr, c.magenta),
+        row(`${' '.repeat(W)}`),
+        `${c.cyan}├${hr}┤${c.reset}`,
+        row(pad(`${c.green}${c.bold}✦  SYSTEM READY  ✦${c.reset}`)),
+        `${c.cyan}└${hr}┘${c.reset}`,
+        '',
+    ];
+
+    // Flush the whole banner at once so nothing interrupts it
+    process.stdout.write(lines.join('\n') + '\n');
 });
+
+async function shutdown(signal) {
+    try {
+        logger.info({ signal }, 'Shutdown initiated');
+        server.close(() => logger.info('HTTP server closed'));
+        await sql.end({ timeout: 5 });
+        process.exit(0);
+    } catch (err) {
+        logger.error({ err }, 'Shutdown error');
+        process.exit(1);
+    }
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

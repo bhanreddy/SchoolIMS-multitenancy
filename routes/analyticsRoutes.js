@@ -1,53 +1,57 @@
 import express from 'express';
 import sql from '../db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
-import { requireAuth, requirePermission } from '../middleware/auth.js';
+import { requireAuth } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const router = express.Router();
 
 /**
  * GET /admin/analytics/risk
- * Get student risk profiles based on Attendance, Marks, and Discipline
+ * AN1: scoped students query to school_id
  */
 router.get('/risk', requireAuth, asyncHandler(async (req, res) => {
-    // 1. Fetch Risk Data Summary
-    // We analyze:
-    // - Attendance < 75% (Critical), < 85% (Warning)
-    // - Failed Subjects (Marks < 35)
-    // - Discipline Issues (derived from Complaints with 'high' or 'urgent' priority)
+    const schoolId = req.schoolId;
 
     const students = await sql`
         WITH attendance_stats AS (
-            SELECT 
+            SELECT
                 se.student_id,
                 COUNT(*) FILTER (WHERE da.status IN ('present', 'late', 'half_day'))::FLOAT / NULLIF(COUNT(*), 0) * 100 as attendance_pct
             FROM daily_attendance da
             JOIN student_enrollments se ON da.student_enrollment_id = se.id
+            JOIN students s ON se.student_id = s.id
             WHERE da.attendance_date > CURRENT_DATE - INTERVAL '60 days'
+              AND s.school_id = ${schoolId}
             GROUP BY se.student_id
         ),
         academic_stats AS (
-            SELECT 
+            SELECT
                 m.student_enrollment_id,
                 COUNT(*) FILTER (WHERE m.marks_obtained < 35) as failed_subjects,
-                json_agg(s.name) FILTER (WHERE m.marks_obtained < 35) as failed_subject_names
+                json_agg(sub.name) FILTER (WHERE m.marks_obtained < 35) as failed_subject_names
             FROM marks m
             JOIN exam_subjects es ON m.exam_subject_id = es.id
-            JOIN subjects s ON es.subject_id = s.id
+            JOIN subjects sub ON es.subject_id = sub.id
+            JOIN student_enrollments se ON m.student_enrollment_id = se.id
+            JOIN students s ON se.student_id = s.id
             WHERE m.created_at > CURRENT_DATE - INTERVAL '6 months'
+              AND s.school_id = ${schoolId}
             GROUP BY m.student_enrollment_id
         ),
         discipline_stats AS (
-            SELECT 
+            SELECT
                 c.raised_for_student_id as student_id,
                 COUNT(*) as incident_count,
                 MAX(CASE WHEN c.priority = 'urgent' THEN 2 WHEN c.priority = 'high' THEN 1 ELSE 0 END) as max_severity
             FROM complaints c
             WHERE c.created_at > CURRENT_DATE - INTERVAL '6 months'
               AND c.raised_for_student_id IS NOT NULL
+              AND c.school_id = ${schoolId}
             GROUP BY c.raised_for_student_id
         )
-        SELECT 
+        SELECT
             s.id,
             p.display_name as name,
             s.admission_no,
@@ -60,7 +64,7 @@ router.get('/risk', requireAuth, asyncHandler(async (req, res) => {
             (
                 SELECT COALESCE(json_agg(t.pct), '[]'::json)
                 FROM (
-                    SELECT (m.marks_obtained / es.max_marks * 100)::INT as pct
+                    SELECT (m.marks_obtained::FLOAT / es.max_marks * 100)::INT as pct
                     FROM marks m
                     JOIN exam_subjects es ON m.exam_subject_id = es.id
                     WHERE m.student_enrollment_id = se.id
@@ -78,13 +82,13 @@ router.get('/risk', requireAuth, asyncHandler(async (req, res) => {
         LEFT JOIN academic_stats acad ON se.id = acad.student_enrollment_id
         LEFT JOIN discipline_stats disc ON s.id = disc.student_id
         WHERE s.deleted_at IS NULL
+          AND s.school_id = ${schoolId}
     `;
 
     const riskProfiles = students.map(s => {
         let riskLevel = 'SAFE';
         let factors = [];
 
-        // Logic
         if (s.attendance_pct < 75) {
             riskLevel = 'CRITICAL';
             factors.push(`Attendance ${(s.attendance_pct || 0).toFixed(0)}%`);
@@ -98,15 +102,14 @@ router.get('/risk', requireAuth, asyncHandler(async (req, res) => {
             factors.push(`${s.failed_count} Failed Subjects`);
         } else if (s.failed_count === 1) {
             if (riskLevel !== 'CRITICAL') riskLevel = 'WARNING';
-            // Access nested json array if necessary, or just use 0 index if it works directly
             const subject = Array.isArray(s.failed_names) ? s.failed_names[0] : '';
             factors.push(`Failed ${subject}`);
         }
 
-        if (s.discipline_severity >= 2) { // Critical/Urgent
+        if (s.discipline_severity >= 2) {
             riskLevel = 'CRITICAL';
             factors.push('Discipline Issues');
-        } else if (s.discipline_severity === 1) { // High
+        } else if (s.discipline_severity === 1) {
             if (riskLevel !== 'CRITICAL') riskLevel = 'WARNING';
             factors.push('Behavior Warning');
         }
@@ -114,47 +117,45 @@ router.get('/risk', requireAuth, asyncHandler(async (req, res) => {
         return {
             id: s.id,
             name: s.name,
-            // Only using first part of ID for brevity if needed, but full ID is fine
             class: s.class_name,
             riskLevel,
             factors,
-            trend: s.trend && s.trend.length > 0 ? s.trend.reverse() : [0, 0, 0, 0, 0] // Reverse to show chronological left-to-right if UI expects it? Usually charts are left=oldest? Assuming fetch DESC means [newest, ..., oldest]. So reverse to [oldest, ..., newest].
+            trend: s.trend && s.trend.length > 0 ? s.trend.reverse() : [0, 0, 0, 0, 0]
         };
     });
 
-    // Sort CRITICAL first
     const sorted = riskProfiles.sort((a, b) => {
         const order = { 'CRITICAL': 0, 'WARNING': 1, 'SAFE': 2 };
         return order[a.riskLevel] - order[b.riskLevel];
     });
 
-    res.json(sorted);
+    return sendSuccess(res, req.schoolId, sorted);
 }));
 
 /**
  * GET /admin/analytics/heatmap
- * Avg marks by Class & Subject
+ * AN2: scoped marks/students query to school_id
  */
 router.get('/heatmap', requireAuth, asyncHandler(async (req, res) => {
-    // Aggregate avg marks
+    const schoolId = req.schoolId;
+
     const stats = await sql`
-        SELECT 
+        SELECT
             c.name as class_name,
             sub.name as subject_name,
-            AVG(m.marks_obtained / es.max_marks * 100)::INT as avg_pct
+            AVG(m.marks_obtained::FLOAT / es.max_marks * 100)::INT as avg_pct
         FROM marks m
         JOIN exam_subjects es ON m.exam_subject_id = es.id
         JOIN subjects sub ON es.subject_id = sub.id
         JOIN student_enrollments se ON m.student_enrollment_id = se.id
+        JOIN students s ON se.student_id = s.id
         JOIN class_sections cs ON se.class_section_id = cs.id
         JOIN classes c ON cs.class_id = c.id
         WHERE m.created_at > CURRENT_DATE - INTERVAL '1 year'
+          AND s.school_id = ${schoolId}
         GROUP BY c.name, sub.name
         ORDER BY c.name, sub.name
     `;
-
-    // Transform to Heatmap format
-    // { classes: [], subjects: [], data: { ClassA: { Math: 80 } } }
 
     const classes = [...new Set(stats.map(s => s.class_name))];
     const subjects = [...new Set(stats.map(s => s.subject_name))];
@@ -162,7 +163,7 @@ router.get('/heatmap', requireAuth, asyncHandler(async (req, res) => {
 
     classes.forEach(c => {
         data[c] = {};
-        subjects.forEach(s => data[c][s] = 0); // Init
+        subjects.forEach(s => data[c][s] = 0);
     });
 
     stats.forEach(r => {
@@ -171,134 +172,169 @@ router.get('/heatmap', requireAuth, asyncHandler(async (req, res) => {
         }
     });
 
-    res.json({ classes, subjects, data });
+    return sendSuccess(res, req.schoolId, { classes, subjects, data });
 }));
 
 /**
- * GET /admin/analytics/talking-points/:studentId
- * Generate summary
+ * GET /admin/analytics/talking-points/:id
+ * AN3: student lookup and all stats scoped to school_id
  */
 router.get('/talking-points/:id', requireAuth, asyncHandler(async (req, res) => {
     const { id } = req.params;
+    const schoolId = req.schoolId;
 
-    // 1. Fetch Student Details
-    // Accepts UUID or admission_no
+    // AN3: Ownership check — student must belong to this school
     const [student] = await sql`
         SELECT s.id, p.display_name, s.admission_no
         FROM students s JOIN persons p ON s.person_id = p.id
-        WHERE s.id::text = ${id} OR s.admission_no = ${id}
+        WHERE (s.id::text = ${id} OR s.admission_no = ${id})
+          AND s.school_id = ${schoolId}
         LIMIT 1
     `;
 
     if (!student) return res.status(404).json({ error: 'Student not found' });
 
-    // 2. Fetch Stats
-    // Complaint count
+    // Complaint count — scoped to school
     const [complaintStats] = await sql`
-        SELECT COUNT(*) as count 
-        FROM complaints 
+        SELECT COUNT(*) as count
+        FROM complaints
         WHERE raised_for_student_id = ${student.id}
+          AND school_id = ${schoolId}
     `;
 
-    // Failed subjects
+    // Failed subjects — scoped through students.school_id
     const failedSubjects = await sql`
-        SELECT s.name
+        SELECT sub.name
         FROM marks m
         JOIN exam_subjects es ON m.exam_subject_id = es.id
-        JOIN subjects s ON es.subject_id = s.id
+        JOIN subjects sub ON es.subject_id = sub.id
         JOIN student_enrollments se ON m.student_enrollment_id = se.id
-        WHERE se.student_id = ${student.id} 
+        JOIN students s ON se.student_id = s.id
+        WHERE se.student_id = ${student.id}
+          AND s.school_id = ${schoolId}
           AND m.marks_obtained < 35
         ORDER BY m.created_at DESC
         LIMIT 5
     `;
 
-    // Attendance
+    // Attendance — scoped through students.school_id
     const [attendance] = await sql`
-        SELECT 
+        SELECT
             COUNT(*) FILTER (WHERE da.status IN ('present', 'late', 'half_day'))::FLOAT / NULLIF(COUNT(*), 0) * 100 as pct
         FROM daily_attendance da
         JOIN student_enrollments se ON da.student_enrollment_id = se.id
+        JOIN students s ON se.student_id = s.id
         WHERE se.student_id = ${student.id}
+          AND s.school_id = ${schoolId}
           AND da.attendance_date > CURRENT_DATE - INTERVAL '60 days'
     `;
 
-    // 3. Generate Points
-    const points = [];
-    points.push(`Student: ${student.display_name} (${student.admission_no})`);
+    const attPct = attendance && attendance.pct ? attendance.pct.toFixed(1) : 100;
+    const subjects = failedSubjects.length > 0 ? [...new Set(failedSubjects.map(f => f.name))].join(', ') : 'None';
 
-    // Academic
-    if (failedSubjects.length > 0) {
-        const subjects = failedSubjects.map(f => f.name).join(', ');
-        points.push(`Recent struggles in: ${subjects}.`);
-    } else {
-        points.push('Recent academic performance is satisfying (Passing all subjects).');
+    const prompt = `
+You are a senior academic counselor. Prepare a set of 3 to 4 professional talking points for a parent-teacher meeting regarding the student ${student.display_name}.
+Context:
+- Attendance: ${attPct}%
+- Recent failed subjects: ${subjects}
+- Behavioral incidents: ${complaintStats.count}
+
+Instructions:
+1. Be professional and encouraging.
+2. Provide specific insights based on the stats.
+3. RETURN ONLY A JSON ARRAY OF STRINGS.
+   Example: ["Insight 1", "Insight 2", "Insight 3"]
+4. DO NOT include any markdown code blocks.
+`;
+
+    let points = [];
+    try {
+        const apiKey = process.env.GEMINI_API_KEY;
+        if (!apiKey) throw new Error("GEMINI_API_KEY not found in environment");
+
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' });
+
+        const result = await model.generateContent(prompt);
+        let responseText = result.response.text().trim();
+
+        const start = responseText.indexOf('[');
+        const end = responseText.lastIndexOf(']');
+
+        if (start === -1 || end === -1 || end < start) {
+            throw new Error(`No JSON array found in response.`);
+        }
+
+        const jsonStr = responseText.substring(start, end + 1);
+        points = JSON.parse(jsonStr);
+
+        if (!Array.isArray(points)) {
+            throw new Error("Parsed result is not an array");
+        }
+    } catch (aiError) {
+        console.error("AI Insights Error:", aiError.message);
+        points.push(`[Rule-based Analysis] for ${student.display_name}`);
+
+        if (failedSubjects.length > 0) {
+            points.push(`Student is struggling in ${subjects}. Recommend extra tutoring.`);
+        } else {
+            points.push('Student is passing all subjects with a stable academic record.');
+        }
+
+        if (parseFloat(attPct) < 75) {
+            points.push(`Critical: Attendance at ${attPct}% is significantly below school standards.`);
+        } else if (parseFloat(attPct) < 85) {
+            points.push(`Warning: Attendance is low (${attPct}%). Regularity is advised.`);
+        } else {
+            points.push(`Positive: Consistent attendance maintained at ${attPct}%.`);
+        }
+
+        if (complaintStats.count > 0) {
+            points.push(`Behavioral Note: ${complaintStats.count} complaints recorded recently.`);
+        }
     }
 
-    // Attendance
-    const attPct = attendance && attendance.pct ? attendance.pct : 100;
-    if (attPct < 75) {
-        points.push(`Attendance is CRITICAL (${attPct.toFixed(1)}%). Immediate attention required.`);
-    } else if (attPct < 85) {
-        points.push(`Attendance is low (${attPct.toFixed(1)}%). Monitor closely.`);
-    } else {
-        points.push(`Good attendance record (${attPct.toFixed(1)}%).`);
-    }
-
-    // Behavioral
-    if (complaintStats.count > 0) {
-        points.push(`Has ${complaintStats.count} reported behavior incidents/complaints.`);
-    }
-
-    res.json(points);
+    return sendSuccess(res, req.schoolId, points);
 }));
-
 
 /**
  * GET /admin/analytics/net-balance
- * Get financial summary (Net Balance)
- * Query Params: startDate, endDate (YYYY-MM-DD)
+ * AN4: All 3 financial sub-queries scoped to school_id
  */
 router.get('/net-balance', requireAuth, asyncHandler(async (req, res) => {
     const { startDate, endDate } = req.query;
+    const schoolId = req.schoolId;
 
     if (!startDate || !endDate) {
         return res.status(400).json({ error: 'startDate and endDate are required' });
     }
 
-    // 1. Total Fee Collected (Paid only)
+    // AN4: Fee collected — via student_fees join
     const [feeStats] = await sql`
-        SELECT COALESCE(SUM(amount), 0) as total
-        FROM fee_transactions
-        WHERE paid_at BETWEEN ${startDate} AND ${endDate}::date + INTERVAL '1 day'
+        SELECT COALESCE(SUM(ft.amount), 0) as total
+        FROM fee_transactions ft
+        JOIN student_fees sf ON ft.student_fee_id = sf.id
+        WHERE ft.paid_at BETWEEN ${startDate} AND ${endDate}::date + INTERVAL '1 day'
+          AND sf.school_id = ${schoolId}
     `;
 
-    // 2. Total Salary Paid (Paid only)
+    // AN4: Salary paid — via staff join
     const [salaryStats] = await sql`
-        SELECT COALESCE(SUM(net_salary), 0) as total
-        FROM staff_payroll
-        WHERE status = 'paid'
-          AND payment_date BETWEEN ${startDate} AND ${endDate}
+        SELECT COALESCE(SUM(sp.net_salary), 0) as total
+        FROM staff_payroll sp
+        JOIN staff st ON sp.staff_id = st.id
+        WHERE sp.status = 'paid'
+          AND sp.payment_date BETWEEN ${startDate} AND ${endDate}
+          AND st.school_id = ${schoolId}
     `;
 
-    // 3. Total Other Expenses (Paid only)
-    // Note: 'expenses' table has 'expense_date'. We use that.
-    // Filter by status='paid' as per requirement (though prompt said "Total Other Expenses -> all non-salary expenses", usually implies paid or incurred. Prompt clarification: "Data rules: ... Total Fee -> only paid ... Total Salary -> only paid ... Other Expenses -> all non-salary expenses". 
-    // Wait, for Expenses, it says "all non-salary expenses". It doesn't explicitly say "only paid". 
-    // However, for "Net Balance" (Cash flow context), usually we track actual outflow.
-    // Let's look at the constraints: "Net Balance = Total Fee Collected - Total Salary Paid - Total Other Expenses".
-    // "Total Fee Collected -> only paid fees".
-    // "Total Salary Paid -> only paid salaries".
-    // "Other Expenses -> all non-salary expenses". 
-    // If I include 'pending' expenses, it reduces the balance even if cash hasn't left. 
-    // Given usage of "Collected" and "Paid" for others, I will assume "Paid" for expenses too to keep it cash-based.
-    // ALSO: The prompt says "Keep logic cash-based". So definitely only 'paid'.
-
+    // AN4: Other expenses — via expenses.school_id
     const [expenseStats] = await sql`
         SELECT COALESCE(SUM(amount), 0) as total
         FROM expenses
         WHERE status = 'paid'
           AND expense_date BETWEEN ${startDate} AND ${endDate}
+          AND school_id = ${schoolId}
     `;
 
     const totalFee = parseFloat(feeStats.total);
@@ -306,12 +342,7 @@ router.get('/net-balance', requireAuth, asyncHandler(async (req, res) => {
     const totalExpenses = parseFloat(expenseStats.total);
     const netBalance = totalFee - totalSalary - totalExpenses;
 
-    res.json({
-        totalFee,
-        totalSalary,
-        totalExpenses,
-        netBalance
-    });
+    return sendSuccess(res, req.schoolId, { totalFee, totalSalary, totalExpenses, netBalance });
 }));
 
 export default router;

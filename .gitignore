@@ -1,9 +1,29 @@
+# Local environment variables
 .env
 .env.*
+
+# Dependencies
 node_modules/
+
+# Build and IDE
 dist/
 build/
+.DS_Store
+.idea/
+.vscode/
+
+# Logs and debug
 *.log
 *.txt
+out.txt
+test_out.txt
+debug_log.txt
+
+# Sensitive credentials
 service-account.json
-.DS_Store
+*.pem
+*.key
+
+# Temporary files
+/tmp/
+.temp/

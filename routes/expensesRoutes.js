@@ -2,6 +2,7 @@
 import express from 'express';
 import sql from '../db.js';
 import { requirePermission } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
 
@@ -19,24 +20,25 @@ router.post('/', requirePermission('expenses.create'), asyncHandler(async (req, 
     return res.status(400).json({ error: 'Amount and Date are required' });
   }
 
-  // 1. Insert Expense
+  // E1 FIX: Add school_id to expenses INSERT
   const [expense] = await sql`
     INSERT INTO expenses (
-      title, description, amount, expense_date, category, 
+      school_id, title, description, amount, expense_date, category,
       status, created_by
     ) VALUES (
-      ${title || 'Untitled Expense'}, 
-      ${description || ''}, 
-      ${amount}, 
-      ${expense_date}, 
-      ${category || 'general'}, 
-      'pending', 
+      ${req.schoolId},
+      ${title || 'Untitled Expense'},
+      ${description || ''},
+      ${amount},
+      ${expense_date},
+      ${category || 'general'},
+      'pending',
       ${userId}
     )
     RETURNING *
   `;
 
-  // 2. Notification: EXPENSE_CREATED (Admin + Accounts)
+  // E3 FIX: Add school_id filters to admin notification query
   (async () => {
     try {
       const recipients = await sql`
@@ -46,16 +48,15 @@ router.post('/', requirePermission('expenses.create'), asyncHandler(async (req, 
         JOIN users u ON ur.user_id = u.id
         WHERE r.code = 'admin'
           AND u.account_status = 'active'
+          AND u.school_id = ${req.schoolId}
+          AND ur.school_id = ${req.schoolId}
+          AND r.school_id = ${req.schoolId}
       `;
 
       if (recipients.length > 0) {
         const userIds = recipients.map((r) => r.user_id);
         const uniqueIds = [...new Set(userIds)];
 
-        // Don't notify the creator if they are admin/accounts (optional, but requested: "DO NOT notify Students/Staff unless they are admin/accounts". 
-        // Usually creator shouldn't get "New expense submitted" notification from themselves, but standard logic often sends to group. 
-        // User didn't explicitly safeguard against self-notification for creation, only for "Students/Staff". 
-        // I will exclude the creator to be less annoying.
         const finalIds = uniqueIds.filter((id) => id !== userId);
 
         if (finalIds.length > 0) {
@@ -71,7 +72,7 @@ router.post('/', requirePermission('expenses.create'), asyncHandler(async (req, 
     }
   })();
 
-  res.status(201).json({ message: 'Expense created successfully', expense });
+  return sendSuccess(res, req.schoolId, { message: 'Expense created successfully', expense }, 201);
 }));
 
 /**
@@ -86,14 +87,19 @@ router.put('/:id/status', requirePermission('expenses.approve'), asyncHandler(as
     return res.status(400).json({ error: 'Invalid status. Use approved or rejected.' });
   }
 
-  // 1. Update Status
+  // E2 FIX: Ownership check first
+  const [existing] = await sql`SELECT id FROM expenses WHERE id = ${id} AND school_id = ${req.schoolId}`;
+  if (!existing) {
+    return res.status(404).json({ error: 'Expense not found' });
+  }
+
   const [updated] = await sql`
     UPDATE expenses
-    SET 
+    SET
       status = ${status},
-      approved_by = ${req.user.id}, -- assuming column exists or ignored if not
+      approved_by = ${req.user.id},
       updated_at = now()
-    WHERE id = ${id}
+    WHERE id = ${id} AND school_id = ${req.schoolId}
     RETURNING *
   `;
 
@@ -125,7 +131,7 @@ router.put('/:id/status', requirePermission('expenses.approve'), asyncHandler(as
     }
   })();
 
-  res.json({ message: `Expense ${status}`, expense: updated });
+  return sendSuccess(res, req.schoolId, { message: `Expense ${status}`, expense: updated });
 }));
 
 export default router;

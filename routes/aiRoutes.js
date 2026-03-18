@@ -1,5 +1,6 @@
 import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import sql from '../db.js';
 import { translateToTelugu } from '../services/geminiTranslator.js';
@@ -56,9 +57,9 @@ router.post('/doubt-assist', requireAuth, async (req, res) => {
         const enrollment = await sql`
                     SELECT c.name as class_name 
                     FROM student_enrollments se
-                    JOIN class_sections cs ON se.class_section_id = cs.id
+                    JOIN class_sections cs ON se.class_section_id = cs.id AND cs.school_id = ${req.schoolId}
                     JOIN classes c ON cs.class_id = c.id
-                    WHERE se.student_id = ${req.user.internal_id} AND se.status = 'active'
+                    WHERE se.student_id = ${req.user.internal_id} AND se.status = 'active' AND se.school_id = ${req.schoolId}
                     LIMIT 1
                  `;
         if (enrollment.length > 0) {
@@ -100,7 +101,7 @@ Answer the question now, adhering strictly to the rules above.
     const result = await generateWithRetry(model, finalPrompt);
     const responseText = result.response.text();
 
-    res.json({
+    return sendSuccess(res, req.schoolId, {
       answer: responseText,
       context_used: studentClass, // Returning this helps you debug on frontend
       id: Date.now().toString()
@@ -130,7 +131,7 @@ Answer the question now, adhering strictly to the rules above.
 });
 
 // NEW ROUTE: Hybrid Telugu Translation Endpoint
-router.post('/translate', async (req, res) => {
+router.post('/translate', requireAuth, async (req, res) => {
   try {
     const { texts } = req.body;
 
@@ -145,7 +146,7 @@ router.post('/translate', async (req, res) => {
 
     const translatedTexts = await Promise.all(texts.map((t) => translateToTelugu(t)));
 
-    res.json({ translations: translatedTexts });
+    return sendSuccess(res, req.schoolId, { translations: translatedTexts });
   } catch (error) {
 
     res.status(500).json({

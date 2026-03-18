@@ -9,8 +9,8 @@ import sql from '../db.js';
 async function grantPermission() {
 
   try {
-    // 1. Get accounts role
-    const [accountsRole] = await sql`SELECT id FROM roles WHERE code = 'accounts'`;
+    // 1. Get accountant role
+    const [accountsRole] = await sql`SELECT id FROM roles WHERE code = 'accountant'`;
 
     if (!accountsRole) {
 

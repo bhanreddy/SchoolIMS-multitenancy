@@ -1,11 +1,12 @@
 import express from 'express';
 import sql, { supabaseAdmin } from '../db.js';
-import { identifyUser, requirePermission } from '../middleware/auth.js';
+import { identifyUser, requirePermission, requireAuth } from '../middleware/auth.js';
+import { sendSuccess } from '../utils/apiResponse.js';
 
 const router = express.Router();
 
-// Middleware to ensure user is logged in
-router.use(identifyUser);
+// U1 FIX: Replace identifyUser with requireAuth to reject unauthenticated requests
+router.use(requireAuth);
 
 /**
  * POST /users
@@ -36,11 +37,10 @@ router.post('/', async (req, res) => {
 
   try {
     const result = await sql.begin(async (sql) => {
-      // 1. Create Person
-      // Convert undefined to null for optional fields
+      // U2 FIX: Add school_id to persons INSERT
       const [person] = await sql`
-                INSERT INTO persons (first_name, middle_name, last_name, dob, gender_id)
-                VALUES (${first_name}, ${middle_name || null}, ${last_name}, ${dob || null}, ${gender_id})
+                INSERT INTO persons (school_id, first_name, middle_name, last_name, dob, gender_id)
+                VALUES (${req.schoolId}, ${first_name}, ${middle_name || null}, ${last_name}, ${dob || null}, ${gender_id})
                 RETURNING id
             `;
 
@@ -58,30 +58,29 @@ router.post('/', async (req, res) => {
 
       const supabaseUserId = authData.user.id;
 
-      // 3. Create Local User
-      // Note: We explicitly set the ID to match Supabase User ID
+      // U3 FIX: Add school_id to users INSERT
       const [user] = await sql`
-                INSERT INTO users (id, person_id, account_status)
-                VALUES (${supabaseUserId}, ${person.id}, 'active')
+                INSERT INTO users (id, school_id, person_id, account_status)
+                VALUES (${supabaseUserId}, ${req.schoolId}, ${person.id}, 'active')
                 RETURNING id
             `;
 
-      // 4. Assign Role
-      // Get role ID from code
-      const [role] = await sql`SELECT id FROM roles WHERE code = ${role_code}`;
+      // U4 FIX: Add school_id filter to role lookup
+      const [role] = await sql`SELECT id FROM roles WHERE code = ${role_code} AND school_id = ${req.schoolId}`;
       if (!role) {
         throw new Error(`Invalid role code: ${role_code}`);
       }
 
+      // U7 partial: Add school_id to user_roles INSERT
       await sql`
-                INSERT INTO user_roles (user_id, role_id, granted_by)
-                VALUES (${user.id}, ${role.id}, ${req.user.internal_id})
+                INSERT INTO user_roles (user_id, role_id, school_id, granted_by)
+                VALUES (${user.id}, ${role.id}, ${req.schoolId}, ${req.user.internal_id})
             `;
 
       // 5. Add Contact (Email)
       await sql`
-                INSERT INTO person_contacts (person_id, contact_type, contact_value, is_primary)
-                VALUES (${person.id}, 'email', ${email}, true)
+                INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary)
+                VALUES (${req.schoolId}, ${person.id}, 'email', ${email}, true)
             `;
 
       return {
@@ -92,14 +91,14 @@ router.post('/', async (req, res) => {
       };
     });
 
-    res.status(201).json({
+    return sendSuccess(res, req.schoolId, {
       message: 'User created successfully',
       user: result
-    });
+    }, 201);
 
   } catch (error) {
 
-    // Supabase user might have been created even if DB failed if transaction blocked? 
+    // Supabase user might have been created even if DB failed if transaction blocked?
     // Ideally we should rollback supabase user too, but Supabase doesn't support 2PC with Postgres this way easily.
     // For now, we assume if DB transaction fails (rolled back via sql.begin), we might have an orphan in Supabase Auth.
     // Production grade would involve a "compensation" action here to delete the Auth user if DB fails.
@@ -120,22 +119,28 @@ router.get('/', async (req, res) => {
   }
 
   try {
+    // U5 FIX: Add school_id filter to user list query
     const users = await sql`
-            SELECT 
+            SELECT
                 u.id, u.account_status, u.last_login_at, u.created_at,
                 p.display_name, p.photo_url,
-                (SELECT contact_value FROM person_contacts pc 
+                (SELECT contact_value FROM person_contacts pc
                  WHERE pc.person_id = p.id AND pc.contact_type = 'email' AND pc.is_primary = true LIMIT 1) as email,
                 array_agg(DISTINCT r.code) FILTER (WHERE r.code IS NOT NULL) as roles
             FROM users u
             JOIN persons p ON u.person_id = p.id
+              AND p.school_id = ${req.schoolId}
             LEFT JOIN user_roles ur ON u.id = ur.user_id
+              AND ur.school_id = ${req.schoolId}
             LEFT JOIN roles r ON ur.role_id = r.id
+              AND r.school_id = ${req.schoolId}
+            WHERE u.school_id = ${req.schoolId}
+              AND u.deleted_at IS NULL
             GROUP BY u.id, p.display_name, p.photo_url, p.id
             ORDER BY p.display_name
         `;
 
-    res.json(users);
+    return sendSuccess(res, req.schoolId, users);
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to fetch users' });
@@ -159,14 +164,14 @@ router.put('/settings', async (req, res) => {
 
   try {
     const [upserted] = await sql`
-            INSERT INTO user_settings (user_id, notification_sound)
-            VALUES (${req.user.internal_id}, ${notification_sound || 'custom'})
-            ON CONFLICT (user_id) 
+            INSERT INTO user_settings (school_id, user_id, notification_sound)
+    VALUES (${req.schoolId}, ${req.user.internal_id}, ${notification_sound || 'custom'})
+            ON CONFLICT (user_id)
             DO UPDATE SET notification_sound = COALESCE(EXCLUDED.notification_sound, user_settings.notification_sound), updated_at = now()
             RETURNING *
         `;
 
-    res.json({ message: 'Settings updated successfully', settings: upserted });
+    return sendSuccess(res, req.schoolId, { message: 'Settings updated successfully', settings: upserted });
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to update settings' });
@@ -186,10 +191,19 @@ router.put('/:id', async (req, res) => {
   const { account_status } = req.body;
 
   try {
+    // U6 FIX: Ownership check — verify user belongs to this school
+    const [existing] = await sql`
+            SELECT id FROM users
+            WHERE id = ${id} AND school_id = ${req.schoolId} AND deleted_at IS NULL
+        `;
+    if (!existing) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
     const [updated] = await sql`
             UPDATE users
-            SET account_status = COALESCE(${account_status}, account_status)
-            WHERE id = ${id}
+            SET account_status = COALESCE(${account_status ?? null}, account_status)
+            WHERE id = ${id} AND school_id = ${req.schoolId}
             RETURNING id, account_status
         `;
 
@@ -197,7 +211,7 @@ router.put('/:id', async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    res.json({ message: 'User updated', user: updated });
+    return sendSuccess(res, req.schoolId, { message: 'User updated', user: updated });
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to update user' });
@@ -221,18 +235,26 @@ router.post('/:id/roles', async (req, res) => {
   }
 
   try {
-    const [role] = await sql`SELECT id FROM roles WHERE code = ${role_code}`;
+    // U7 FIX: Verify user belongs to this school
+    const [userCheck] = await sql`SELECT id FROM users WHERE id = ${id} AND school_id = ${req.schoolId}`;
+    if (!userCheck) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // U7 FIX: Add school_id filter to role lookup
+    const [role] = await sql`SELECT id FROM roles WHERE code = ${role_code} AND school_id = ${req.schoolId}`;
     if (!role) {
       return res.status(404).json({ error: 'Role not found' });
     }
 
+    // U7 FIX: Add school_id to user_roles INSERT
     await sql`
-            INSERT INTO user_roles (user_id, role_id, granted_by)
-            VALUES (${id}, ${role.id}, ${req.user.internal_id})
+            INSERT INTO user_roles (user_id, role_id, school_id, granted_by)
+            VALUES (${id}, ${role.id}, ${req.schoolId}, ${req.user.internal_id})
             ON CONFLICT (user_id, role_id) DO NOTHING
         `;
 
-    res.json({ message: 'Role assigned successfully' });
+    return sendSuccess(res, req.schoolId, { message: 'Role assigned successfully' });
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to assign role' });
@@ -251,9 +273,11 @@ router.delete('/:id/roles/:roleId', async (req, res) => {
   const { id, roleId } = req.params;
 
   try {
+    // U8 FIX: Add school_id filter to user_roles DELETE
     const [deleted] = await sql`
-            DELETE FROM user_roles 
+            DELETE FROM user_roles
             WHERE user_id = ${id} AND role_id = ${roleId}
+              AND school_id = ${req.schoolId}
             RETURNING user_id
         `;
 
@@ -261,7 +285,7 @@ router.delete('/:id/roles/:roleId', async (req, res) => {
       return res.status(404).json({ error: 'Role assignment not found' });
     }
 
-    res.json({ message: 'Role removed successfully' });
+    return sendSuccess(res, req.schoolId, { message: 'Role removed successfully' });
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to remove role' });
