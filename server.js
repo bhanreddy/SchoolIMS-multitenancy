@@ -138,8 +138,8 @@ app.use(cors({
     origin: (origin, cb) => {
         const allow = config.cors.allowedOrigins;
         if (!allow || allow.length === 0) {
-            // If nothing configured, default to permissive only outside production.
-            return cb(config.isProduction ? new Error('CORS is not configured') : null, !config.isProduction);
+            // Default to permissive (echo the origin back) if not configured
+            return cb(null, origin || true);
         }
         if (allow.includes('*')) return cb(null, true);
         if (!origin) return cb(null, true); // server-to-server / curl
