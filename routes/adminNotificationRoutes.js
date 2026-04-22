@@ -15,9 +15,17 @@ const router = express.Router();
  * client. No school admin can set or modify this table.
  * This is acceptable and no per-school scope is needed here.
  */
+let _killSwitchCache = { value: false, expiresAt: 0 };
+
 async function isPlatformKillSwitchActive() {
+  const now = Date.now();
+  if (now < _killSwitchCache.expiresAt) return _killSwitchCache.value;
+
   const config = await sql`SELECT value FROM notification_config WHERE key = 'kill_switch'`;
-  return config.length > 0 && config[0].value.global === true;
+  const active = config.length > 0 && config[0].value?.global === true;
+
+  _killSwitchCache = { value: active, expiresAt: now + 30_000 };
+  return active;
 }
 
 // ── POST /fees/send-all ────────────────────────────────────────────────────────
@@ -381,7 +389,7 @@ router.post(
                   minimumFractionDigits: 2,
                   maximumFractionDigits: 2,
                 });
-                const msg = `Gentle reminder: Your child has pending fees of <font color="red">₹${amt}</font> due for this active term.`;
+                const msg = `Gentle reminder: Your child has pending fees of ₹${amt} due for this active term.`;
                 const response = await sendNotificationToUsers(
                   [r.id],
                   type,

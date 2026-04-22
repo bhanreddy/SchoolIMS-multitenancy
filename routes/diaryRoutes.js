@@ -9,6 +9,10 @@ import { translateFields } from '../services/geminiTranslator.js';
 
 const router = express.Router();
 
+/** Rolling window of diary entry dates kept and returned (today + prior 14 days). */
+const DIARY_RETENTION_DAYS = 15;
+const diaryRetentionOffsetDays = DIARY_RETENTION_DAYS - 1;
+
 function logDebug(msg) {
   try {
     fs.appendFileSync('debug_log.txt', `${new Date().toISOString()} - ${msg}\n`);
@@ -28,7 +32,9 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
 
   let entries;
 
-  // Sync Logic
+  // Sync Logic (read-only): old rows are excluded by the date window below.
+  // Run periodic DELETE via pg_cron / scheduler, e.g.:
+  // DELETE FROM diary_entries WHERE entry_date < CURRENT_DATE - INTERVAL '15 days' AND school_id = $school;
   if (updated_since && class_section_id) {
     const sinceDate = new Date(parseInt(updated_since));
     entries = await sql`
@@ -41,8 +47,8 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
       LEFT JOIN subjects s ON d.subject_id = s.id
       JOIN users u ON d.created_by = u.id
       JOIN persons creator ON u.person_id = creator.id
-      WHERE d.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
-        AND d.school_id = ${schoolId}
+      WHERE d.class_section_id = ${class_section_id} AND d.school_id = ${schoolId}
+        AND d.entry_date >= (CURRENT_DATE - (${diaryRetentionOffsetDays}) * INTERVAL '1 day')
         AND (d.updated_at > ${sinceDate} OR d.created_at > ${sinceDate})
       ORDER BY d.updated_at DESC
     `;
@@ -63,9 +69,9 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
       LEFT JOIN subjects s ON d.subject_id = s.id
       JOIN users u ON d.created_by = u.id
       JOIN persons creator ON u.person_id = creator.id
-      WHERE d.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
-        AND d.school_id = ${schoolId}
+      WHERE d.class_section_id = ${class_section_id} AND d.school_id = ${schoolId}
         AND d.entry_date = ${entry_date}
+        AND d.entry_date >= (CURRENT_DATE - (${diaryRetentionOffsetDays}) * INTERVAL '1 day')
         ${subject_id ? sql`AND d.subject_id = ${subject_id}` : sql``}
       ORDER BY s.name NULLS LAST
     `;
@@ -80,9 +86,9 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
       LEFT JOIN subjects s ON d.subject_id = s.id
       JOIN users u ON d.created_by = u.id
       JOIN persons creator ON u.person_id = creator.id
-      WHERE d.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
-        AND d.school_id = ${schoolId}
+      WHERE d.class_section_id = ${class_section_id} AND d.school_id = ${schoolId}
         AND d.entry_date BETWEEN ${from_date} AND ${to_date}
+        AND d.entry_date >= (CURRENT_DATE - (${diaryRetentionOffsetDays}) * INTERVAL '1 day')
       ORDER BY d.entry_date DESC, s.name NULLS LAST
       LIMIT ${limit} OFFSET ${offset}
     `;
@@ -95,38 +101,93 @@ router.get('/', requirePermission('diary.view'), asyncHandler(async (req, res) =
         s.name as subject_name
       FROM diary_entries d
       LEFT JOIN subjects s ON d.subject_id = s.id
-      WHERE d.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
-        AND d.school_id = ${schoolId}
+      WHERE d.class_section_id = ${class_section_id} AND d.school_id = ${schoolId}
+        AND d.entry_date >= (CURRENT_DATE - (${diaryRetentionOffsetDays}) * INTERVAL '1 day')
       ORDER BY d.entry_date DESC
       LIMIT ${limit} OFFSET ${offset}
     `;
   } else {
-    // Teacher's own entries — scoped to school
-    entries = await sql`
-      SELECT
-        d.id, d.entry_date, d.title, d.title_te, d.content, d.content_te, d.homework_due_date,
-        s.name as subject_name,
-        c.name as class_name, sec.name as section_name,
-        d.class_section_id, d.subject_id,
-        d.created_at, d.updated_at
-      FROM diary_entries d
-      JOIN class_sections csec ON d.class_section_id = csec.id
-      JOIN classes c ON csec.class_id = c.id
-      JOIN sections sec ON csec.section_id = sec.id
-      LEFT JOIN subjects s ON d.subject_id = s.id
-      WHERE d.created_by = ${req.user.internal_id}
-        AND d.school_id = ${schoolId}
-        AND EXISTS (
-          SELECT 1 FROM class_subjects csub
-          JOIN staff st ON csub.teacher_id = st.id
-          JOIN users u ON st.person_id = u.person_id
-          WHERE u.id = ${req.user.id}
-            AND csub.class_section_id = d.class_section_id
-            AND csub.subject_id = d.subject_id
-        )
-      ORDER BY d.homework_due_date DESC NULLS LAST, d.created_at DESC
-      LIMIT ${limit} OFFSET ${offset}
-    `;
+    // Teacher's own entries — scoped to school (no class_section_id on query)
+    if (entry_date) {
+      entries = await sql`
+        SELECT
+          d.id, d.entry_date, d.title, d.title_te, d.content, d.content_te, d.homework_due_date,
+          s.name as subject_name,
+          c.name as class_name, sec.name as section_name,
+          d.class_section_id, d.subject_id,
+          d.created_at, d.updated_at
+        FROM diary_entries d
+        JOIN class_sections csec ON d.class_section_id = csec.id
+        JOIN classes c ON csec.class_id = c.id
+        JOIN sections sec ON csec.section_id = sec.id
+        LEFT JOIN subjects s ON d.subject_id = s.id
+        WHERE d.created_by = ${req.user.internal_id}
+          AND d.school_id = ${schoolId}
+          AND d.entry_date = ${entry_date}
+          AND EXISTS (
+            SELECT 1 FROM class_subjects csub
+            JOIN staff st ON csub.teacher_id = st.id
+            JOIN users u ON st.person_id = u.person_id
+            WHERE u.id = ${req.user.id}
+              AND csub.class_section_id = d.class_section_id
+              AND csub.subject_id = d.subject_id
+          )
+        ORDER BY d.created_at DESC
+      `;
+    } else if (from_date && to_date) {
+      // Staff diary history: full window without the default LIMIT 20 (which hid older days)
+      entries = await sql`
+        SELECT
+          d.id, d.entry_date, d.title, d.title_te, d.content, d.content_te, d.homework_due_date,
+          s.name as subject_name,
+          c.name as class_name, sec.name as section_name,
+          d.class_section_id, d.subject_id,
+          d.created_at, d.updated_at
+        FROM diary_entries d
+        JOIN class_sections csec ON d.class_section_id = csec.id
+        JOIN classes c ON csec.class_id = c.id
+        JOIN sections sec ON csec.section_id = sec.id
+        LEFT JOIN subjects s ON d.subject_id = s.id
+        WHERE d.created_by = ${req.user.internal_id}
+          AND d.school_id = ${schoolId}
+          AND d.entry_date BETWEEN ${from_date} AND ${to_date}
+          AND EXISTS (
+            SELECT 1 FROM class_subjects csub
+            JOIN staff st ON csub.teacher_id = st.id
+            JOIN users u ON st.person_id = u.person_id
+            WHERE u.id = ${req.user.id}
+              AND csub.class_section_id = d.class_section_id
+              AND csub.subject_id = d.subject_id
+          )
+        ORDER BY d.entry_date DESC, d.created_at DESC
+      `;
+    } else {
+      entries = await sql`
+        SELECT
+          d.id, d.entry_date, d.title, d.title_te, d.content, d.content_te, d.homework_due_date,
+          s.name as subject_name,
+          c.name as class_name, sec.name as section_name,
+          d.class_section_id, d.subject_id,
+          d.created_at, d.updated_at
+        FROM diary_entries d
+        JOIN class_sections csec ON d.class_section_id = csec.id
+        JOIN classes c ON csec.class_id = c.id
+        JOIN sections sec ON csec.section_id = sec.id
+        LEFT JOIN subjects s ON d.subject_id = s.id
+        WHERE d.created_by = ${req.user.internal_id}
+          AND d.school_id = ${schoolId}
+          AND EXISTS (
+            SELECT 1 FROM class_subjects csub
+            JOIN staff st ON csub.teacher_id = st.id
+            JOIN users u ON st.person_id = u.person_id
+            WHERE u.id = ${req.user.id}
+              AND csub.class_section_id = d.class_section_id
+              AND csub.subject_id = d.subject_id
+          )
+        ORDER BY d.homework_due_date DESC NULLS LAST, d.created_at DESC
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+    }
   }
 
   return sendSuccess(res, req.schoolId, entries);
@@ -179,6 +240,7 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
     return res.status(400).json({ error: 'class_section_id, content, and entry_date are required' });
   }
 
+
   let title_te = null;
   let content_te = null;
   try {
@@ -188,18 +250,38 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
   } catch (e) {}
 
   let entry;
+  let createdNew = true;
   try {
     const result = await sql`
       INSERT INTO diary_entries (school_id, class_section_id, subject_id, entry_date, title, title_te, content, content_te, homework_due_date, attachments, created_by)
       VALUES (${schoolId}, ${class_section_id}, ${subject_id}, ${entry_date}, ${title}, ${title_te}, ${content}, ${content_te},
               ${homework_due_date || null}, ${attachments ? JSON.stringify(attachments) : null}, ${req.user.internal_id})
-      RETURNING *
+      ON CONFLICT (school_id, class_section_id, subject_id, entry_date, created_by)
+      DO UPDATE SET
+        title = EXCLUDED.title,
+        title_te = EXCLUDED.title_te,
+        content = EXCLUDED.content,
+        content_te = EXCLUDED.content_te,
+        homework_due_date = EXCLUDED.homework_due_date,
+        attachments = EXCLUDED.attachments,
+        updated_at = now()
+      RETURNING *, (xmax = 0) AS _was_insert
     `;
-    entry = result[0];
+    const row = result[0];
+    createdNew = row._was_insert === true;
+    const { _was_insert, ...rest } = row;
+    entry = rest;
   } catch (dbErr) {
     logDebug(`[Diary] DB Insert Error: ${dbErr.message}`);
     throw dbErr;
   }
+
+  await sql`
+    DELETE FROM diary_entries
+    WHERE school_id = ${schoolId}
+      AND class_section_id = ${class_section_id}
+      AND entry_date < (CURRENT_DATE - (${diaryRetentionOffsetDays}) * INTERVAL '1 day')
+  `;
 
   // Notification: DIARY_UPDATED (Students in class section from this school only)
   (async () => {
@@ -209,7 +291,7 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
         FROM users u
         JOIN students s ON u.person_id = s.person_id
         JOIN student_enrollments se ON s.id = se.student_id
-        WHERE se.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
+        WHERE se.class_section_id = ${class_section_id} AND u.school_id = ${req.schoolId}
           AND se.status = 'active'
           AND u.account_status = 'active'
           AND s.school_id = ${schoolId}
@@ -222,7 +304,7 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
         JOIN student_parents sp ON p.id = sp.parent_id
         JOIN students s ON sp.student_id = s.id
         JOIN student_enrollments se ON s.id = se.student_id
-        WHERE se.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
+        WHERE se.class_section_id = ${class_section_id} AND u.school_id = ${req.schoolId}
           AND se.status = 'active'
           AND u.account_status = 'active'
           AND s.school_id = ${schoolId}
@@ -235,7 +317,8 @@ router.post('/', requirePermission('diary.create'), asyncHandler(async (req, res
     } catch (err) {}
   })();
 
-  return sendSuccess(res, req.schoolId, { message: 'Diary entry created', entry }, 201);
+  const message = createdNew ? 'Diary entry created' : 'Diary entry updated';
+  return sendSuccess(res, req.schoolId, { message, entry }, createdNew ? 201 : 200);
 }));
 
 /**

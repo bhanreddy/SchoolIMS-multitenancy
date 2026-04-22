@@ -33,57 +33,50 @@ function getDateRange(range) {
 async function fetchFinancials(range, schoolId) {
     const start = getDateRange(range);
 
-    // Total Collected
-    const [collected] = await sql`
+    const [
+        [collected],
+        [outstanding],
+        [invoiced],
+        [discounts],
+        [enrollments],
+        trend,
+    ] = await Promise.all([
+        sql`
         SELECT COALESCE(SUM(ft.amount), 0) as total
         FROM fee_transactions ft
         JOIN student_fees sf ON ft.student_fee_id = sf.id
         WHERE ft.paid_at >= ${start}
           AND sf.school_id = ${schoolId}
-    `;
-
-    // Outstanding
-    const [outstanding] = await sql`
+    `,
+        sql`
         SELECT COALESCE(SUM(amount_due - discount - amount_paid), 0) as total
         FROM student_fees
-        WHERE due_date >= ${start}
-          AND status != 'paid'
+        WHERE status != 'paid'
           AND deleted_at IS NULL
           AND school_id = ${schoolId}
-    `;
-
-    // Total Invoiced (all billed)
-    const [invoiced] = await sql`
+    `,
+        sql`
         SELECT COALESCE(SUM(amount_due), 0) as total
         FROM student_fees
         WHERE created_at >= ${start}
           AND deleted_at IS NULL
           AND school_id = ${schoolId}
-    `;
-
-    // Discount Given
-    const [discounts] = await sql`
+    `,
+        sql`
         SELECT COALESCE(SUM(discount), 0) as total
         FROM student_fees
         WHERE created_at >= ${start}
           AND deleted_at IS NULL
           AND school_id = ${schoolId}
-    `;
-
-    // Refunds (Not supported in current DB schema)
-    const refunds = { total: 0 };
-
-    // New Enrollments — students enrolled this period
-    const [enrollments] = await sql`
+    `,
+        sql`
         SELECT COUNT(*) as count
         FROM students
         WHERE created_at >= ${start}
           AND deleted_at IS NULL
           AND school_id = ${schoolId}
-    `;
-
-    // Revenue Trend — last 6 months
-    const trend = await sql`
+    `,
+        sql`
         SELECT
             TO_CHAR(ft.paid_at, 'Mon') as label,
             SUM(ft.amount) as value
@@ -93,7 +86,11 @@ async function fetchFinancials(range, schoolId) {
           AND sf.school_id = ${schoolId}
         GROUP BY TO_CHAR(ft.paid_at, 'Mon'), DATE_TRUNC('month', ft.paid_at)
         ORDER BY DATE_TRUNC('month', ft.paid_at)
-    `;
+    `,
+    ]);
+
+    // Refunds (Not supported in current DB schema)
+    const refunds = { total: 0 };
 
     const totalCollected = parseFloat(collected.total) || 0;
     const totalInvoiced = parseFloat(invoiced.total) || 0;
@@ -119,8 +116,15 @@ async function fetchFinancials(range, schoolId) {
 async function fetchAttendance(range, schoolId) {
     const start = getDateRange(range);
 
-    // Average student attendance %
-    const [avgAtt] = await sql`
+    const [
+        [avgAtt],
+        [chronic],
+        [workingDays],
+        [staffAtt],
+        trend,
+        [presentDays],
+    ] = await Promise.all([
+        sql`
         SELECT
             (COUNT(*) FILTER (WHERE da.status IN ('present', 'late', 'half_day')))::FLOAT
             / NULLIF(COUNT(*), 0) * 100 as pct
@@ -129,10 +133,8 @@ async function fetchAttendance(range, schoolId) {
         JOIN students s ON se.student_id = s.id
         WHERE da.attendance_date >= ${start}
           AND s.school_id = ${schoolId}
-    `;
-
-    // Chronic absentees (<75%)
-    const [chronic] = await sql`
+    `,
+        sql`
         WITH student_att AS (
             SELECT se.student_id,
                    COUNT(*) FILTER (WHERE da.status IN ('present', 'late', 'half_day'))::FLOAT / NULLIF(COUNT(*), 0) * 100 as pct
@@ -144,20 +146,16 @@ async function fetchAttendance(range, schoolId) {
             GROUP BY se.student_id
         )
         SELECT COUNT(*) as count FROM student_att WHERE pct < 75
-    `;
-
-    // Total working days (distinct dates with attendance records)
-    const [workingDays] = await sql`
+    `,
+        sql`
         SELECT COUNT(DISTINCT da.attendance_date) as count
         FROM daily_attendance da
         JOIN student_enrollments se ON da.student_enrollment_id = se.id
         JOIN students s ON se.student_id = s.id
         WHERE da.attendance_date >= ${start}
           AND s.school_id = ${schoolId}
-    `;
-
-    // Staff attendance %
-    const [staffAtt] = await sql`
+    `,
+        sql`
         SELECT
             (COUNT(*) FILTER (WHERE sa.status IN ('present', 'late', 'half_day')))::FLOAT
             / NULLIF(COUNT(*), 0) * 100 as pct
@@ -166,10 +164,8 @@ async function fetchAttendance(range, schoolId) {
         WHERE sa.attendance_date >= ${start}
           AND st.school_id = ${schoolId}
           AND st.deleted_at IS NULL
-    `;
-
-    // Attendance trend — last 14 days
-    const trend = await sql`
+    `,
+        sql`
         SELECT
             TO_CHAR(da.attendance_date, 'DD Mon') as label,
             (COUNT(*) FILTER (WHERE da.status IN ('present', 'late', 'half_day')))::FLOAT
@@ -181,10 +177,8 @@ async function fetchAttendance(range, schoolId) {
           AND s.school_id = ${schoolId}
         GROUP BY da.attendance_date
         ORDER BY da.attendance_date
-    `;
-
-    // Total present days aggregate
-    const [presentDays] = await sql`
+    `,
+        sql`
         SELECT COUNT(*) as count
         FROM daily_attendance da
         JOIN student_enrollments se ON da.student_enrollment_id = se.id
@@ -192,7 +186,8 @@ async function fetchAttendance(range, schoolId) {
         WHERE da.attendance_date >= ${start}
           AND da.status IN ('present', 'late', 'half_day')
           AND s.school_id = ${schoolId}
-    `;
+    `,
+    ]);
 
     return {
         avg_attendance: Math.round(avgAtt.pct || 0),
@@ -212,8 +207,15 @@ async function fetchAttendance(range, schoolId) {
 async function fetchAcademics(range, schoolId) {
     const start = getDateRange(range);
 
-    // Average score across all marks
-    const [avgScore] = await sql`
+    const [
+        [avgScore],
+        [passRate],
+        topSubjects,
+        weakSubjects,
+        [examsCount],
+        trend,
+    ] = await Promise.all([
+        sql`
         SELECT COALESCE(AVG(m.marks_obtained::FLOAT / NULLIF(es.max_marks, 0) * 100), 0)::FLOAT as avg
         FROM marks m
         JOIN exam_subjects es ON m.exam_subject_id = es.id
@@ -221,10 +223,8 @@ async function fetchAcademics(range, schoolId) {
         JOIN students s ON se.student_id = s.id
         WHERE s.school_id = ${schoolId}
           AND m.created_at >= ${start}
-    `;
-
-    // Pass rate — students with avg >= 35% of max marks
-    const [passRate] = await sql`
+    `,
+        sql`
         WITH student_pass AS (
             SELECT se.student_id,
                    CASE WHEN AVG(m.marks_obtained::FLOAT / NULLIF(es.max_marks, 0) * 100) >= 35 THEN 1 ELSE 0 END as passed
@@ -239,10 +239,8 @@ async function fetchAcademics(range, schoolId) {
         SELECT
             CASE WHEN COUNT(*) > 0 THEN (SUM(passed)::FLOAT / COUNT(*) * 100) ELSE 0 END as rate
         FROM student_pass
-    `;
-
-    // Top subject (highest avg score)
-    const topSubjects = await sql`
+    `,
+        sql`
         SELECT sub.name, AVG(m.marks_obtained::FLOAT / NULLIF(es.max_marks, 0) * 100) as avg_pct
         FROM marks m
         JOIN exam_subjects es ON m.exam_subject_id = es.id
@@ -254,10 +252,8 @@ async function fetchAcademics(range, schoolId) {
         GROUP BY sub.name
         ORDER BY avg_pct DESC
         LIMIT 1
-    `;
-
-    // Weakest subject (lowest avg score)
-    const weakSubjects = await sql`
+    `,
+        sql`
         SELECT sub.name, AVG(m.marks_obtained::FLOAT / NULLIF(es.max_marks, 0) * 100) as avg_pct
         FROM marks m
         JOIN exam_subjects es ON m.exam_subject_id = es.id
@@ -269,10 +265,8 @@ async function fetchAcademics(range, schoolId) {
         GROUP BY sub.name
         ORDER BY avg_pct ASC
         LIMIT 1
-    `;
-
-    // Exams conducted — count distinct exams
-    const [examsCount] = await sql`
+    `,
+        sql`
         SELECT COUNT(DISTINCT e.id) as count
         FROM exams e
         JOIN exam_subjects es ON e.id = es.exam_id
@@ -281,10 +275,8 @@ async function fetchAcademics(range, schoolId) {
         JOIN students s ON se.student_id = s.id
         WHERE s.school_id = ${schoolId}
           AND m.created_at >= ${start}
-    `;
-
-    // Academic trend — average score per exam
-    const trend = await sql`
+    `,
+        sql`
         SELECT
             e.name as label,
             AVG(m.marks_obtained::FLOAT / NULLIF(es.max_marks, 0) * 100) as value
@@ -297,7 +289,8 @@ async function fetchAcademics(range, schoolId) {
           AND m.created_at >= ${start}
         GROUP BY e.id, e.name, e.start_date
         ORDER BY e.start_date
-    `;
+    `,
+    ]);
 
     return {
         avg_score: Math.round(parseFloat(avgScore.avg) || 0),
@@ -316,19 +309,21 @@ async function fetchAcademics(range, schoolId) {
 async function fetchStaff(schoolId) {
     const start = getDateRange('month');
 
-    // Total staff
-    const [total] = await sql`
-        SELECT COUNT(*) FROM staff WHERE deleted_at IS NULL AND school_id = ${schoolId}
-    `;
-
-    // Active staff
-    const [active] = await sql`
-        SELECT COUNT(*) FROM staff WHERE status_id = 1 AND deleted_at IS NULL AND school_id = ${schoolId}
-    `;
-
-    // On leave today — from leave applications
-    // leave_applications uses applicant_id -> users(id), join through users -> staff
-    const [onLeave] = await sql`
+    const [
+        [total],
+        [active],
+        [onLeave],
+        [staffAttPct],
+        [newJoins],
+        [resigned],
+    ] = await Promise.all([
+        sql`
+        SELECT COUNT(*)::int as count FROM staff WHERE deleted_at IS NULL AND school_id = ${schoolId}
+    `,
+        sql`
+        SELECT COUNT(*)::int as count FROM staff WHERE status_id = 1 AND deleted_at IS NULL AND school_id = ${schoolId}
+    `,
+        sql`
         SELECT COUNT(DISTINCT st.id) as count
         FROM leave_applications la
         JOIN users u ON la.applicant_id = u.id
@@ -337,10 +332,8 @@ async function fetchStaff(schoolId) {
           AND CURRENT_DATE BETWEEN la.start_date AND la.end_date
           AND st.school_id = ${schoolId}
           AND st.deleted_at IS NULL
-    `;
-
-    // Average staff attendance % (current month)
-    const [staffAttPct] = await sql`
+    `,
+        sql`
         SELECT
             (COUNT(*) FILTER (WHERE sa.status IN ('present', 'late', 'half_day')))::FLOAT
             / NULLIF(COUNT(*), 0) * 100 as pct
@@ -349,25 +342,22 @@ async function fetchStaff(schoolId) {
         WHERE sa.attendance_date >= ${start}
           AND st.school_id = ${schoolId}
           AND st.deleted_at IS NULL
-    `;
-
-    // New joinings (staff created this month)
-    const [newJoins] = await sql`
+    `,
+        sql`
         SELECT COUNT(*) as count
         FROM staff
         WHERE created_at >= ${start}
           AND deleted_at IS NULL
           AND school_id = ${schoolId}
-    `;
-
-    // Resignations (staff with end_date in current month or status indicating resigned)
-    const [resigned] = await sql`
+    `,
+        sql`
         SELECT COUNT(*) as count
         FROM staff
         WHERE deleted_at IS NOT NULL
           AND deleted_at >= ${start}
           AND school_id = ${schoolId}
-    `;
+    `,
+    ]);
 
     return {
         total_staff: parseInt(total.count) || 0,
@@ -492,6 +482,24 @@ function generateInsights(financials, attendance, academics, staff) {
     return insights.slice(0, 5); // Return top 5 most relevant
 }
 
+const _analyticsCache = new Map();
+
+async function getOrFetchAnalytics(range, schoolId) {
+    const key = `${schoolId}:${range}`;
+    const cached = _analyticsCache.get(key);
+    if (cached && Date.now() < cached.expiresAt) return cached.data;
+
+    const [financials, attendance, academics, staff] = await Promise.all([
+        fetchFinancials(range, schoolId),
+        fetchAttendance(range, schoolId),
+        fetchAcademics(range, schoolId),
+        fetchStaff(schoolId),
+    ]);
+    const data = { financials, attendance, academics, staff };
+    _analyticsCache.set(key, { data, expiresAt: Date.now() + 5 * 60_000 });
+    return data;
+}
+
 /**
  * GET /admin/analytics — Full dashboard snapshot, 100% DB-driven
  */
@@ -499,12 +507,7 @@ router.get('/', requireAuth, asyncHandler(async (req, res) => {
     const { range = 'month' } = req.query;
     const schoolId = req.schoolId;
 
-    const [financials, attendance, academics, staff] = await Promise.all([
-        fetchFinancials(range, schoolId),
-        fetchAttendance(range, schoolId),
-        fetchAcademics(range, schoolId),
-        fetchStaff(schoolId)
-    ]);
+    const { financials, attendance, academics, staff } = await getOrFetchAnalytics(range, schoolId);
 
     const insights = generateInsights(financials, attendance, academics, staff);
 
@@ -542,12 +545,7 @@ router.get('/staff', requireAuth, asyncHandler(async (req, res) => {
 router.get('/insights', requireAuth, asyncHandler(async (req, res) => {
     const range = req.query.range || 'month';
     const schoolId = req.schoolId;
-    const [financials, attendance, academics, staff] = await Promise.all([
-        fetchFinancials(range, schoolId),
-        fetchAttendance(range, schoolId),
-        fetchAcademics(range, schoolId),
-        fetchStaff(schoolId)
-    ]);
+    const { financials, attendance, academics, staff } = await getOrFetchAnalytics(range, schoolId);
     const insights = generateInsights(financials, attendance, academics, staff);
     return sendSuccess(res, req.schoolId, insights);
 }));

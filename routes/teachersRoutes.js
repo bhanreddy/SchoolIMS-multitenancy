@@ -42,6 +42,8 @@ router.get(
 
 // ── GET /me/classes ────────────────────────────────────────────────────────────
 // Returns the classes & subjects assigned to the currently logged-in teacher.
+// Sources: timetable_slots AND class_subjects (UNION) so teachers see their
+// classes regardless of which table holds the assignment.
 // TCH1/TCH3: requireAuth guard
 // TCH3: school_id scoped on staff and class_sections joins
 router.get(
@@ -66,28 +68,62 @@ router.get(
       return res.status(404).json({ error: 'Staff profile not found' });
     }
 
-    // 2. Fetch class assignments scoped to this school's timetable
+    // 2. Fetch class assignments from BOTH timetable_slots AND class_subjects
+    //    so teachers see their classes regardless of which table holds the mapping.
     const assignments = await sql`
-      SELECT DISTINCT
-        ts.class_section_id,
-        c.id   AS class_id,
-        c.name AS class_name,
-        sec.id   AS section_id,
-        sec.name AS section_name,
-        s.id   AS subject_id,
-        s.name AS subject_name,
-        ts.class_section_id || '-' || ts.subject_id AS assignment_id
-      FROM timetable_slots ts
-      JOIN class_sections csec ON ts.class_section_id = csec.id
-        AND csec.school_id = ${schoolId}
-      JOIN classes c ON csec.class_id = c.id
-        AND c.school_id = ${schoolId}
-      JOIN sections sec ON csec.section_id = sec.id
-      JOIN subjects s ON ts.subject_id = s.id
-        AND s.school_id = ${schoolId}
-      WHERE ts.teacher_id = ${staff.id}
-        AND ts.school_id  = ${schoolId}
-      ORDER BY c.name, sec.name, s.name
+      SELECT DISTINCT ON (class_section_id, subject_id)
+        class_section_id,
+        class_id,
+        class_name,
+        section_id,
+        section_name,
+        subject_id,
+        subject_name,
+        class_section_id || '-' || subject_id AS assignment_id
+      FROM (
+        -- Source 1: timetable_slots
+        SELECT
+          ts.class_section_id,
+          c.id   AS class_id,
+          c.name AS class_name,
+          sec.id   AS section_id,
+          sec.name AS section_name,
+          s.id   AS subject_id,
+          s.name AS subject_name
+        FROM timetable_slots ts
+        JOIN class_sections csec ON ts.class_section_id = csec.id
+          AND csec.school_id = ${schoolId}
+        JOIN classes c ON csec.class_id = c.id
+          AND c.school_id = ${schoolId}
+        JOIN sections sec ON csec.section_id = sec.id
+        JOIN subjects s ON ts.subject_id = s.id
+          AND s.school_id = ${schoolId}
+        WHERE ts.teacher_id = ${staff.id}
+          AND ts.deleted_at IS NULL
+
+        UNION
+
+        -- Source 2: class_subjects
+        SELECT
+          csub.class_section_id,
+          c.id   AS class_id,
+          c.name AS class_name,
+          sec.id   AS section_id,
+          sec.name AS section_name,
+          s.id   AS subject_id,
+          s.name AS subject_name
+        FROM class_subjects csub
+        JOIN class_sections csec ON csub.class_section_id = csec.id
+          AND csec.school_id = ${schoolId}
+        JOIN classes c ON csec.class_id = c.id
+          AND c.school_id = ${schoolId}
+        JOIN sections sec ON csec.section_id = sec.id
+        JOIN subjects s ON csub.subject_id = s.id
+          AND s.school_id = ${schoolId}
+        WHERE csub.teacher_id = ${staff.id}
+          AND csub.school_id  = ${schoolId}
+      ) combined
+      ORDER BY class_section_id, subject_id, class_name, section_name, subject_name
     `;
 
     return sendSuccess(res, req.schoolId, assignments);
@@ -140,13 +176,13 @@ router.post(
       if (email) {
         await sql`
           INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary)
-    VALUES (${req.schoolId}, ${person.id}, 'email', ${email}, true)
+          VALUES (${req.schoolId}, ${person.id}, 'email', ${email}, true)
         `;
       }
       if (phone) {
         await sql`
           INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary)
-    VALUES (${req.schoolId}, ${person.id}, 'phone', ${phone}, true)
+          VALUES (${req.schoolId}, ${person.id}, 'phone', ${phone}, true)
         `;
       }
 

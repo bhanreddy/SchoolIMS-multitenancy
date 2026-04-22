@@ -8,8 +8,10 @@ const router = express.Router();
 // Get all students
 router.get('/', requirePermission('students.view'), async (req, res) => {
   try {
-    const { search, limit = 20, page = 1, class_id, section_id, status_id, sort_by = 'name', sort_order = 'asc' } = req.query;
-    const offset = (parseInt(page) - 1) * parseInt(limit);
+    const { search, page = 1, class_id, section_id, status_id, sort_by = 'name', sort_order = 'asc' } = req.query;
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? '20'), 10) || 20));
+    const pageNum = Math.max(1, parseInt(String(page), 10) || 1);
+    const offset = (pageNum - 1) * limit;
 
     let whereClause = sql`s.deleted_at IS NULL AND s.school_id = ${req.schoolId}`;
 
@@ -64,6 +66,7 @@ router.get('/', requirePermission('students.view'), async (req, res) => {
         json_build_object(
             'roll_number', se.roll_number,
             'class_code', c.code,
+            'class_name', c.name,
             'class_id', c.id,
             'section_name', sec.name,
             'section_id', sec.id,
@@ -96,9 +99,9 @@ router.get('/', requirePermission('students.view'), async (req, res) => {
       data: students,
       meta: {
         total: countResult.total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total_pages: Math.ceil(countResult.total / parseInt(limit))
+        page: pageNum,
+        limit,
+        total_pages: Math.ceil(countResult.total / limit)
       }
     });
   } catch (error) {
@@ -165,6 +168,7 @@ router.get('/profile/me', requireAuth, async (req, res) => {
                 'id', se.id,
                 'roll_number', se.roll_number,
                 'class_code', c.code,
+                'class_name', c.name,
                 'class_id', c.id,
                 'section_name', sec.name,
                 'section_id', sec.id,
@@ -282,6 +286,7 @@ router.get('/:id', requirePermission('students.view'), async (req, res) => {
                 'id', se.id,
                 'roll_number', se.roll_number,
                 'class_code', c.code,
+                'class_name', c.name,
                 'class_id', c.id,
                 'section_name', sec.name,
                 'section_id', sec.id,
@@ -362,7 +367,7 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
           ${req.schoolId}, ${person.id}, ${admission_no}, ${admission_date}, ${status_id},
           ${category_id}, ${religion_id}, ${blood_group_id}
         )
-        RETURNING *
+        RETURNING id, person_id, admission_no, admission_date, status_id, category_id, religion_id, blood_group_id, school_id, created_at, updated_at
       `;
 
       // 3. Contacts
@@ -392,10 +397,15 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
           // If user already exists, try to reuse the ID (Orphaned Auth User case)
           if (authError.message.includes('already been registered')) {
 
-            const { data: { users }, error: listError } = await supabaseAdmin.auth.admin.listUsers();
+            const { data: listed, error: listError } = await supabaseAdmin.auth.admin.listUsers({
+              page: 1,
+              perPage: 200,
+            });
             if (listError) throw new Error('Auth List Error: ' + listError.message);
 
-            const existingUser = users.find((u) => u.email === email);
+            const existingUser = listed.users.find(
+              (u) => (u.email || '').toLowerCase() === (email || '').toLowerCase()
+            );
             if (!existingUser) throw new Error('User reported existing but not found in list');
 
             authUserId = existingUser.id;
@@ -599,22 +609,30 @@ router.put('/:id', requirePermission('students.edit'), async (req, res) => {
     const {
       first_name, middle_name, last_name, dob, gender_id,
       admission_no, admission_date, status_id, category_id, religion_id, blood_group_id,
-      email, phone
+      email, phone, password
     } = req.body;
 
     // Ownership check must short-circuit as 404, not throw into catch/500.
     const [student] = await sql`
-      SELECT id, person_id
-      FROM students
-      WHERE id = ${id}
-        AND school_id = ${req.schoolId}
-        AND deleted_at IS NULL
+      SELECT 
+        s.id, s.person_id,
+        u.id as user_id,
+        (SELECT contact_value FROM person_contacts pc 
+         WHERE pc.person_id = s.person_id AND pc.contact_type = 'email' AND pc.is_primary = true LIMIT 1) as current_email,
+        (SELECT contact_value FROM person_contacts pc 
+         WHERE pc.person_id = s.person_id AND pc.contact_type = 'phone' AND pc.is_primary = true LIMIT 1) as current_phone
+      FROM students s
+      LEFT JOIN users u ON u.person_id = s.person_id
+      WHERE s.id = ${id}
+        AND s.school_id = ${req.schoolId}
+        AND s.deleted_at IS NULL
     `;
     if (!student) {
       return res.status(404).json({ error: 'Student not found' });
     }
 
     const personId = student.person_id;
+    const authUserId = student.user_id;
 
     const result = await sql.begin(async (sql) => {
 
@@ -692,9 +710,44 @@ router.put('/:id', requirePermission('students.edit'), async (req, res) => {
       return updatedStudent;
     });
 
+    // 5. Update Auth Credentials (Supabase auth.users via Admin API)
+    let authUpdateResult = null;
+    if (authUserId && supabaseAdmin) {
+      const authUpdates = {};
+
+      if (email && email !== student.current_email) {
+        authUpdates.email = email;
+      }
+      if (phone && phone !== student.current_phone) {
+        authUpdates.phone = phone;
+      }
+      if (password && password.length >= 6) {
+        authUpdates.password = password;
+      }
+
+      if (Object.keys(authUpdates).length > 0) {
+        const { data: authData, error: authError } = await supabaseAdmin.auth.admin.updateUserById(
+          authUserId,
+          authUpdates
+        );
+
+        if (authError) {
+          // Profile update succeeded but auth update failed
+          return res.status(207).json({
+            success: true,
+            message: 'Profile updated but login credentials failed to update',
+            student: result,
+            authError: authError.message
+          });
+        }
+        authUpdateResult = { updated: Object.keys(authUpdates) };
+      }
+    }
+
     sendSuccess(res, req.schoolId, {
       message: 'Student updated successfully',
-      student: result
+      student: result,
+      ...(authUpdateResult && { authUpdate: authUpdateResult })
     });
   } catch (error) {
 
@@ -826,7 +879,30 @@ router.get('/:id/enrollments', requirePermission('students.view'), async (req, r
     const [studentCheck] = await sql`SELECT id FROM students WHERE id = ${targetStudentId} AND school_id = ${req.schoolId} AND deleted_at IS NULL`;
     if (!studentCheck) return res.status(404).json({ error: 'Student not found' });
 
-    const enrollments = await sql`
+    const { page, limit } = req.query;
+    const usePaging = page !== undefined || limit !== undefined;
+    const lim = Math.min(parseInt(limit, 10) || 20, 100);
+    const pg = Math.max(parseInt(page, 10) || 1, 1);
+    const offset = (pg - 1) * lim;
+
+    const enrollments = usePaging
+      ? await sql`
+      SELECT
+        se.id, se.status, se.start_date, se.end_date, se.created_at,
+        c.name as class_name, s.name as section_name,
+        ay.code as academic_year
+      FROM student_enrollments se
+      JOIN class_sections cs ON se.class_section_id = cs.id
+      JOIN classes c ON cs.class_id = c.id
+      JOIN sections s ON cs.section_id = s.id
+      JOIN academic_years ay ON se.academic_year_id = ay.id
+      WHERE se.student_id = ${targetStudentId}
+        AND se.school_id = ${req.schoolId}
+        AND se.deleted_at IS NULL
+      ORDER BY se.start_date DESC
+      LIMIT ${lim} OFFSET ${offset}
+    `
+      : await sql`
       SELECT
         se.id, se.status, se.start_date, se.end_date, se.created_at,
         c.name as class_name, s.name as section_name,
@@ -841,6 +917,25 @@ router.get('/:id/enrollments', requirePermission('students.view'), async (req, r
         AND se.deleted_at IS NULL
       ORDER BY se.start_date DESC
     `;
+
+    if (usePaging) {
+      const [countResult] = await sql`
+        SELECT count(*)::int as total
+        FROM student_enrollments se
+        WHERE se.student_id = ${targetStudentId}
+          AND se.school_id = ${req.schoolId}
+          AND se.deleted_at IS NULL
+      `;
+      return sendSuccess(res, req.schoolId, {
+        records: enrollments,
+        meta: {
+          total: countResult.total,
+          page: pg,
+          limit: lim,
+          total_pages: Math.ceil(countResult.total / lim) || 1,
+        },
+      });
+    }
 
     sendSuccess(res, req.schoolId, enrollments);
   } catch (error) {
@@ -883,11 +978,32 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
     if (!hasViewPermission && !isOwner) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    const { from_date, to_date, limit = 30 } = req.query;
+    const { from_date, to_date, limit = 30, page } = req.query;
+    const usePaging = page !== undefined;
+    const lim = Math.min(parseInt(limit, 10) || 30, 200);
+    const pg = Math.max(parseInt(page, 10) || 1, 1);
+    const offset = (pg - 1) * lim;
 
     let attendance;
     if (from_date && to_date) {
-      attendance = await sql`
+      attendance = usePaging
+        ? await sql`
+        SELECT 
+          da.attendance_date, da.status, da.marked_at,
+          c.name as class_name, s.name as section_name
+        FROM daily_attendance da
+        JOIN student_enrollments se ON da.student_enrollment_id = se.id
+        JOIN class_sections cs ON se.class_section_id = cs.id
+        JOIN classes c ON cs.class_id = c.id
+        JOIN sections s ON cs.section_id = s.id
+        WHERE se.student_id = ${targetStudentId}
+          AND se.school_id = ${req.schoolId}
+          AND da.attendance_date BETWEEN ${from_date} AND ${to_date}
+          AND da.deleted_at IS NULL
+        ORDER BY da.attendance_date DESC
+        LIMIT ${lim} OFFSET ${offset}
+      `
+        : await sql`
         SELECT 
           da.attendance_date, da.status, da.marked_at,
           c.name as class_name, s.name as section_name
@@ -903,7 +1019,8 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
         ORDER BY da.attendance_date DESC
       `;
     } else {
-      attendance = await sql`
+      attendance = usePaging
+        ? await sql`
         SELECT 
           da.attendance_date, da.status, da.marked_at,
           c.name as class_name, s.name as section_name
@@ -916,7 +1033,22 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
           AND se.school_id = ${req.schoolId}
           AND da.deleted_at IS NULL
         ORDER BY da.attendance_date DESC
-        LIMIT ${limit}
+        LIMIT ${lim} OFFSET ${offset}
+      `
+        : await sql`
+        SELECT 
+          da.attendance_date, da.status, da.marked_at,
+          c.name as class_name, s.name as section_name
+        FROM daily_attendance da
+        JOIN student_enrollments se ON da.student_enrollment_id = se.id
+        JOIN class_sections cs ON se.class_section_id = cs.id
+        JOIN classes c ON cs.class_id = c.id
+        JOIN sections s ON cs.section_id = s.id
+        WHERE se.student_id = ${targetStudentId}
+          AND se.school_id = ${req.schoolId}
+          AND da.deleted_at IS NULL
+        ORDER BY da.attendance_date DESC
+        LIMIT ${lim}
       `;
     }
 
@@ -933,6 +1065,41 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
         AND se.school_id = ${req.schoolId}
         AND da.deleted_at IS NULL
     `;
+
+    if (usePaging) {
+      let countQuery;
+      if (from_date && to_date) {
+        countQuery = sql`
+          SELECT count(*)::int as total
+          FROM daily_attendance da
+          JOIN student_enrollments se ON da.student_enrollment_id = se.id
+          WHERE se.student_id = ${targetStudentId}
+            AND se.school_id = ${req.schoolId}
+            AND da.attendance_date BETWEEN ${from_date} AND ${to_date}
+            AND da.deleted_at IS NULL
+        `;
+      } else {
+        countQuery = sql`
+          SELECT count(*)::int as total
+          FROM daily_attendance da
+          JOIN student_enrollments se ON da.student_enrollment_id = se.id
+          WHERE se.student_id = ${targetStudentId}
+            AND se.school_id = ${req.schoolId}
+            AND da.deleted_at IS NULL
+        `;
+      }
+      const [countResult] = await countQuery;
+      return sendSuccess(res, req.schoolId, {
+        summary: summary[0],
+        records: attendance,
+        meta: {
+          total: countResult.total,
+          page: pg,
+          limit: lim,
+          total_pages: Math.ceil(countResult.total / lim) || 1,
+        },
+      });
+    }
 
     sendSuccess(res, req.schoolId, {
       summary: summary[0],
@@ -951,6 +1118,11 @@ router.get('/:id/attendance', requireAuth, async (req, res) => {
 router.get('/:id/fees', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    let targetStudentId = id;
+    if (id === 'me' || id === req.user.internal_id) {
+      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id} AND u.school_id = ${req.schoolId} AND s.school_id = ${req.schoolId}`;
+      if (s) targetStudentId = s.id;
+    }
 
     // Check access
     const hasViewPermission = req.user.permissions?.includes('students.view') || req.user.roles?.includes('admin');
@@ -963,7 +1135,7 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
             JOIN users u ON s.person_id = u.person_id
             WHERE u.id = ${req.user.internal_id} AND u.school_id = ${req.schoolId} AND s.school_id = ${req.schoolId}
         `;
-      if (student && student.id === id) {
+      if (student && student.id === targetStudentId) {
         isOwner = true;
       }
     }
@@ -971,14 +1143,31 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
     if (!hasViewPermission && !isOwner) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    const { academic_year_id } = req.query;
-
-    const targetStudentId = id;
+    const { academic_year_id, page, limit } = req.query;
+    const usePaging = page !== undefined || limit !== undefined;
+    const lim = Math.min(parseInt(limit, 10) || 20, 100);
+    const pg = Math.max(parseInt(page, 10) || 1, 1);
+    const offset = (pg - 1) * lim;
 
     // Get fees
     let fees;
     if (academic_year_id) {
-      fees = await sql`
+      fees = usePaging
+        ? await sql`
+        SELECT 
+          sf.id, sf.amount_due, sf.amount_paid, sf.discount, sf.status,
+          sf.due_date, sf.period_month, sf.period_year,
+          ft.name as fee_type
+        FROM student_fees sf
+        JOIN fee_structures fs ON sf.fee_structure_id = fs.id
+        JOIN fee_types ft ON fs.fee_type_id = ft.id
+        WHERE sf.student_id = ${targetStudentId}
+          AND sf.school_id = ${req.schoolId}
+          AND fs.academic_year_id = ${academic_year_id}
+        ORDER BY sf.due_date DESC
+        LIMIT ${lim} OFFSET ${offset}
+      `
+        : await sql`
         SELECT 
           sf.id, sf.amount_due, sf.amount_paid, sf.discount, sf.status,
           sf.due_date, sf.period_month, sf.period_year,
@@ -992,7 +1181,21 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
         ORDER BY sf.due_date DESC
       `;
     } else {
-      fees = await sql`
+      fees = usePaging
+        ? await sql`
+        SELECT 
+          sf.id, sf.amount_due, sf.amount_paid, sf.discount, sf.status,
+          sf.due_date, ft.name as fee_type, ay.code as academic_year
+        FROM student_fees sf
+        JOIN fee_structures fs ON sf.fee_structure_id = fs.id
+        JOIN fee_types ft ON fs.fee_type_id = ft.id
+        JOIN academic_years ay ON fs.academic_year_id = ay.id
+        WHERE sf.student_id = ${targetStudentId}
+          AND sf.school_id = ${req.schoolId}
+        ORDER BY sf.due_date DESC
+        LIMIT ${lim} OFFSET ${offset}
+      `
+        : await sql`
         SELECT 
           sf.id, sf.amount_due, sf.amount_paid, sf.discount, sf.status,
           sf.due_date, ft.name as fee_type, ay.code as academic_year
@@ -1018,6 +1221,39 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
         AND school_id = ${req.schoolId}
     `;
 
+    if (usePaging) {
+      let countSql;
+      if (academic_year_id) {
+        countSql = sql`
+          SELECT count(*)::int as total
+          FROM student_fees sf
+          JOIN fee_structures fs ON sf.fee_structure_id = fs.id
+          WHERE sf.student_id = ${targetStudentId}
+            AND sf.school_id = ${req.schoolId}
+            AND fs.academic_year_id = ${academic_year_id}
+        `;
+      } else {
+        countSql = sql`
+          SELECT count(*)::int as total
+          FROM student_fees sf
+          WHERE sf.student_id = ${targetStudentId}
+            AND sf.school_id = ${req.schoolId}
+        `;
+      }
+      const [countResult] = await countSql;
+      return sendSuccess(res, req.schoolId, {
+        student_id: targetStudentId,
+        summary: summary[0],
+        fees,
+        meta: {
+          total: countResult.total,
+          page: pg,
+          limit: lim,
+          total_pages: Math.ceil(countResult.total / lim) || 1,
+        },
+      });
+    }
+
     sendSuccess(res, req.schoolId, {
       student_id: targetStudentId,
       summary: summary[0],
@@ -1026,90 +1262,6 @@ router.get('/:id/fees', requireAuth, async (req, res) => {
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to fetch fees' });
-  }
-});
-
-/**
- * GET /students/:id/results
- * Get exam results for a student
- */
-router.get('/:id/results', requireAuth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    let targetStudentId = id;
-
-    // Resolve Auth ID to Student ID if needed (for "me" or internal_id)
-    if (req.user && (id === 'me' || id === req.user.internal_id)) {
-      const [s] = await sql`SELECT s.id FROM students s JOIN users u ON s.person_id = u.person_id WHERE u.id = ${req.user.internal_id} AND u.school_id = ${req.schoolId} AND s.school_id = ${req.schoolId}`;
-      if (s) targetStudentId = s.id;
-    }
-
-    // Check access
-    const hasViewPermission = req.user.permissions?.includes('students.view') || req.user.roles?.includes('admin');
-    let isOwner = false;
-
-    if (!hasViewPermission) {
-      const [student] = await sql`
-            SELECT s.id 
-            FROM students s
-            JOIN users u ON s.person_id = u.person_id
-            WHERE u.id = ${req.user.internal_id} AND u.school_id = ${req.schoolId} AND s.school_id = ${req.schoolId}
-        `;
-      if (student && student.id === targetStudentId) {
-        isOwner = true;
-      }
-    }
-
-    if (!hasViewPermission && !isOwner) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-    const { exam_id, academic_year_id } = req.query;
-
-    let results;
-    if (exam_id) {
-      results = await sql`
-        SELECT 
-          m.marks_obtained, m.is_absent, m.remarks,
-          s.name as subject_name,
-          es.max_marks, es.passing_marks,
-          e.name as exam_name
-        FROM marks m
-        JOIN exam_subjects es ON m.exam_subject_id = es.id
-        JOIN subjects s ON es.subject_id = s.id
-        JOIN exams e ON es.exam_id = e.id
-        JOIN student_enrollments se ON m.student_enrollment_id = se.id
-        WHERE se.student_id = ${targetStudentId}
-          AND es.exam_id = ${exam_id}
-        ORDER BY s.name
-      `;
-    } else {
-      results = await sql`
-        SELECT 
-          e.id as exam_id, e.name as exam_name, e.exam_type,
-          ay.code as academic_year,
-          COUNT(DISTINCT es.subject_id) as subjects_count,
-          SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) as total_obtained,
-          SUM(es.max_marks) as total_max
-        FROM marks m
-        JOIN exam_subjects es ON m.exam_subject_id = es.id
-        JOIN exams e ON es.exam_id = e.id
-        JOIN academic_years ay ON e.academic_year_id = ay.id
-        JOIN student_enrollments se ON m.student_enrollment_id = se.id
-        WHERE se.student_id = ${targetStudentId}
-          ${academic_year_id ? sql`AND e.academic_year_id = ${academic_year_id}` : sql``}
-        GROUP BY e.id, e.name, e.exam_type, ay.code
-        ORDER BY e.start_date DESC
-        LIMIT 10
-      `;
-    }
-
-    sendSuccess(res, req.schoolId, {
-      student_id: targetStudentId,
-      results
-    });
-  } catch (error) {
-
-    res.status(500).json({ error: 'Failed to fetch results' });
   }
 });
 
@@ -1142,7 +1294,7 @@ router.get('/:id/parents', requirePermission('students.view'), async (req, res) 
       JOIN parents pa ON sp.parent_id = pa.id
       JOIN persons p ON pa.person_id = p.id
       LEFT JOIN relationship_types rt ON sp.relationship_id = rt.id
-      WHERE sp.student_id = ${id}
+      WHERE sp.student_id = ${targetStudentId}
         AND pa.school_id = ${req.schoolId}
         AND sp.deleted_at IS NULL
         AND pa.deleted_at IS NULL
@@ -1187,6 +1339,184 @@ router.post('/:id/parents', requirePermission('students.edit'), async (req, res)
   } catch (error) {
 
     res.status(500).json({ error: 'Failed to link parent', details: error.message });
+  }
+});
+
+/**
+ * GET /students/:id/results
+ * Get exam results (marks), attendance %, grading scale for progress report
+ */
+router.get('/:id/results', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    let targetStudentId = id;
+
+    // Resolve Auth ID to Student ID if needed
+    if (id === 'me' || id === req.user.internal_id) {
+      const [s] = await sql`
+        SELECT s.id FROM students s
+        JOIN users u ON s.person_id = u.person_id
+        WHERE u.id = ${req.user.internal_id}
+          AND u.school_id = ${req.schoolId}
+          AND s.school_id = ${req.schoolId}
+      `;
+      if (s) targetStudentId = s.id;
+    }
+
+    // Access check: students.view OR own profile
+    const hasViewPermission = req.user.permissions?.includes('students.view') || req.user.roles?.includes('admin');
+    let isOwner = false;
+    if (!hasViewPermission) {
+      const [student] = await sql`
+        SELECT s.id FROM students s
+        JOIN users u ON s.person_id = u.person_id
+        WHERE u.id = ${req.user.internal_id}
+          AND u.school_id = ${req.schoolId}
+          AND s.school_id = ${req.schoolId}
+      `;
+      if (student && student.id === targetStudentId) isOwner = true;
+    }
+    if (!hasViewPermission && !isOwner) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // 1. Find student's active enrollment
+    const [enrollment] = await sql`
+      SELECT se.id, se.academic_year_id, se.class_section_id,
+             ay.code as academic_year_code
+      FROM student_enrollments se
+      JOIN academic_years ay ON se.academic_year_id = ay.id
+      WHERE se.student_id = ${targetStudentId}
+        AND se.school_id = ${req.schoolId}
+        AND se.status = 'active'
+        AND se.deleted_at IS NULL
+      LIMIT 1
+    `;
+
+    if (!enrollment) {
+      return sendSuccess(res, req.schoolId, {
+        exams: [],
+        attendance: { present: 0, absent: 0, late: 0, total: 0, percentage: 0 },
+        academic_year: 'N/A',
+        grading_scale: []
+      });
+    }
+
+    const subjectMarksRows = await sql`
+      SELECT
+        e.id AS exam_id,
+        e.name AS exam_name,
+        e.exam_type,
+        e.start_date,
+        e.end_date,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'subject', sub.name,
+              'maxMarks', es.max_marks,
+              'passingMarks', es.passing_marks,
+              'obtained', COALESCE(m.marks_obtained, 0),
+              'is_absent', COALESCE(m.is_absent, false),
+              'remarks', m.remarks
+            ) ORDER BY sub.name
+          ) FILTER (WHERE es.id IS NOT NULL),
+          '[]'::json
+        ) AS subjects
+      FROM exams e
+      LEFT JOIN exam_subjects es ON es.exam_id = e.id
+        AND es.school_id = ${req.schoolId}
+        AND es.deleted_at IS NULL
+      LEFT JOIN subjects sub ON es.subject_id = sub.id
+      LEFT JOIN marks m ON m.exam_subject_id = es.id
+        AND m.student_enrollment_id = ${enrollment.id}
+      WHERE e.academic_year_id = ${enrollment.academic_year_id}
+        AND e.school_id = ${req.schoolId}
+        AND e.deleted_at IS NULL
+        AND e.status != 'cancelled'
+      GROUP BY e.id, e.name, e.exam_type, e.start_date, e.end_date
+      ORDER BY e.start_date ASC
+    `;
+
+    const examResults = subjectMarksRows.map((row) => ({
+      exam_id: row.exam_id,
+      exam_name: row.exam_name,
+      exam_type: row.exam_type,
+      start_date: row.start_date,
+      end_date: row.end_date,
+      subjects: (row.subjects || []).map((sm) => ({
+        subject: sm.subject,
+        maxMarks: Number(sm.maxMarks),
+        passingMarks: Number(sm.passingMarks),
+        obtained: sm.is_absent ? 0 : Number(sm.obtained),
+        is_absent: sm.is_absent,
+        remarks: sm.remarks,
+      })),
+    }));
+
+    // 4. Attendance summary
+    const [attSummary] = await sql`
+      SELECT
+        COUNT(*) FILTER (WHERE da.status = 'present')::int as present,
+        COUNT(*) FILTER (WHERE da.status = 'absent')::int as absent,
+        COUNT(*) FILTER (WHERE da.status = 'late')::int as late,
+        COUNT(*)::int as total
+      FROM daily_attendance da
+      JOIN student_enrollments se ON da.student_enrollment_id = se.id
+      WHERE se.student_id = ${targetStudentId}
+        AND se.school_id = ${req.schoolId}
+        AND da.deleted_at IS NULL
+    `;
+    const total = attSummary.total || 0;
+    const presentCount = (attSummary.present || 0) + (attSummary.late || 0);
+    const attendancePercentage = total > 0 ? parseFloat(((presentCount / total) * 100).toFixed(1)) : 0;
+
+    // 5. Grading scale
+    const gradingScale = await sql`
+      SELECT grade, min_percentage, max_percentage, grade_point
+      FROM grading_scales
+      WHERE school_id = ${req.schoolId}
+        AND deleted_at IS NULL
+      ORDER BY min_percentage DESC
+    `;
+
+    // 6. Compute grades for each subject if grading scale exists
+    if (gradingScale.length > 0) {
+      for (const exam of examResults) {
+        for (const sub of exam.subjects) {
+          if (sub.maxMarks > 0) {
+            const pct = (sub.obtained / sub.maxMarks) * 100;
+            const matched = gradingScale.find(g =>
+              pct >= Number(g.min_percentage) && pct <= Number(g.max_percentage)
+            );
+            sub.grade = matched ? matched.grade : '-';
+          } else {
+            sub.grade = '-';
+          }
+        }
+      }
+    }
+
+    sendSuccess(res, req.schoolId, {
+      exams: examResults,
+      attendance: {
+        present: attSummary.present || 0,
+        absent: attSummary.absent || 0,
+        late: attSummary.late || 0,
+        total,
+        percentage: attendancePercentage
+      },
+      academic_year: enrollment.academic_year_code,
+      grading_scale: gradingScale.map(g => ({
+        grade: g.grade,
+        min: Number(g.min_percentage),
+        max: Number(g.max_percentage),
+        gpa: Number(g.grade_point)
+      }))
+    });
+
+  } catch (error) {
+    console.error('[GET /:id/results] Error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch results', details: error.message });
   }
 });
 

@@ -41,6 +41,15 @@ export const errorHandler = (err, req, res, next) => {
     });
   }
 
+  // PL/pgSQL RAISE EXCEPTION 'Unauthorized: ...' (e.g. diary class_subjects check)
+  if (typeof err.message === 'string' && err.message.startsWith('Unauthorized:')) {
+    const detail = err.message.slice('Unauthorized:'.length).trim();
+    return res.status(403).json({
+      error: detail || 'Forbidden',
+      requestId
+    });
+  }
+
   // Handle transient DB/network errors → 503 (so frontend can auto-retry)
   const transientCodes = ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'CONNECTION_ENDED', 'CONNECTION_CLOSED'];
   if (transientCodes.includes(err.code) || err.message?.includes('ETIMEDOUT') || err.message?.includes('Connect Timeout')) {

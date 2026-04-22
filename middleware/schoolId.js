@@ -7,6 +7,23 @@
  */
 
 /**
+ * Routes that derive tenant school_id from the authenticated user (JWT → users.school_id),
+ * never from query/body. Matches full req.path (e.g. /api/v1/settings/upi).
+ */
+const JWT_SCHOOL_ID_PATHS = [
+  /^\/api\/v1\/settings\/upi\/?$/i,
+  /^\/api\/settings\/upi\/?$/i,
+  /^\/api\/v1\/school-settings\/?$/i,
+  /^\/api\/v1\/dcgd\/?$/i,
+  /^\/api\/v1\/dcgd\/programs\/\d+\/content\/?$/i,
+];
+
+function pathUsesJwtSchoolId(req) {
+  const p = req.path || '';
+  return JWT_SCHOOL_ID_PATHS.some((re) => re.test(p));
+}
+
+/**
  * Extract school_id from request based on HTTP method.
  * @param {import('express').Request} req
  * @returns {string|null} Trimmed school_id or null if missing/empty
@@ -29,6 +46,14 @@ export const getSchoolId = (req) => {
  * Rejects with 400 if missing or empty. Sets req.schoolId on success.
  */
 export const requireSchoolId = (req, res, next) => {
+  if (pathUsesJwtSchoolId(req)) {
+    if (!req.user?.schoolId) {
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
+    req.schoolId = String(req.user.schoolId);
+    return next();
+  }
+
   const schoolId = getSchoolId(req);
 
   if (!schoolId) {

@@ -7,6 +7,44 @@ import config from '../config/env.js';
 
 const router = express.Router();
 
+/** OPT-20: short TTL cache for staff class_section_id (rarely changes mid-session). */
+const _authSectionCache = new Map();
+
+async function getActiveAcademicYearIdForSchool(schoolId) {
+  const [y] = await sql`
+    SELECT id FROM academic_years
+    WHERE now() BETWEEN start_date AND end_date
+      AND school_id = ${schoolId}
+    LIMIT 1
+  `;
+  return y?.id ?? null;
+}
+
+async function detectClassSectionForStaff(staffId, schoolId, academicYearId) {
+  if (!staffId || !academicYearId) return null;
+  const [row] = await sql`
+    (
+      SELECT class_section_id AS id FROM timetable_slots
+      WHERE teacher_id = ${staffId}
+        AND school_id = ${schoolId}
+        AND academic_year_id = ${academicYearId}
+        AND period_number = 1
+        AND deleted_at IS NULL
+      LIMIT 1
+    )
+    UNION ALL
+    (
+      SELECT id FROM class_sections
+      WHERE class_teacher_id = ${staffId}
+        AND school_id = ${schoolId}
+        AND academic_year_id = ${academicYearId}
+      LIMIT 1
+    )
+    LIMIT 1
+  `;
+  return row?.id ?? null;
+}
+
 /**
  * POST /auth/login
  * Login with email and password via Supabase Auth
@@ -73,40 +111,18 @@ router.post('/login', asyncHandler(async (req, res) => {
   // Check for Class/Section Assignment
   let classSectionId = null;
   if (dbUser.has_staff_profile && dbUser.staff_id) {
-    // Get active academic year
-    const [currentYear] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
-
-    if (currentYear) {
-      // Priority 1: Timetable Period 1
-      const [timetableAuto] = await sql`
-                SELECT class_section_id FROM timetable_slots 
-                WHERE teacher_id = ${dbUser.staff_id} 
-                  AND academic_year_id = ${currentYear.id} 
-                  AND period_number = 1
-                LIMIT 1
-            `;
-      if (timetableAuto) {
-        classSectionId = timetableAuto.class_section_id;
-      } else {
-        // Priority 2: Static Class Teacher Assignment
-        const [staticAuto] = await sql`
-                    SELECT id FROM class_sections 
-                    WHERE class_teacher_id = ${dbUser.staff_id} 
-                      AND academic_year_id = ${currentYear.id}
-                    LIMIT 1
-                `;
-        if (staticAuto) {
-          classSectionId = staticAuto.id;
-        }
-      }
+    const yearId = await getActiveAcademicYearIdForSchool(req.schoolId);
+    if (yearId) {
+      classSectionId = await detectClassSectionForStaff(dbUser.staff_id, req.schoolId, yearId);
     }
   } else if (dbUser.has_student_profile) {
-    // Get active enrollment for student
     const [enrollment] = await sql`
             SELECT se.class_section_id 
             FROM student_enrollments se
             JOIN students s ON se.student_id = s.id
             WHERE s.person_id = ${dbUser.person_id}
+              AND s.school_id = ${req.schoolId}
+              AND se.school_id = ${req.schoolId}
               AND se.status = 'active'
               AND se.deleted_at IS NULL
             LIMIT 1
@@ -179,8 +195,12 @@ router.post('/validate-school-user', asyncHandler(async (req, res) => {
   const userInfo = await sql`
     SELECT 
       u.id as user_id, u.school_id, u.account_status,
+      u.is_temporary_password,
       p.display_name, p.photo_url,
-      r.code as role_code, r.name as role_name
+      r.code as role_code, r.name as role_name,
+      (SELECT st.id FROM staff st
+       WHERE st.person_id = u.person_id AND st.school_id = u.school_id AND st.deleted_at IS NULL
+       LIMIT 1) as staff_id
     FROM users u
     JOIN persons p ON u.person_id = p.id
     JOIN user_roles ur ON ur.user_id = u.id
@@ -216,13 +236,18 @@ router.post('/validate-school-user', asyncHandler(async (req, res) => {
   // Map DB role codes to frontend-expected codes
   const roleCode = dbUser.role_code === 'accounts' ? 'accountant' : dbUser.role_code;
 
+  // Only return requiresPasswordChange for admin role
+  const requiresPasswordChange = roleCode === 'admin' && dbUser.is_temporary_password === true;
+
   return sendSuccess(res, req.schoolId, {
     userId: dbUser.user_id,
     schoolId: dbUser.school_id,
     displayName: dbUser.display_name,
     photoUrl: dbUser.photo_url,
     role: { code: roleCode, name: dbUser.role_name },
-    accountStatus: dbUser.account_status
+    accountStatus: dbUser.account_status,
+    staffId: dbUser.staff_id || null,
+    requiresPasswordChange
   });
 }));
 
@@ -304,29 +329,24 @@ router.get('/me', asyncHandler(async (req, res) => {
   // Check for Class/Section Assignment (Re-detect for /me)
   let classSectionId = null;
   if (dbUser.has_staff_profile && dbUser.staff_id) {
-    const [currentYear] = await sql`SELECT id FROM academic_years WHERE now() BETWEEN start_date AND end_date LIMIT 1`;
-    if (currentYear) {
-      const [timetableAuto] = await sql`
-                SELECT class_section_id FROM timetable_slots 
-                WHERE teacher_id = ${dbUser.staff_id} AND academic_year_id = ${currentYear.id} AND period_number = 1
-                LIMIT 1
-            `;
-      if (timetableAuto) {
-        classSectionId = timetableAuto.class_section_id;
-      } else {
-        const [staticAuto] = await sql`
-                    SELECT id FROM class_sections 
-                    WHERE class_teacher_id = ${dbUser.staff_id} AND academic_year_id = ${currentYear.id}
-                    LIMIT 1
-                `;
-        if (staticAuto) classSectionId = staticAuto.id;
-      }
+    const cacheKey = `${dbUser.id}:${req.schoolId}`;
+    const hit = _authSectionCache.get(cacheKey);
+    if (hit && Date.now() < hit.expiresAt) {
+      classSectionId = hit.id;
+    } else {
+      const yearId = await getActiveAcademicYearIdForSchool(req.schoolId);
+      classSectionId = yearId ? await detectClassSectionForStaff(dbUser.staff_id, req.schoolId, yearId) : null;
+      _authSectionCache.set(cacheKey, { id: classSectionId, expiresAt: Date.now() + 5 * 60_000 });
     }
   } else if (dbUser.has_student_profile) {
     const [enrollment] = await sql`
             SELECT class_section_id FROM student_enrollments se 
             JOIN students s ON se.student_id = s.id 
-            WHERE s.person_id = ${dbUser.person_id} AND se.status = 'active' AND se.deleted_at IS NULL 
+            WHERE s.person_id = ${dbUser.person_id}
+              AND s.school_id = ${req.schoolId}
+              AND se.school_id = ${req.schoolId}
+              AND se.status = 'active'
+              AND se.deleted_at IS NULL 
             LIMIT 1
         `;
     if (enrollment) classSectionId = enrollment.class_section_id;
@@ -408,18 +428,7 @@ router.post('/change-password', asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'New password must be at least 8 characters' });
   }
 
-  // We already have req.user from auth middleware, but we need email or phone to sign in again to verify old password.
-  // Let's get the email first from the database
-  const [dbUser] = await sql`SELECT email, person_id FROM users u 
-                               JOIN auth.users au ON u.id = au.id
-                               WHERE u.id = ${req.user.id}`;
-
-  // As we can't easily query auth.users from public schema if we don't have access,
-  // actually, let's use supabaseAdmin to get the user email if needed, or if we rely on req.user.email if available.
-  // Or we verify by attempting signInWithPassword using the user's email.
-
-  // Wait, let's do this cleaner:
-  const { data: userData, error: userError } = await supabase.auth.admin.getUserById(req.user.id);
+  const { data: userData, error: userError } = await supabaseAdmin.auth.admin.getUserById(req.user.id);
   if (userError || !userData.user) {
     return res.status(400).json({ error: 'User not found' });
   }
@@ -437,7 +446,7 @@ router.post('/change-password', asyncHandler(async (req, res) => {
   }
 
   // Now update the password
-  const { error: updateError } = await supabase.auth.admin.updateUserById(req.user.id, {
+  const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(req.user.id, {
     password: new_password
   });
 
@@ -471,6 +480,109 @@ router.post('/change-password', asyncHandler(async (req, res) => {
   }
 
   return sendSuccess(res, req.schoolId, { message: 'Password changed successfully. Please log in again.' });
+}));
+
+/**
+ * POST /auth/admin/change-password
+ * Change password for admin users with temporary password (forced password change flow)
+ * Uses the user's own session token - does not require current password
+ */
+router.post('/admin/change-password', asyncHandler(async (req, res) => {
+  const { newPassword, confirmPassword } = req.body;
+
+  if (!req.user || !req.user.id) {
+    return res.status(401).json({ success: false, message: 'Not authenticated' });
+  }
+
+  // Validate passwords match
+  if (!newPassword || !confirmPassword) {
+    return res.status(400).json({ success: false, message: 'New password and confirmation are required' });
+  }
+
+  if (newPassword !== confirmPassword) {
+    return res.status(400).json({ success: false, message: 'Passwords do not match' });
+  }
+
+  // Validate password strength
+  if (newPassword.length < 8) {
+    return res.status(400).json({ success: false, message: 'Password must be at least 8 characters' });
+  }
+
+  if (!/[A-Z]/.test(newPassword)) {
+    return res.status(400).json({ success: false, message: 'Password must contain at least 1 uppercase letter' });
+  }
+
+  if (!/[0-9]/.test(newPassword)) {
+    return res.status(400).json({ success: false, message: 'Password must contain at least 1 number' });
+  }
+
+  if (!/[!@#$%^&*(),.?":{}|<>]/.test(newPassword)) {
+    return res.status(400).json({ success: false, message: 'Password must contain at least 1 special character (!@#$%^&*)' });
+  }
+
+  // Verify user is admin with temporary password
+  const [userRecord] = await sql`
+    SELECT u.id, u.is_temporary_password, r.code as role_code
+    FROM users u
+    JOIN user_roles ur ON ur.user_id = u.id
+    JOIN roles r ON ur.role_id = r.id
+    WHERE u.id = ${req.user.id}
+      AND u.deleted_at IS NULL
+    LIMIT 1
+  `;
+
+  if (!userRecord) {
+    return res.status(404).json({ success: false, message: 'User not found' });
+  }
+
+  if (userRecord.role_code !== 'admin') {
+    return res.status(403).json({ success: false, message: 'This endpoint is only for admin users' });
+  }
+
+  if (!userRecord.is_temporary_password) {
+    return res.status(400).json({ success: false, message: 'Password change not required for this account' });
+  }
+
+  // Update password via Supabase Auth using user's own session
+  const { error: updateError } = await supabase.auth.updateUser({ password: newPassword });
+
+  if (updateError) {
+    return res.status(500).json({ success: false, message: 'Failed to update password', details: updateError.message });
+  }
+
+  // Clear the temporary password flag
+  await sql`
+    UPDATE users 
+    SET is_temporary_password = false 
+    WHERE id = ${req.user.id}
+  `;
+
+  // Log the password change event
+  try {
+    await sql`
+      INSERT INTO audit_logs (
+        user_id, 
+        action, 
+        entity, 
+        details, 
+        ip_address, 
+        user_agent, 
+        request_id
+      ) VALUES (
+        ${req.user.id}, 
+        'TEMPORARY_PASSWORD_CHANGED', 
+        'users', 
+        ${sql.json({ changed_at: new Date().toISOString(), was_temporary: true })}, 
+        ${req.ip}, 
+        ${req.headers['user-agent']}, 
+        ${req.headers['x-request-id']}
+      )
+    `;
+  } catch (auditErr) {
+    // Audit log failure should not break the main flow
+  }
+
+  return res.status(200).json({ success: true, message: 'Password changed successfully' });
 }));
 
 /**

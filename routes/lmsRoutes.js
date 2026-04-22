@@ -4,6 +4,12 @@ import { requirePermission } from '../middleware/auth.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
+import {
+  extractYoutubeVideoId,
+  fetchYoutubeDurationSeconds,
+} from '../utils/youtubeDuration.js';
+
+const LMS_YT_DURATION_BACKFILL_MAX = 25;
 
 const router = express.Router();
 
@@ -60,7 +66,74 @@ router.get('/all-materials', requirePermission('lms.view'), asyncHandler(async (
     ORDER BY m.created_at DESC
     LIMIT 100
   `;
+
+  // Backfill missing video lengths (seconds) from YouTube for legacy rows; cap work per request.
+  let filled = 0;
+  for (const row of materials) {
+    if (filled >= LMS_YT_DURATION_BACKFILL_MAX) break;
+    const d = row.duration;
+    if (d != null && Number(d) > 0) continue;
+    if (row.material_type !== 'video' || !row.content_url) continue;
+    const vid = extractYoutubeVideoId(row.content_url);
+    if (!vid) continue;
+    const sec = await fetchYoutubeDurationSeconds(vid);
+    if (sec == null || sec <= 0) continue;
+    await sql`
+      UPDATE lms_materials
+      SET duration = ${sec}
+      WHERE id = ${row.id} AND school_id = ${schoolId}
+    `;
+    row.duration = sec;
+    filled += 1;
+  }
+
   return sendSuccess(res, req.schoolId, materials);
+}));
+
+/**
+ * POST /lms/material/:id/view
+ * Records a completed video view (client should call once per completion). Increments view_count.
+ */
+router.post('/material/:id/view', requirePermission('lms.view'), asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const schoolId = req.schoolId;
+  let studentClassId = null;
+
+  if (req.user?.roles.includes('student')) {
+    const [enrollment] = await sql`
+      SELECT cs.class_id
+      FROM users u
+      JOIN students s ON u.person_id = s.person_id
+      JOIN student_enrollments se ON s.id = se.student_id
+      JOIN class_sections cs ON se.class_section_id = cs.id
+      WHERE u.id = ${req.user.internal_id}
+        AND se.status = 'active'
+        AND s.school_id = ${schoolId}
+      LIMIT 1
+    `;
+    studentClassId = enrollment?.class_id || null;
+  }
+
+  const [row] = await sql`
+    UPDATE lms_materials m
+    SET view_count = COALESCE(m.view_count, 0) + 1
+    FROM lms_courses c
+    WHERE m.id = ${id}
+      AND m.course_id = c.id
+      AND m.is_published = true
+      AND c.is_published = true
+      AND c.school_id = ${schoolId}
+      AND m.school_id = ${schoolId}
+      AND (m.deleted_at IS NULL)
+      ${studentClassId ? sql`AND c.class_id = ${studentClassId}` : sql``}
+    RETURNING m.id, m.view_count
+  `;
+
+  if (!row) {
+    return res.status(404).json({ error: 'Material not found or not accessible' });
+  }
+
+  return sendSuccess(res, req.schoolId, { material_id: row.id, view_count: row.view_count });
 }));
 
 /**
@@ -156,18 +229,35 @@ router.post('/courses', requirePermission('lms.create'), asyncHandler(async (req
 
   const isAdmin = req.user?.roles.includes('admin');
   if (!isAdmin) {
-    const [assignment] = await sql`
-      SELECT 1
-      FROM class_subjects cs
-      JOIN class_sections sec ON cs.class_section_id = sec.id
-      WHERE sec.class_id = ${class_id}
-        AND cs.subject_id = ${subject_id}
-        AND cs.teacher_id = ${staff.id}
-        AND sec.school_id = ${schoolId}
-      LIMIT 1
+    // Must match GET /teachers/me/classes: teachers may appear from class_subjects
+    // or only from timetable_slots; LMS picker uses that list, so authorize the same way.
+    const [authorized] = await sql`
+      SELECT (
+        EXISTS (
+          SELECT 1
+          FROM class_subjects cs
+          JOIN class_sections sec ON cs.class_section_id = sec.id
+          WHERE sec.class_id = ${class_id}
+            AND cs.subject_id = ${subject_id}
+            AND cs.teacher_id = ${staff.id}
+            AND sec.school_id = ${schoolId}
+            AND cs.school_id = ${schoolId}
+            AND cs.deleted_at IS NULL
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM timetable_slots ts
+          JOIN class_sections sec ON ts.class_section_id = sec.id
+          WHERE sec.class_id = ${class_id}
+            AND ts.subject_id = ${subject_id}
+            AND ts.teacher_id = ${staff.id}
+            AND ts.school_id = ${schoolId}
+            AND sec.school_id = ${schoolId}
+        )
+      ) AS ok
     `;
 
-    if (!assignment) {
+    if (!authorized?.ok) {
       return res.status(403).json({ error: 'You are not assigned to teach this subject in this class' });
     }
   }
@@ -253,7 +343,22 @@ router.post('/courses/:id/materials', requirePermission('lms.create'), asyncHand
   const safeDescription = description || '';
   const safeContentUrl = content_url || '';
   const safeFileSize = file_size ?? null;
-  const safeDuration = duration ?? null;
+  let safeDuration =
+    duration != null && duration !== '' ? parseInt(String(duration), 10) : null;
+  if (safeDuration != null && !Number.isFinite(safeDuration)) safeDuration = null;
+
+  if (
+    (safeDuration == null || safeDuration <= 0) &&
+    material_type === 'video' &&
+    safeContentUrl
+  ) {
+    const vid = extractYoutubeVideoId(safeContentUrl);
+    if (vid) {
+      const sec = await fetchYoutubeDurationSeconds(vid);
+      if (sec != null && sec > 0) safeDuration = sec;
+    }
+  }
+
   const safeIsPublished = is_published === true;
 
   const [material] = await sql`
@@ -318,7 +423,7 @@ router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async
 
   // LM3: Ownership check includes school_id scope
   const [material] = await sql`
-    SELECT c.instructor_id
+    SELECT m.content_url AS existing_url, m.material_type, c.instructor_id
     FROM lms_materials m
     JOIN lms_courses c ON m.course_id = c.id
     WHERE m.id = ${id}
@@ -335,6 +440,23 @@ router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async
     return res.status(403).json({ error: 'Only the course instructor or admin can edit this material' });
   }
 
+  let durationCoalesce = duration ?? null;
+  if (duration != null && duration !== '') {
+    const d = parseInt(String(duration), 10);
+    durationCoalesce = Number.isFinite(d) && d > 0 ? d : null;
+  } else if (
+    material.material_type === 'video' &&
+    content_url != null &&
+    content_url !== '' &&
+    content_url !== material.existing_url
+  ) {
+    const vid = extractYoutubeVideoId(content_url);
+    if (vid) {
+      const sec = await fetchYoutubeDurationSeconds(vid);
+      if (sec != null && sec > 0) durationCoalesce = sec;
+    }
+  }
+
   const [updated] = await sql`
     UPDATE lms_materials
     SET
@@ -342,7 +464,7 @@ router.put('/materials/:id', requirePermission('lms.create'), asyncHandler(async
       description = COALESCE(${description ?? null}, description),
       content_url = COALESCE(${content_url ?? null}, content_url),
       file_size = COALESCE(${file_size ?? null}, file_size),
-      duration = COALESCE(${duration ?? null}, duration),
+      duration = COALESCE(${durationCoalesce}, duration),
       sort_order = COALESCE(${sort_order ?? null}, sort_order),
       is_published = COALESCE(${is_published ?? null}, is_published)
     WHERE id = ${id}

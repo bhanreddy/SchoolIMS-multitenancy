@@ -1,8 +1,9 @@
 import express from 'express';
 import sql from '../db.js';
-import { requirePermission } from '../middleware/auth.js';
+import { requirePermission, requireAnyPermission } from '../middleware/auth.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { translateFields } from '../services/geminiTranslator.js';
 
 const router = express.Router();
 
@@ -12,9 +13,9 @@ const router = express.Router();
  * GET /results/subjects
  * List all subjects
  */
-router.get('/subjects', requirePermission('exams.view'), asyncHandler(async (req, res) => {
+router.get('/subjects', requireAnyPermission(['academics.view', 'exams.view']), asyncHandler(async (req, res) => {
   const subjects = await sql`
-    SELECT id, name, code, description
+    SELECT id, name, name_te, code, description
     FROM subjects
     WHERE school_id = ${req.schoolId}
     ORDER BY name
@@ -26,16 +27,28 @@ router.get('/subjects', requirePermission('exams.view'), asyncHandler(async (req
  * POST /results/subjects
  * Create a subject
  */
-router.post('/subjects', requirePermission('exams.manage'), asyncHandler(async (req, res) => {
-  const { name, code, description } = req.body;
+router.post('/subjects', requireAnyPermission(['academics.manage', 'exams.manage']), asyncHandler(async (req, res) => {
+  const { name, code, description, name_te } = req.body;
 
   if (!name) {
     return res.status(400).json({ error: 'Subject name is required' });
   }
 
+  const codeNorm = code != null && String(code).trim() !== '' ? String(code).trim() : null;
+  const descNorm = description != null && String(description).trim() !== '' ? String(description).trim() : null;
+
+  // Auto-translate if not provided
+  let finalNameTe = name_te ?? null;
+  if (!finalNameTe && name) {
+    try {
+      const te = await translateFields({ name });
+      finalNameTe = te.name || null;
+    } catch (e) {}
+  }
+
   const [subject] = await sql`
-    INSERT INTO subjects (school_id, name, code, description)
-    VALUES (${req.schoolId}, ${name}, ${code}, ${description})
+    INSERT INTO subjects (school_id, name, name_te, code, description)
+    VALUES (${req.schoolId}, ${name}, ${finalNameTe}, ${codeNorm}, ${descNorm})
     RETURNING *
   `;
 
@@ -46,40 +59,39 @@ router.post('/subjects', requirePermission('exams.manage'), asyncHandler(async (
  * DELETE /results/subjects/:id
  * Delete a subject (if not linked to exams, classes, or LMS)
  */
-router.delete('/subjects/:id', requirePermission('exams.manage'), asyncHandler(async (req, res) => {
+router.delete('/subjects/:id', requireAnyPermission(['academics.manage', 'exams.manage']), asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  // 1. Check for Exam Subjects (B2: school_id scoped)
-  const [hasExams] = await sql`SELECT 1 FROM exam_subjects WHERE subject_id = ${id} AND school_id = ${req.schoolId} AND school_id = ${req.schoolId} LIMIT 1`;
-  if (hasExams) {
+  const [hasExams, hasClasses, hasLMS, hasTimetable, hasDiary] = await Promise.all([
+    sql`SELECT 1 FROM exam_subjects WHERE subject_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`,
+    sql`SELECT 1 FROM class_subjects WHERE subject_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`,
+    sql`SELECT 1 FROM lms_courses WHERE subject_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`,
+    sql`
+      SELECT 1 FROM timetable_slots ts
+      JOIN class_sections cs ON ts.class_section_id = cs.id
+      WHERE ts.subject_id = ${id} AND cs.school_id = ${req.schoolId}
+      LIMIT 1
+    `,
+    sql`SELECT 1 FROM diary_entries WHERE subject_id = ${id} AND school_id = ${req.schoolId} LIMIT 1`,
+  ]);
+
+  if (hasExams.length) {
     return res.status(400).json({ error: 'Cannot delete subject: Linked to one or more exams' });
   }
-
-  // 2. Check for Class Subjects (mappings)
-  const [hasClasses] = await sql`SELECT 1 FROM class_subjects WHERE subject_id = ${id} AND school_id = ${req.schoolId} AND school_id = ${req.schoolId} LIMIT 1`;
-  if (hasClasses) {
+  if (hasClasses.length) {
     return res.status(400).json({ error: 'Cannot delete subject: Assigned to classes/sections' });
   }
-
-  // 3. Check for LMS Materials (subject via lms_courses)
-  const [hasLMS] = await sql`SELECT 1 FROM lms_courses WHERE subject_id = ${id} AND school_id = ${req.schoolId} AND school_id = ${req.schoolId} LIMIT 1`;
-  if (hasLMS) {
+  if (hasLMS.length) {
     return res.status(400).json({ error: 'Cannot delete subject: Linked to LMS materials' });
   }
-
-  // 4. Check for Timetable Entries
-  const [hasTimetable] = await sql`SELECT 1 FROM timetable_slots ts JOIN class_sections cs ON ts.class_section_id = cs.id WHERE ts.subject_id = ${id} AND cs.school_id = ${req.schoolId} LIMIT 1`;
-  if (hasTimetable) {
+  if (hasTimetable.length) {
     return res.status(400).json({ error: 'Cannot delete subject: Linked to timetable records' });
   }
-
-  // 5. Check for Diary Entries
-  const [hasDiary] = await sql`SELECT 1 FROM diary_entries WHERE subject_id = ${id} AND school_id = ${req.schoolId} AND school_id = ${req.schoolId} LIMIT 1`;
-  if (hasDiary) {
+  if (hasDiary.length) {
     return res.status(400).json({ error: 'Cannot delete subject: Linked to diary/homework records' });
   }
 
-  await sql`DELETE FROM subjects WHERE id = ${id} AND school_id = ${req.schoolId} AND school_id = ${req.schoolId}`;
+  await sql`DELETE FROM subjects WHERE id = ${id} AND school_id = ${req.schoolId}`;
   return sendSuccess(res, req.schoolId, { message: 'Subject deleted successfully' });
 }));
 
@@ -94,7 +106,7 @@ router.get('/exams', requirePermission('exams.view'), asyncHandler(async (req, r
 
   const exams = await sql`
     SELECT 
-      e.id, e.name, e.exam_type, e.start_date, e.end_date, e.status,
+      e.id, e.name, e.name_te, e.exam_type, e.start_date, e.end_date, e.status,
       ay.code as academic_year
     FROM exams e
     JOIN academic_years ay ON e.academic_year_id = ay.id
@@ -112,15 +124,24 @@ router.get('/exams', requirePermission('exams.view'), asyncHandler(async (req, r
  * Create an exam
  */
 router.post('/exams', requirePermission('exams.manage'), asyncHandler(async (req, res) => {
-  const { name, academic_year_id, exam_type, start_date, end_date, status } = req.body;
+  const { name, name_te, academic_year_id, exam_type, start_date, end_date, status } = req.body;
 
   if (!name || !academic_year_id || !exam_type) {
     return res.status(400).json({ error: 'name, academic_year_id, and exam_type are required' });
   }
 
+  // Auto-translate if not provided
+  let finalNameTe = name_te ?? null;
+  if (!finalNameTe && name) {
+    try {
+      const te = await translateFields({ name });
+      finalNameTe = te.name || null;
+    } catch (e) {}
+  }
+
   const [exam] = await sql`
-    INSERT INTO exams (school_id, name, academic_year_id, exam_type, start_date, end_date, status)
-    VALUES (${req.schoolId}, ${name}, ${academic_year_id}, ${exam_type}, ${start_date}, ${end_date}, ${status || 'scheduled'})
+    INSERT INTO exams (school_id, name, name_te, academic_year_id, exam_type, start_date, end_date, status)
+    VALUES (${req.schoolId}, ${name}, ${finalNameTe}, ${academic_year_id}, ${exam_type}, ${start_date ?? null}, ${end_date ?? null}, ${status || 'scheduled'})
     RETURNING *
   `;
 
@@ -149,7 +170,7 @@ router.get('/exams/:id', requirePermission('exams.view'), asyncHandler(async (re
   const subjects = await sql`
     SELECT 
       es.id, es.exam_date, es.max_marks, es.passing_marks,
-      s.name as subject_name, s.code as subject_code,
+      s.name as subject_name, s.name_te as subject_name_te, s.code as subject_code,
       c.name as class_name
     FROM exam_subjects es
     JOIN subjects s ON es.subject_id = s.id
@@ -252,7 +273,7 @@ router.post('/exams/:id/subjects', requirePermission('exams.manage'), asyncHandl
   // RES3 FIX: Add school_id to exam_subjects INSERT
   const [examSubject] = await sql`
     INSERT INTO exam_subjects (school_id, exam_id, subject_id, class_id, exam_date, max_marks, passing_marks)
-    VALUES (${req.schoolId}, ${id}, ${subject_id}, ${class_id}, ${exam_date}, ${max_marks || 100}, ${passing_marks || 35})
+    VALUES (${req.schoolId}, ${id}, ${subject_id}, ${class_id}, ${exam_date ?? null}, ${max_marks || 100}, ${passing_marks || 35})
     RETURNING *
   `;
 
@@ -310,15 +331,22 @@ router.post('/marks/upload', requirePermission('marks.enter'), asyncHandler(asyn
     `;
 
     try {
+      // Auto-translate remarks
+      let remarks_te = null;
+      if (remarks) {
+        try { const te = await translateFields({ remarks }); remarks_te = te.remarks || null; } catch (e) {}
+      }
+
       // Upsert marks (B2: school_id required)
       const [result] = await sql`
-        INSERT INTO marks (school_id, exam_subject_id, student_enrollment_id, marks_obtained, is_absent, remarks, entered_by)
-        VALUES (${req.schoolId}, ${exam_subject_id}, ${student_enrollment_id}, ${is_absent ? null : marks_obtained}, ${is_absent || false}, ${remarks}, ${enteredBy})
+        INSERT INTO marks (school_id, exam_subject_id, student_enrollment_id, marks_obtained, is_absent, remarks, remarks_te, entered_by)
+        VALUES (${req.schoolId}, ${exam_subject_id}, ${student_enrollment_id}, ${is_absent ? null : marks_obtained}, ${is_absent || false}, ${remarks}, ${remarks_te}, ${enteredBy})
         ON CONFLICT (school_id, exam_subject_id, student_enrollment_id) 
         DO UPDATE SET 
           marks_obtained = EXCLUDED.marks_obtained,
           is_absent = EXCLUDED.is_absent,
           remarks = EXCLUDED.remarks,
+          remarks_te = EXCLUDED.remarks_te,
           entered_by = EXCLUDED.entered_by
         RETURNING id
       `;
@@ -416,9 +444,9 @@ router.get('/marks/student/:studentId', requirePermission('marks.view'), asyncHa
     marksQuery = await sql`
       SELECT 
         m.id, m.marks_obtained, m.is_absent, m.remarks, m.remarks_te,
-        s.name as subject_name, s.code as subject_code,
+        s.name as subject_name, s.name_te as subject_name_te, s.code as subject_code,
         es.max_marks, es.passing_marks,
-        e.name as exam_name
+        e.name as exam_name, e.name_te as exam_name_te
       FROM marks m
       JOIN exam_subjects es ON m.exam_subject_id = es.id AND es.school_id = ${req.schoolId}
       JOIN subjects s ON es.subject_id = s.id
@@ -432,9 +460,9 @@ router.get('/marks/student/:studentId', requirePermission('marks.view'), asyncHa
     marksQuery = await sql`
       SELECT 
         m.id, m.marks_obtained, m.is_absent, m.remarks,
-        s.name as subject_name,
+        s.name as subject_name, s.name_te as subject_name_te,
         es.max_marks, es.passing_marks,
-        e.name as exam_name, e.exam_type,
+        e.name as exam_name, e.name_te as exam_name_te, e.exam_type,
         ay.code as academic_year
       FROM marks m
       JOIN exam_subjects es ON m.exam_subject_id = es.id AND es.school_id = ${req.schoolId}
@@ -586,7 +614,7 @@ router.get('/student/:studentId', requirePermission('results.view'), asyncHandle
   if (exam_id) {
     results = await sql`
       SELECT 
-        e.id as exam_id, e.name as exam_name, e.exam_type,
+        e.id as exam_id, e.name as exam_name, e.name_te as exam_name_te, e.exam_type,
         json_agg(json_build_object(
           'subject', sub.name,
           'marks_obtained', m.marks_obtained,
@@ -613,7 +641,7 @@ router.get('/student/:studentId', requirePermission('results.view'), asyncHandle
   } else {
     results = await sql`
       SELECT 
-        e.id as exam_id, e.name as exam_name, e.exam_type,
+        e.id as exam_id, e.name as exam_name, e.name_te as exam_name_te, e.exam_type,
         ay.code as academic_year,
         COUNT(DISTINCT es.subject_id) as subjects_count,
         SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) as total_obtained,
@@ -692,7 +720,7 @@ router.get('/generate', requirePermission('results.generate'), asyncHandler(asyn
       AND es.exam_id = ${exam_id}
       AND es.school_id = ${req.schoolId}
     LEFT JOIN subjects sub ON es.subject_id = sub.id
-    WHERE se.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
+    WHERE se.class_section_id = ${class_section_id}
       AND se.school_id = ${req.schoolId}
       AND se.status = 'active'
       AND st.deleted_at IS NULL
@@ -752,15 +780,41 @@ router.get('/summary/student/:studentId', requirePermission('results.view'), asy
  */
 router.get('/list/student/:studentId', requirePermission('results.view'), asyncHandler(async (req, res) => {
   const { studentId } = req.params;
-  const { exam_type, academic_year_id } = req.query;
+  const { exam_type, academic_year_id, page, limit } = req.query;
 
   if (!exam_type) {
     return res.status(400).json({ error: 'exam_type is required' });
   }
 
-  const exams = await sql`
+  const usePaging = page !== undefined || limit !== undefined;
+  const lim = Math.min(parseInt(limit, 10) || 15, 50);
+  const pg = Math.max(parseInt(page, 10) || 1, 1);
+  const offset = (pg - 1) * lim;
+
+  const exams = usePaging
+    ? await sql`
     SELECT 
-      e.id, e.name, e.exam_type, e.start_date, e.end_date, e.status,
+      e.id, e.name, e.name_te, e.exam_type, e.start_date, e.end_date, e.status,
+      ay.code as academic_year,
+      COUNT(DISTINCT es.subject_id) as subjects_count,
+      SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) as total_obtained,
+      SUM(es.max_marks) as total_max,
+      ROUND(CAST(SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) AS NUMERIC) / NULLIF(SUM(es.max_marks), 0) * 100, 2) as percentage
+    FROM marks m
+    JOIN exam_subjects es ON m.exam_subject_id = es.id
+    JOIN exams e ON es.exam_id = e.id
+    JOIN academic_years ay ON e.academic_year_id = ay.id
+    JOIN student_enrollments se ON m.student_enrollment_id = se.id
+    WHERE se.student_id = ${studentId}
+      AND e.exam_type = ${exam_type}
+      ${academic_year_id ? sql`AND e.academic_year_id = ${academic_year_id}` : sql``}
+    GROUP BY e.id, e.name, e.exam_type, e.start_date, e.end_date, e.status, ay.code
+    ORDER BY e.start_date DESC
+    LIMIT ${lim} OFFSET ${offset}
+  `
+    : await sql`
+    SELECT 
+      e.id, e.name, e.name_te, e.exam_type, e.start_date, e.end_date, e.status,
       ay.code as academic_year,
       COUNT(DISTINCT es.subject_id) as subjects_count,
       SUM(CASE WHEN m.is_absent THEN 0 ELSE m.marks_obtained END) as total_obtained,
@@ -777,6 +831,28 @@ router.get('/list/student/:studentId', requirePermission('results.view'), asyncH
     GROUP BY e.id, e.name, e.exam_type, e.start_date, e.end_date, e.status, ay.code
     ORDER BY e.start_date DESC
   `;
+
+  if (usePaging) {
+    const [countRow] = await sql`
+      SELECT count(DISTINCT e.id)::int as total
+      FROM marks m
+      JOIN exam_subjects es ON m.exam_subject_id = es.id
+      JOIN exams e ON es.exam_id = e.id
+      JOIN student_enrollments se ON m.student_enrollment_id = se.id
+      WHERE se.student_id = ${studentId}
+        AND e.exam_type = ${exam_type}
+        ${academic_year_id ? sql`AND e.academic_year_id = ${academic_year_id}` : sql``}
+    `;
+    return sendSuccess(res, req.schoolId, {
+      records: exams,
+      meta: {
+        total: countRow.total,
+        page: pg,
+        limit: lim,
+        total_pages: Math.ceil(countRow.total / lim) || 1,
+      },
+    });
+  }
 
   return sendSuccess(res, req.schoolId, exams);
 }));
@@ -847,7 +923,7 @@ router.get('/marks', requirePermission('marks.view'), asyncHandler(async (req, r
       m.remarks
     FROM student_enrollments se
     JOIN marks m ON m.student_enrollment_id = se.id AND m.school_id = ${req.schoolId}
-    WHERE se.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
+    WHERE se.class_section_id = ${class_section_id}
       AND se.school_id = ${req.schoolId}
       AND m.exam_subject_id = ${examSubject.id}
       AND se.status = 'active'
@@ -898,9 +974,11 @@ router.post('/upload', requirePermission('marks.enter'), asyncHandler(async (req
   `;
 
   if (!exam) {
+    let autoNameTe = null;
+    try { const te = await translateFields({ name: sub_exam }); autoNameTe = te.name || null; } catch (e) {}
     [exam] = await sql`
-      INSERT INTO exams (school_id, name, academic_year_id, exam_type, start_date, status)
-      VALUES (${req.schoolId}, ${sub_exam}, ${academic_year_id}, ${exam_category}, CURRENT_DATE, 'ongoing')
+      INSERT INTO exams (school_id, name, name_te, academic_year_id, exam_type, start_date, status)
+      VALUES (${req.schoolId}, ${sub_exam}, ${autoNameTe}, ${academic_year_id}, ${exam_category}, CURRENT_DATE, 'ongoing')
       RETURNING id, name, exam_type
     `;
   }

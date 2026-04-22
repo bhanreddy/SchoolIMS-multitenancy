@@ -4,6 +4,7 @@ import { asyncHandler } from '../utils/asyncHandler.js';
 import { requireAuth, requirePermission } from '../middleware/auth.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
+import { studentCacheGet, studentCacheSet } from '../utils/studentDataCache.js';
 
 const router = express.Router();
 
@@ -35,6 +36,14 @@ router.get('/:classSectionId/slots', requirePermission('academics.view'), asyncH
     else return sendSuccess(res, req.schoolId, []);
   }
 
+  const cacheKey = `${schoolId}:timetable:class_section:${classSectionId}:year:${yearId}`;
+  if (!lastSyncedAt) {
+    const cached = studentCacheGet(cacheKey);
+    if (cached) {
+      return sendSuccess(res, req.schoolId, cached);
+    }
+  }
+
   const slots = await sql`
     SELECT
       ts.id,
@@ -43,6 +52,7 @@ router.get('/:classSectionId/slots', requirePermission('academics.view'), asyncH
       ts.end_time,
       ts.room_no,
       sub.name as subject_name,
+      sub.name_te as subject_name_te,
       sub.id as subject_id,
       p.display_name as teacher_name,
       ts.teacher_id
@@ -50,11 +60,17 @@ router.get('/:classSectionId/slots', requirePermission('academics.view'), asyncH
     JOIN subjects sub ON ts.subject_id = sub.id
     LEFT JOIN staff st ON ts.teacher_id = st.id
     LEFT JOIN persons p ON st.person_id = p.id
-    WHERE ts.class_section_id = ${classSectionId} AND school_id = ${req.schoolId}
+    JOIN class_sections cs ON ts.class_section_id = cs.id
+    WHERE ts.class_section_id = ${classSectionId}
+      AND cs.school_id = ${schoolId}
       AND ts.academic_year_id = ${yearId}
       ${lastSyncedAt ? sql`AND (ts.updated_at >= ${lastSyncedAt} OR ts.created_at >= ${lastSyncedAt})` : sql``}
     ORDER BY ts.period_number
   `;
+
+  if (!lastSyncedAt) {
+    studentCacheSet(cacheKey, slots);
+  }
 
   return sendSuccess(res, req.schoolId, slots);
 }));
@@ -71,7 +87,8 @@ router.post('/', requirePermission('academics.manage'), asyncHandler(async (req,
     period_number,
     subject_id,
     teacher_id: provided_teacher_id,
-    room_no
+    room_no,
+    day_of_week = 'monday'
   } = req.body;
   const schoolId = req.schoolId;
 
@@ -91,6 +108,7 @@ router.post('/', requirePermission('academics.manage'), asyncHandler(async (req,
     SELECT start_time, end_time
     FROM periods
     WHERE sort_order = ${period_number}
+      AND school_id = ${schoolId}
     LIMIT 1
   `;
 
@@ -120,11 +138,11 @@ router.post('/', requirePermission('academics.manage'), asyncHandler(async (req,
 
     await sql`
       INSERT INTO timetable_slots (
-        academic_year_id, class_section_id, period_number,
-        subject_id, teacher_id, start_time, end_time, room_no
+        academic_year_id, class_section_id, period_number, day_of_week,
+        subject_id, teacher_id, start_time, end_time, room_no, school_id
       ) VALUES (
-        ${academic_year_id}, ${class_section_id}, ${period_number},
-        ${subject_id}, ${final_teacher_id}, ${start_time}, ${end_time}, ${final_room_no}
+        ${academic_year_id}, ${class_section_id}, ${period_number}, ${day_of_week},
+        ${subject_id}, ${final_teacher_id}, ${start_time}, ${end_time}, ${final_room_no}, ${schoolId}
       )
       ON CONFLICT (class_section_id, academic_year_id, period_number) WHERE deleted_at IS NULL
       DO UPDATE SET
@@ -133,6 +151,7 @@ router.post('/', requirePermission('academics.manage'), asyncHandler(async (req,
         start_time = EXCLUDED.start_time,
         end_time = EXCLUDED.end_time,
         room_no = EXCLUDED.room_no,
+        school_id = EXCLUDED.school_id,
         updated_at = now()
     `;
   });
@@ -163,7 +182,13 @@ router.delete('/:id', requirePermission('academics.manage'), asyncHandler(async 
   `;
   if (!slot) return res.status(404).json({ error: 'Timetable slot not found' });
 
-  await sql`DELETE FROM timetable_slots WHERE id = ${id} AND school_id = ${req.schoolId}`;
+  await sql`
+    DELETE FROM timetable_slots ts
+    USING class_sections cs
+    WHERE ts.id = ${id}
+      AND ts.class_section_id = cs.id
+      AND cs.school_id = ${schoolId}
+  `;
   return sendSuccess(res, req.schoolId, { message: 'Slot deleted' });
 }));
 
@@ -201,12 +226,15 @@ router.get('/my-timetable', requireAuth, asyncHandler(async (req, res) => {
       ts.end_time,
       ts.room_no,
       sub.name as subject_name,
+      sub.name_te as subject_name_te,
       p.display_name as teacher_name
     FROM timetable_slots ts
     JOIN subjects sub ON ts.subject_id = sub.id
     LEFT JOIN staff st ON ts.teacher_id = st.id
     LEFT JOIN persons p ON st.person_id = p.id
-    WHERE ts.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
+    JOIN class_sections cs ON ts.class_section_id = cs.id
+    WHERE ts.class_section_id = ${class_section_id}
+      AND cs.school_id = ${schoolId}
       AND ts.academic_year_id = ${academic_year_id}
       ${req.query.lastSyncedAt ? sql`AND (ts.updated_at >= ${req.query.lastSyncedAt} OR ts.created_at >= ${req.query.lastSyncedAt})` : sql``}
     ORDER BY ts.start_time
@@ -244,7 +272,8 @@ router.get('/teacher-timetable', requireAuth, asyncHandler(async (req, res) => {
       ts.room_no,
       c.name as class_name,
       sec.name as section_name,
-      sub.name as subject_name
+      sub.name as subject_name,
+      sub.name_te as subject_name_te
     FROM timetable_slots ts
     JOIN staff st ON ts.teacher_id = st.id
     JOIN persons p ON st.person_id = p.id
@@ -269,7 +298,9 @@ router.get('/teacher-timetable', requireAuth, asyncHandler(async (req, res) => {
  */
 router.get('/periods/list', requireAuth, asyncHandler(async (req, res) => {
   const periods = await sql`
-    SELECT * FROM periods
+    SELECT id, school_id, name, start_time, end_time, sort_order, created_at, updated_at
+    FROM periods
+    WHERE school_id = ${req.schoolId}
     ORDER BY sort_order ASC, start_time ASC
   `;
   return sendSuccess(res, req.schoolId, periods);
@@ -290,13 +321,17 @@ router.post('/periods/create', requirePermission('academics.manage'), asyncHandl
     return res.status(400).json({ error: 'End time must be after start time' });
   }
 
-  const [maxRow] = await sql`SELECT COALESCE(MAX(sort_order), 0) as max_order FROM periods`;
+  const [maxRow] = await sql`
+    SELECT COALESCE(MAX(sort_order), 0) AS max_order
+    FROM periods
+    WHERE school_id = ${req.schoolId}
+  `;
   const sort_order = maxRow.max_order + 1;
 
   const [created] = await sql`
     INSERT INTO periods (school_id, name, start_time, end_time, sort_order)
     VALUES (${req.schoolId}, ${name}, ${start_time}, ${end_time}, ${sort_order})
-    RETURNING *
+    RETURNING id, school_id, name, start_time, end_time, sort_order, created_at, updated_at
   `;
 
   return sendSuccess(res, req.schoolId, created, 201);
@@ -378,7 +413,11 @@ router.delete('/periods/:id', requirePermission('academics.manage'), asyncHandle
   const { id } = req.params;
   const schoolId = req.schoolId;
 
-  const [period] = await sql`SELECT * FROM periods WHERE id = ${id}`;
+  const [period] = await sql`
+    SELECT id, school_id, name, start_time, end_time, sort_order, created_at, updated_at
+    FROM periods
+    WHERE id = ${id} AND school_id = ${schoolId}
+  `;
   if (!period) {
     return res.status(404).json({ error: 'Period not found' });
   }

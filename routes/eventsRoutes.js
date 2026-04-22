@@ -62,7 +62,7 @@ router.get('/calendar', requirePermission('events.view'), asyncHandler(async (re
 
   const events = await sql`
     SELECT 
-      id, title, event_type, start_date, end_date, start_time, end_time,
+      id, title, title_te, event_type, start_date, end_date, start_time, end_time,
       is_all_day, location
     FROM events
     WHERE school_id = ${req.schoolId}

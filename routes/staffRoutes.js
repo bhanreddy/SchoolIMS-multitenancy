@@ -25,14 +25,65 @@ function normalizeStaffPayload(body) {
   };
 }
 
+function formatStaffPayslipRows(payslips) {
+  const formatCurrency = (amount) => `₹${Number(amount || 0).toLocaleString('en-IN')}`;
+  return payslips.map((p) => {
+    const date = new Date();
+    date.setMonth(Number(p.month) - 1);
+    const monthName = date.toLocaleString('default', { month: 'long' });
+    const statusStr = p.status != null ? String(p.status) : '';
+    return {
+      id: p.id,
+      month: `${monthName} ${p.year}`,
+      status: statusStr ? statusStr.charAt(0).toUpperCase() + statusStr.slice(1) : '',
+      earnings: formatCurrency(p.earnings),
+      deductions: formatCurrency(p.deductions),
+      net: formatCurrency(p.net),
+      payment_date: p.payment_date
+    };
+  });
+}
+
+/**
+ * @param {{ disbursedOnly?: boolean }} opts - If true, only rows marked paid by accounts (excludes pending payroll).
+ */
+async function fetchPayslipsForStaffId(staffId, schoolId, opts = {}) {
+  const { disbursedOnly = false } = opts;
+  return sql`
+    SELECT 
+      sp.id,
+      sp.payroll_month as month,
+      sp.payroll_year as year,
+      sp.status,
+      sp.net_salary as net,
+      sp.base_salary + COALESCE(sp.bonus, 0) as earnings,
+      sp.deductions as deductions,
+      sp.payment_date,
+      st.staff_code,
+      p.display_name as staff_name,
+      sd.name as designation
+    FROM staff_payroll sp
+    JOIN staff st ON sp.staff_id = st.id AND st.school_id = ${schoolId}
+    JOIN persons p ON st.person_id = p.id
+    LEFT JOIN staff_designations sd ON st.designation_id = sd.id
+    WHERE sp.staff_id = ${staffId}
+    ${disbursedOnly ? sql`AND sp.status = 'paid'` : sql``}
+    ORDER BY sp.payroll_year DESC, sp.payroll_month DESC
+  `;
+}
+
 /**
  * GET /staff
  * List all staff members
  */
 router.get('/', requirePermission('staff.view'), asyncHandler(async (req, res) => {
-  const { status, designation_id } = req.query;
+  const { status, designation_id, page = 1, limit = 50 } = req.query;
+  const safeLimit = Math.min(200, Math.max(1, parseInt(String(limit), 10) || 50));
+  const pageNum = Math.max(1, parseInt(String(page), 10) || 1);
+  const offset = (pageNum - 1) * safeLimit;
 
-  const staff = await sql`
+  const [staff, [countResult]] = await Promise.all([
+    sql`
     SELECT 
       st.id, st.staff_code, st.joining_date, st.salary,
       p.first_name, p.middle_name, p.last_name, p.display_name, p.dob, p.photo_url,
@@ -53,9 +104,50 @@ router.get('/', requirePermission('staff.view'), asyncHandler(async (req, res) =
       ${status ? sql`AND ss.code = ${status}` : sql``}
       ${designation_id ? sql`AND st.designation_id = ${designation_id}` : sql``}
     ORDER BY p.display_name
+    LIMIT ${safeLimit} OFFSET ${offset}
+  `,
+    sql`
+    SELECT COUNT(*)::int as total
+    FROM staff st
+    LEFT JOIN staff_statuses ss ON st.status_id = ss.id
+    WHERE st.deleted_at IS NULL
+      AND st.school_id = ${req.schoolId}
+      ${status ? sql`AND ss.code = ${status}` : sql``}
+      ${designation_id ? sql`AND st.designation_id = ${designation_id}` : sql``}
+  `,
+  ]);
+
+  return sendSuccess(res, req.schoolId, {
+    data: staff,
+    meta: {
+      total: countResult.total,
+      page: pageNum,
+      limit: safeLimit,
+      total_pages: Math.ceil(countResult.total / safeLimit) || 1,
+    },
+  });
+}));
+
+/**
+ * GET /staff/me/payslips
+ * Logged-in user's payslips from staff_payroll (same rows accounts updates via payroll routes).
+ * Uses person_id → staff.id so clients do not confuse users.id with staff.id.
+ */
+router.get('/me/payslips', requireAuth, asyncHandler(async (req, res) => {
+  const [targetStaff] = await sql`
+    SELECT id FROM staff
+    WHERE person_id = ${req.user.person_id}
+      AND school_id = ${req.schoolId}
+      AND deleted_at IS NULL
+    LIMIT 1
   `;
 
-  return sendSuccess(res, req.schoolId, staff);
+  if (!targetStaff) {
+    return sendSuccess(res, req.schoolId, []);
+  }
+
+  const payslips = await fetchPayslipsForStaffId(targetStaff.id, req.schoolId, { disbursedOnly: true });
+  return sendSuccess(res, req.schoolId, formatStaffPayslipRows(payslips));
 }));
 
 /**
@@ -206,16 +298,23 @@ router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res
   const {
     first_name, middle_name, last_name, dob, gender_id,
     staff_code, joining_date, status_id, designation_id, salary,
-    email, phone
+    email, phone, password
   } = req.body;
 
-  // Ownership check must short-circuit as 404, not throw into catch/500.
+  // Ownership check — also fetch the linked auth user_id and current email/phone
   const [staffCheck] = await sql`
-    SELECT person_id
-    FROM staff
-    WHERE id = ${id}
-      AND deleted_at IS NULL
-      AND school_id = ${req.schoolId}
+    SELECT 
+      st.person_id,
+      u.id as user_id,
+      (SELECT contact_value FROM person_contacts pc 
+       WHERE pc.person_id = st.person_id AND pc.contact_type = 'email' AND pc.is_primary = true LIMIT 1) as current_email,
+      (SELECT contact_value FROM person_contacts pc 
+       WHERE pc.person_id = st.person_id AND pc.contact_type = 'phone' AND pc.is_primary = true LIMIT 1) as current_phone
+    FROM staff st
+    LEFT JOIN users u ON u.person_id = st.person_id
+    WHERE st.id = ${id}
+      AND st.deleted_at IS NULL
+      AND st.school_id = ${req.schoolId}
   `;
 
   if (!staffCheck) {
@@ -223,6 +322,7 @@ router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res
   }
 
   const personId = staffCheck.person_id;
+  const authUserId = staffCheck.user_id;  // Supabase auth UUID (null if no login account)
 
   const result = await sql.begin(async (sql) => {
     // 1. Update Person
@@ -252,15 +352,14 @@ router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res
       RETURNING *
     `;
 
-    // 3. Update Contacts
+    // 3. Update Contacts (public table)
     if (email) {
       const [existing] = await sql`
         SELECT id FROM person_contacts 
         WHERE person_id = ${personId} AND contact_type = 'email' AND is_primary = true
       `;
       if (existing) {
-        await sql`UPDATE person_contacts SET contact_value = ${email} WHERE id = ${existing.id}
-      AND school_id = ${req.schoolId}`;
+        await sql`UPDATE person_contacts SET contact_value = ${email} WHERE id = ${existing.id} AND school_id = ${req.schoolId}`;
       } else {
         await sql`INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary) 
                   VALUES (${req.schoolId}, ${personId}, 'email', ${email}, true)`;
@@ -273,8 +372,7 @@ router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res
         WHERE person_id = ${personId} AND contact_type = 'phone' AND is_primary = true
       `;
       if (existing) {
-        await sql`UPDATE person_contacts SET contact_value = ${phone} WHERE id = ${existing.id}
-      AND school_id = ${req.schoolId}`;
+        await sql`UPDATE person_contacts SET contact_value = ${phone} WHERE id = ${existing.id} AND school_id = ${req.schoolId}`;
       } else {
         await sql`INSERT INTO person_contacts (school_id, person_id, contact_type, contact_value, is_primary) 
                   VALUES (${req.schoolId}, ${personId}, 'phone', ${phone}, true)`;
@@ -284,8 +382,53 @@ router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res
     return updatedStaff;
   });
 
-  return sendSuccess(res, req.schoolId, { message: 'Staff updated successfully', staff: result });
+  // 4. Update Auth Credentials (Supabase auth.users via Admin API)
+  //    Only if this staff member has a linked auth user AND credentials actually changed
+  let authUpdateResult = null;
+  if (authUserId && supabaseAdmin) {
+    const authUpdates = {};
+
+    // Only update email if it actually changed
+    if (email && email !== staffCheck.current_email) {
+      authUpdates.email = email;
+    }
+
+    // Only update phone if it actually changed
+    if (phone && phone !== staffCheck.current_phone) {
+      authUpdates.phone = phone;
+    }
+
+    // Password: only if provided and meets minimum length
+    if (password && password.length >= 6) {
+      authUpdates.password = password;
+    }
+
+    if (Object.keys(authUpdates).length > 0) {
+      const { data: authData, error: authError } = await supabaseAdmin.auth.admin.updateUserById(
+        authUserId,
+        authUpdates
+      );
+
+      if (authError) {
+        // Profile update succeeded but auth update failed — inform the caller
+        return res.status(207).json({
+          success: true,
+          message: 'Profile updated but login credentials failed to update',
+          staff: result,
+          authError: authError.message
+        });
+      }
+      authUpdateResult = { updated: Object.keys(authUpdates) };
+    }
+  }
+
+  return sendSuccess(res, req.schoolId, { 
+    message: 'Staff updated successfully', 
+    staff: result,
+    ...(authUpdateResult && { authUpdate: authUpdateResult })
+  });
 }));
+
 
 /**
  * DELETE /staff/:id
@@ -359,52 +502,9 @@ router.get('/:id/payslips', requireAuth, asyncHandler(async (req, res) => {
     return res.status(403).json({ error: 'Forbidden: missing permission staff.view' });
   }
 
-  // Get all payslips ordered by date desc
-  const payslips = await sql`
-        SELECT 
-            sp.id,
-            sp.payroll_month as month,
-            sp.payroll_year as year,
-            sp.status,
-            sp.net_salary as net,
-            sp.base_salary + COALESCE(sp.bonus, 0) as earnings,
-            sp.deductions as deductions,
-            sp.payment_date,
-            st.staff_code,
-            p.display_name as staff_name,
-            sd.name as designation
-        FROM staff_payroll sp
-        JOIN staff st ON sp.staff_id = st.id AND st.school_id = ${req.schoolId}
-        JOIN persons p ON st.person_id = p.id
-        LEFT JOIN staff_designations sd ON st.designation_id = sd.id
-        WHERE sp.staff_id = ${id}
-        ORDER BY sp.payroll_year DESC, sp.payroll_month DESC
-    `;
-
-  // Format for frontend (matches Payslip interface in payslip.tsx)
-  const formattedPayslips = payslips.map((p) => {
-    // Format currency helper
-    const formatCurrency = (amount) => {
-      return `₹${Number(amount || 0).toLocaleString('en-IN')}`;
-    };
-
-    // Get month name
-    const date = new Date();
-    date.setMonth(p.month - 1);
-    const monthName = date.toLocaleString('default', { month: 'long' });
-
-    return {
-      id: p.id,
-      month: `${monthName} ${p.year}`,
-      status: p.status.charAt(0).toUpperCase() + p.status.slice(1), // Capitalize
-      earnings: formatCurrency(p.earnings),
-      deductions: formatCurrency(p.deductions),
-      net: formatCurrency(p.net),
-      payment_date: p.payment_date
-    };
-  });
-
-  return sendSuccess(res, req.schoolId, formattedPayslips);
+  // Staff viewing own list: only after accounts disburses (paid). Admins viewing another member: include pending.
+  const payslips = await fetchPayslipsForStaffId(id, req.schoolId, { disbursedOnly: isSelf });
+  return sendSuccess(res, req.schoolId, formatStaffPayslipRows(payslips));
 }));
 
 /**

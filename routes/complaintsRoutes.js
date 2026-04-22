@@ -21,7 +21,8 @@ router.get('/', requirePermission('complaints.view'), asyncHandler(async (req, r
   if (isAdmin) {
     complaints = await sql`
       SELECT 
-        c.id, c.ticket_no, c.title, c.title_te, c.category, c.priority, c.status,
+        c.id, c.ticket_no, c.title, c.title_te, c.description, c.description_te, c.category, c.priority, c.status,
+        c.resolution, c.resolution_te,
         c.created_at, c.resolved_at,
         raiser.display_name as raised_by_name,
         assignee.display_name as assigned_to_name
@@ -51,7 +52,8 @@ router.get('/', requirePermission('complaints.view'), asyncHandler(async (req, r
 
     complaints = await sql`
       SELECT 
-        c.id, c.ticket_no, c.title, c.title_te, c.description_te, c.category, c.priority, c.status,
+        c.id, c.ticket_no, c.title, c.title_te, c.description, c.description_te, c.category, c.priority, c.status,
+        c.resolution, c.resolution_te,
         c.created_at, c.resolved_at,
         raiser.display_name as raised_by_name
       FROM complaints c
@@ -174,15 +176,18 @@ router.post('/', requirePermission('complaints.create'), asyncHandler(async (req
       const recipients = await sql`
         SELECT u.id as user_id
         FROM users u
-        JOIN parents p ON u.person_id = p.person_id
-        JOIN student_parents sp ON p.id = sp.parent_id
+        JOIN parents p ON u.person_id = p.person_id AND p.school_id = ${req.schoolId}
+        JOIN student_parents sp ON p.id = sp.parent_id AND sp.school_id = ${req.schoolId}
         WHERE sp.student_id = ${raised_for_student_id}
+          AND u.school_id = ${req.schoolId}
           AND u.account_status = 'active'
         UNION
         SELECT u.id as user_id
         FROM users u
         JOIN students s ON u.person_id = s.person_id
         WHERE s.id = ${raised_for_student_id}
+          AND s.school_id = ${req.schoolId}
+          AND u.school_id = ${req.schoolId}
           AND u.account_status = 'active'
       `;
 
@@ -272,12 +277,15 @@ router.put('/:id', requireAuth, asyncHandler(async (req, res) => {
           SELECT u.id as user_id FROM users u
           JOIN students s ON u.person_id = s.person_id
           WHERE s.id = ${updated.raised_for_student_id}
+            AND s.school_id = ${req.schoolId}
+            AND u.school_id = ${req.schoolId}
             AND u.account_status = 'active'
           UNION
           SELECT u.id as user_id FROM users u
-          JOIN parents p ON u.person_id = p.person_id
-          JOIN student_parents sp ON p.id = sp.parent_id
+          JOIN parents p ON u.person_id = p.person_id AND p.school_id = ${req.schoolId}
+          JOIN student_parents sp ON p.id = sp.parent_id AND sp.school_id = ${req.schoolId}
           WHERE sp.student_id = ${updated.raised_for_student_id}
+            AND u.school_id = ${req.schoolId}
             AND u.account_status = 'active'
         `;
 

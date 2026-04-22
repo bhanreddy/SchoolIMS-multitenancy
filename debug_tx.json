@@ -1,0 +1,13 @@
+{
+  "id": "c139b0d9-2766-4008-8a6f-a56726e434aa",
+  "amount": "1000.00",
+  "payment_method": "cash",
+  "transaction_ref": "830a7b02-3672-4821-9917-5f35c7262d83",
+  "paid_at": "2026-03-23T05:11:20.624Z",
+  "remarks": null,
+  "admission_no": "1",
+  "student_name": "Bharath  Reddy",
+  "fee_type": "Tution Fee",
+  "academic_year": "2025-2026",
+  "received_by": "Bhanu Reddy"
+}

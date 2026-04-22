@@ -7,6 +7,22 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const router = express.Router();
 
+const GEMINI_TIMEOUT_MS = 10_000;
+let _geminiModel = null;
+
+function getGeminiModel() {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+    if (!_geminiModel) {
+        const genAI = new GoogleGenerativeAI(apiKey);
+        _geminiModel = genAI.getGenerativeModel({ model: 'gemini-flash-latest' });
+    }
+    return _geminiModel;
+}
+
+/** OPT-19: cache net-balance for identical school + date window (5 min). */
+const _netBalanceCache = new Map();
+
 /**
  * GET /admin/analytics/risk
  * AN1: scoped students query to school_id
@@ -194,16 +210,14 @@ router.get('/talking-points/:id', requireAuth, asyncHandler(async (req, res) => 
 
     if (!student) return res.status(404).json({ error: 'Student not found' });
 
-    // Complaint count — scoped to school
-    const [complaintStats] = await sql`
-        SELECT COUNT(*) as count
+    const [[complaintStats], failedSubjects, [attendance]] = await Promise.all([
+        sql`
+        SELECT COUNT(*)::int as count
         FROM complaints
         WHERE raised_for_student_id = ${student.id}
           AND school_id = ${schoolId}
-    `;
-
-    // Failed subjects — scoped through students.school_id
-    const failedSubjects = await sql`
+    `,
+        sql`
         SELECT sub.name
         FROM marks m
         JOIN exam_subjects es ON m.exam_subject_id = es.id
@@ -215,10 +229,8 @@ router.get('/talking-points/:id', requireAuth, asyncHandler(async (req, res) => 
           AND m.marks_obtained < 35
         ORDER BY m.created_at DESC
         LIMIT 5
-    `;
-
-    // Attendance — scoped through students.school_id
-    const [attendance] = await sql`
+    `,
+        sql`
         SELECT
             COUNT(*) FILTER (WHERE da.status IN ('present', 'late', 'half_day'))::FLOAT / NULLIF(COUNT(*), 0) * 100 as pct
         FROM daily_attendance da
@@ -227,7 +239,8 @@ router.get('/talking-points/:id', requireAuth, asyncHandler(async (req, res) => 
         WHERE se.student_id = ${student.id}
           AND s.school_id = ${schoolId}
           AND da.attendance_date > CURRENT_DATE - INTERVAL '60 days'
-    `;
+    `,
+    ]);
 
     const attPct = attendance && attendance.pct ? attendance.pct.toFixed(1) : 100;
     const subjects = failedSubjects.length > 0 ? [...new Set(failedSubjects.map(f => f.name))].join(', ') : 'None';
@@ -249,13 +262,14 @@ Instructions:
 
     let points = [];
     try {
-        const apiKey = process.env.GEMINI_API_KEY;
-        if (!apiKey) throw new Error("GEMINI_API_KEY not found in environment");
+        const model = getGeminiModel();
 
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: 'gemini-flash-latest' });
-
-        const result = await model.generateContent(prompt);
+        const result = await Promise.race([
+            model.generateContent(prompt),
+            new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Gemini timeout')), GEMINI_TIMEOUT_MS)
+            ),
+        ]);
         let responseText = result.response.text().trim();
 
         const start = responseText.indexOf('[');
@@ -309,40 +323,46 @@ router.get('/net-balance', requireAuth, asyncHandler(async (req, res) => {
         return res.status(400).json({ error: 'startDate and endDate are required' });
     }
 
-    // AN4: Fee collected — via student_fees join
-    const [feeStats] = await sql`
+    const cacheKey = `${schoolId}:${startDate}:${endDate}`;
+    const cached = _netBalanceCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+        return sendSuccess(res, req.schoolId, cached.payload);
+    }
+
+    const [[feeStats], [salaryStats], [expenseStats]] = await Promise.all([
+        sql`
         SELECT COALESCE(SUM(ft.amount), 0) as total
         FROM fee_transactions ft
         JOIN student_fees sf ON ft.student_fee_id = sf.id
         WHERE ft.paid_at BETWEEN ${startDate} AND ${endDate}::date + INTERVAL '1 day'
           AND sf.school_id = ${schoolId}
-    `;
-
-    // AN4: Salary paid — via staff join
-    const [salaryStats] = await sql`
+    `,
+        sql`
         SELECT COALESCE(SUM(sp.net_salary), 0) as total
         FROM staff_payroll sp
         JOIN staff st ON sp.staff_id = st.id
         WHERE sp.status = 'paid'
           AND sp.payment_date BETWEEN ${startDate} AND ${endDate}
           AND st.school_id = ${schoolId}
-    `;
-
-    // AN4: Other expenses — via expenses.school_id
-    const [expenseStats] = await sql`
+    `,
+        sql`
         SELECT COALESCE(SUM(amount), 0) as total
         FROM expenses
         WHERE status = 'paid'
           AND expense_date BETWEEN ${startDate} AND ${endDate}
           AND school_id = ${schoolId}
-    `;
+    `,
+    ]);
 
     const totalFee = parseFloat(feeStats.total);
     const totalSalary = parseFloat(salaryStats.total);
     const totalExpenses = parseFloat(expenseStats.total);
     const netBalance = totalFee - totalSalary - totalExpenses;
 
-    return sendSuccess(res, req.schoolId, { totalFee, totalSalary, totalExpenses, netBalance });
+    const payload = { totalFee, totalSalary, totalExpenses, netBalance };
+    _netBalanceCache.set(cacheKey, { payload, expiresAt: Date.now() + 5 * 60_000 });
+
+    return sendSuccess(res, req.schoolId, payload);
 }));
 
 export default router;

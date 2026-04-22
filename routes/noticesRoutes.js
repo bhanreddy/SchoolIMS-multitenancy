@@ -37,7 +37,7 @@ router.get('/', requirePermission('notices.view'), asyncHandler(async (req, res)
       ${class_id ? sql`AND (n.target_class_id = ${class_id} OR n.target_class_id IS NULL)` : sql``}
       ${pinned_only === 'true' ? sql`AND n.is_pinned = true` : sql``}
       ${lastSyncedAt ? sql`AND (n.created_at >= ${lastSyncedAt} OR n.publish_at >= ${lastSyncedAt})` : sql``}
-    ORDER BY n.is_pinned DESC, n.publish_at DESC
+    ORDER BY n.publish_at DESC, n.created_at DESC
     LIMIT ${limit} OFFSET ${offset}
   `;
 
@@ -262,7 +262,7 @@ router.put('/:id', requirePermission('notices.manage'), asyncHandler(async (req,
 router.delete('/:id', requirePermission('notices.manage'), asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  const [deleted] = await sql`DELETE FROM notices WHERE id = ${id} AND school_id = ${req.schoolId} AND school_id = ${req.schoolId} RETURNING id`;
+  const [deleted] = await sql`DELETE FROM notices WHERE id = ${id} AND school_id = ${req.schoolId} RETURNING id`;
 
   if (!deleted) {
     return res.status(404).json({ error: 'Notice not found' });

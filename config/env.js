@@ -67,4 +67,4 @@ Object.freeze(config.cors);
 Object.freeze(config.firebase);
 Object.freeze(config.auth);
 
-export default config;
+export default config;

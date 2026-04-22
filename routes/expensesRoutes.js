@@ -81,10 +81,10 @@ router.post('/', requirePermission('expenses.create'), asyncHandler(async (req, 
  */
 router.put('/:id/status', requirePermission('expenses.approve'), asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { status, remarks } = req.body; // status: 'approved' | 'rejected'
+  const { status, remarks } = req.body; // status: 'approved' | 'rejected' | 'paid'
 
-  if (!['approved', 'rejected'].includes(status)) {
-    return res.status(400).json({ error: 'Invalid status. Use approved or rejected.' });
+  if (!['approved', 'rejected', 'paid'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid status. Use approved, rejected, or paid.' });
   }
 
   // E2 FIX: Ownership check first
@@ -114,10 +114,11 @@ router.put('/:id/status', requirePermission('expenses.approve'), asyncHandler(as
         // Verify user is active
         const [user] = await sql`SELECT id FROM users WHERE id = ${updated.created_by} AND account_status = 'active'`;
         if (user) {
-          const eventType = status === 'approved' ? 'EXPENSE_APPROVED' : 'EXPENSE_REJECTED';
-          const message = status === 'approved' ?
-          'Your expense has been approved.' :
-          'Your expense has been rejected.';
+          const eventType = status === 'approved' ? 'EXPENSE_APPROVED' : 
+                            status === 'paid' ? 'EXPENSE_PAID' : 'EXPENSE_REJECTED';
+          const message = status === 'approved' ? 'Your expense has been approved.' :
+                          status === 'paid' ? 'Your expense has been paid.' :
+                          'Your expense has been rejected.';
 
           await sendNotificationToUsers(
             [updated.created_by],

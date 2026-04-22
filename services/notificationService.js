@@ -115,39 +115,67 @@ export async function sendNotificationToUsers(userIds = [], type, params = {}, c
 async function sendBatch(tokens, { title, body, deepLink, soundFile, channelId, type, customSound = true }) {
   if (tokens.length === 0) return { success: 0, failure: 0 };
 
-  // Include top-level 'notification' key so Android OS handles it securely in killed/terminated state.
+  // soundBase = filename without extension (required by Android's raw res lookup).
+  // FCM will automatically add .wav/.mp3 when playing; the raw resource must be
+  // named exactly <soundBase>.wav in android/app/src/main/res/raw/.
   const soundBase = soundFile && soundFile !== 'default' ? soundFile.replace(/\.[^/.]+$/, "") : 'default';
 
   const message = {
     tokens,
+
+    // TOP-LEVEL notification block — REQUIRED for background/killed delivery.
+    // Without this, Android's FCM SDK has nothing to render in the system tray
+    // when JS is not running, and the user sees an empty/silent notification.
     notification: {
       title,
-      body,
+      body
     },
+
     android: {
-      priority: 'high', // Ensure timely delivery even in Doze mode
+      priority: 'high',        // Delivered even in Doze mode
+      ttl: 86400 * 1000,       // TTL is in MILLISECONDS for admin SDK, not seconds
       notification: {
-        channelId: channelId,
-        sound: soundBase,
+        title,                 // Override for Android-specific customization
+        body,
+        channelId: channelId,  // Must match a channel created on the device
+        sound: soundBase,      // Raw resource name WITHOUT extension (e.g. "voice_alert")
+        defaultSound: false,
+        priority: 'high',
+        visibility: 'public',
+        notificationPriority: 'PRIORITY_MAX',
+        notificationCount: 1
       }
     },
+
     apns: {
+      headers: {
+        'apns-priority': '10',      // 10 = immediate delivery (required for alert)
+        'apns-push-type': 'alert'   // Required on iOS 13+ when showing an alert
+      },
       payload: {
         aps: {
-          sound: soundFile || 'default',
-          'content-available': 1,
-          'mutable-content': 1
+          alert: {
+            title,
+            body
+          },
+          sound: soundFile || 'default',   // iOS expects the full filename (with .wav)
+          badge: 1,
+          'mutable-content': 1             // Allow Notification Service Extension
+          // NOTE: Do NOT set 'content-available: 1' together with alert.
+          // That combo makes iOS treat the message as silent/background-only
+          // and the banner may not appear reliably in killed state.
         }
       }
     },
+
     data: {
-      type,
-      deepLink: deepLink || '',
-      title,
-      body,
-      channelId: channelId,
-      sound: soundBase,
-      messageId: randomUUID()
+      type: String(type),
+      deepLink: String(deepLink || ''),
+      title: String(title || ''),   // Kept for foreground onMessage fallback
+      body: String(body || ''),
+      channelId: String(channelId),
+      sound: String(soundBase),
+      messageId: String(randomUUID())
     }
   };
 

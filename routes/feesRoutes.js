@@ -4,6 +4,7 @@ import { requirePermission } from '../middleware/auth.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
+import { translateFields } from '../services/geminiTranslator.js';
 
 const router = express.Router();
 
@@ -15,7 +16,7 @@ const router = express.Router();
  */
 router.get('/types', requirePermission('fees.view'), asyncHandler(async (req, res) => {
   const types = await sql`
-    SELECT id, name, code, description, is_recurring, is_optional
+    SELECT id, name, name_te, code, description, description_te, is_recurring, is_optional
     FROM fee_types
     WHERE school_id = ${req.schoolId}
     ORDER BY name
@@ -28,7 +29,7 @@ router.get('/types', requirePermission('fees.view'), asyncHandler(async (req, re
  * Create a new fee type
  */
 router.post('/types', requirePermission('fees.manage'), asyncHandler(async (req, res) => {
-  const { name, code, description, is_recurring, is_optional } = req.body;
+  const { name, name_te, code, description, description_te, is_recurring, is_optional } = req.body;
 
   if (!name) {
     return res.status(400).json({ error: 'name is required' });
@@ -44,10 +45,24 @@ router.post('/types', requirePermission('fees.manage'), asyncHandler(async (req,
 
   const feeCode = code || name.toUpperCase().replace(/\s+/g, '_').slice(0, 20);
 
+  // Auto-translate if not provided
+  let finalNameTe = name_te ?? null;
+  let finalDescTe = description_te ?? null;
+  if (!finalNameTe || (!finalDescTe && description)) {
+    try {
+      const fields = {};
+      if (!finalNameTe && name) fields.name = name;
+      if (!finalDescTe && description) fields.description = description;
+      const te = await translateFields(fields);
+      if (!finalNameTe) finalNameTe = te.name || null;
+      if (!finalDescTe) finalDescTe = te.description || null;
+    } catch (e) {}
+  }
+
   const [feeType] = await sql`
-    INSERT INTO fee_types (school_id, name, code, description, is_recurring, is_optional)
-    VALUES (${req.schoolId}, ${name}, ${feeCode}, ${description || null}, ${is_recurring || false}, ${is_optional || false})
-    RETURNING id, name, code, description, is_recurring, is_optional
+    INSERT INTO fee_types (school_id, name, name_te, code, description, description_te, is_recurring, is_optional)
+    VALUES (${req.schoolId}, ${name}, ${finalNameTe}, ${feeCode}, ${description || null}, ${finalDescTe}, ${is_recurring || false}, ${is_optional || false})
+    RETURNING id, name, name_te, code, description, description_te, is_recurring, is_optional
   `;
 
   return sendSuccess(res, req.schoolId, feeType, 201);
@@ -67,7 +82,7 @@ router.get('/structure', requirePermission('fees.view'), asyncHandler(async (req
     structures = await sql`
       SELECT 
         fs.id, fs.amount, fs.due_date, fs.frequency,
-        ft.name as fee_type, ft.code as fee_code, ft.is_optional,
+        ft.name as fee_type, ft.name_te as fee_type_te, ft.code as fee_code, ft.is_optional,
         c.name as class_name, ay.code as academic_year
       FROM fee_structures fs
       JOIN fee_types ft ON fs.fee_type_id = ft.id
@@ -81,7 +96,7 @@ router.get('/structure', requirePermission('fees.view'), asyncHandler(async (req
     structures = await sql`
       SELECT 
         fs.id, fs.amount, fs.due_date, fs.frequency,
-        ft.name as fee_type, ft.code as fee_code,
+        ft.name as fee_type, ft.name_te as fee_type_te, ft.code as fee_code,
         c.name as class_name, c.id as class_id
       FROM fee_structures fs
       JOIN fee_types ft ON fs.fee_type_id = ft.id
@@ -95,7 +110,7 @@ router.get('/structure', requirePermission('fees.view'), asyncHandler(async (req
     structures = await sql`
       SELECT
         fs.id, fs.amount, fs.due_date, fs.frequency,
-        ft.name as fee_type, c.name as class_name,
+        ft.name as fee_type, ft.name_te as fee_type_te, c.name as class_name,
         ay.code as academic_year
       FROM fee_structures fs
       JOIN fee_types ft ON fs.fee_type_id = ft.id
@@ -195,7 +210,7 @@ router.get('/students/:studentId', requirePermission('fees.view'), asyncHandler(
       SELECT 
         sf.id, sf.amount_due, sf.amount_paid, sf.discount, sf.status,
         sf.due_date, sf.period_month, sf.period_year,
-        ft.name as fee_type, ft.code as fee_code
+        ft.name as fee_type, ft.name_te as fee_type_te, ft.code as fee_code
       FROM student_fees sf
       JOIN fee_structures fs ON sf.fee_structure_id = fs.id
       JOIN fee_types ft ON fs.fee_type_id = ft.id
@@ -209,7 +224,7 @@ router.get('/students/:studentId', requirePermission('fees.view'), asyncHandler(
       SELECT 
         sf.id, sf.amount_due, sf.amount_paid, sf.discount, sf.status,
         sf.due_date, sf.period_month, sf.period_year,
-        ft.name as fee_type, ay.code as academic_year
+        ft.name as fee_type, ft.name_te as fee_type_te, ay.code as academic_year
       FROM student_fees sf
       JOIN fee_structures fs ON sf.fee_structure_id = fs.id
       JOIN fee_types ft ON fs.fee_type_id = ft.id
@@ -374,23 +389,22 @@ async function processFeeTransaction({ student_fee_id, amount, payment_method, t
     }
 
     const [transaction] = await tx`
-      INSERT INTO fee_transactions (student_fee_id, amount, payment_method, transaction_ref, received_by, remarks)
+      INSERT INTO fee_transactions (student_fee_id, amount, payment_method, transaction_ref, received_by, remarks, school_id)
       VALUES (
         ${student_fee_id}, 
         ${parsedAmount}, 
         ${payment_method}, 
         ${transaction_ref || null}, 
         ${user?.internal_id || null}, 
-        ${remarks || null}
+        ${remarks || null},
+        ${schoolId}
       )
       RETURNING *
     `;
 
     const [updatedFee] = await tx`
       UPDATE student_fees
-      SET
-        amount_paid = amount_paid + ${parsedAmount},
-        updated_at = NOW()
+      SET updated_at = NOW()
       WHERE id = ${student_fee_id}
         AND school_id = ${schoolId}
       RETURNING *
@@ -411,12 +425,17 @@ async function processFeeTransaction({ student_fee_id, amount, payment_method, t
       const recipients = await sql`
         SELECT u.id as user_id FROM users u
         JOIN students s ON u.person_id = s.person_id
-        WHERE s.id = ${fee.student_id} AND u.account_status = 'active'
+        WHERE s.id = ${fee.student_id}
+          AND s.school_id = ${schoolId}
+          AND u.school_id = ${schoolId}
+          AND u.account_status = 'active'
         UNION
         SELECT u.id as user_id FROM users u
-        JOIN parents p ON u.person_id = p.person_id
-        JOIN student_parents sp ON p.id = sp.parent_id
-        WHERE sp.student_id = ${fee.student_id} AND u.account_status = 'active'
+        JOIN parents p ON u.person_id = p.person_id AND p.school_id = ${schoolId}
+        JOIN student_parents sp ON p.id = sp.parent_id AND sp.school_id = ${schoolId}
+        WHERE sp.student_id = ${fee.student_id}
+          AND u.school_id = ${schoolId}
+          AND u.account_status = 'active'
       `;
 
       if (recipients.length > 0) {
@@ -437,14 +456,17 @@ async function processFeeTransaction({ student_fee_id, amount, payment_method, t
       t.*,
       p.display_name as student_name,
       s.admission_no,
-      ft.name as fee_type
+      ft.name as fee_type, ft.name_te as fee_type_te,
+      ay.code as academic_year
     FROM fee_transactions t
     JOIN student_fees sf ON t.student_fee_id = sf.id
     JOIN students s ON sf.student_id = s.id
     JOIN persons p ON s.person_id = p.id
     JOIN fee_structures fs ON sf.fee_structure_id = fs.id
     JOIN fee_types ft ON fs.fee_type_id = ft.id
+    JOIN academic_years ay ON fs.academic_year_id = ay.id
     WHERE t.id = ${transaction.id}
+      AND s.school_id = ${schoolId}
   `;
 
   return enrichedTransaction;
@@ -455,9 +477,22 @@ async function processFeeTransaction({ student_fee_id, amount, payment_method, t
  * Get comprehensive fee summary for all students (or filtered)
  */
 router.get('/summaries', requirePermission('fees.view'), asyncHandler(async (req, res) => {
-  const { class_id, academic_year_id, search } = req.query;
+  const { class_id, academic_year_id, search, page = 1, limit = 50 } = req.query;
+  const safeLimit = Math.min(100, Math.max(1, parseInt(String(limit), 10) || 50));
+  const pageNum = Math.max(1, parseInt(String(page), 10) || 1);
+  const offset = (pageNum - 1) * safeLimit;
 
-  const summaries = await sql`
+  const baseWhere = sql`s.deleted_at IS NULL AND s.school_id = ${req.schoolId}`;
+  const classFilter = class_id ? sql`AND c.id = ${class_id}` : sql``;
+  const searchFilter = search
+    ? sql`AND (p.display_name ILIKE ${'%' + search + '%'} OR s.admission_no ILIKE ${'%' + search + '%'})`
+    : sql``;
+  const ayFilter = academic_year_id
+    ? sql`AND sf.fee_structure_id IN (SELECT id FROM fee_structures WHERE academic_year_id = ${academic_year_id})`
+    : sql``;
+
+  const [summaries, [countResult]] = await Promise.all([
+    sql`
     SELECT 
       s.id as student_id, 
       s.admission_no,
@@ -477,17 +512,41 @@ router.get('/summaries', requirePermission('fees.view'), asyncHandler(async (req
     JOIN class_sections cs ON se.class_section_id = cs.id
     JOIN classes c ON cs.class_id = c.id
     LEFT JOIN student_fees sf ON s.id = sf.student_id 
-      ${academic_year_id ? sql`AND sf.fee_structure_id IN (SELECT id FROM fee_structures WHERE academic_year_id = ${academic_year_id})` : sql``}
-    WHERE s.deleted_at IS NULL
-      AND s.school_id = ${req.schoolId}
-    ${class_id ? sql`AND c.id = ${class_id}` : sql``}
-    ${search ? sql`AND (p.display_name ILIKE ${'%' + search + '%'} OR s.admission_no ILIKE ${'%' + search + '%'})` : sql``}
+      ${ayFilter}
+    WHERE ${baseWhere}
+    ${classFilter}
+    ${searchFilter}
     GROUP BY s.id, s.admission_no, p.display_name, c.name
     ORDER BY p.display_name
-    LIMIT 100
-  `;
+    LIMIT ${safeLimit} OFFSET ${offset}
+  `,
+    sql`
+    SELECT COUNT(*)::int as total FROM (
+      SELECT s.id
+      FROM students s
+      JOIN persons p ON s.person_id = p.id
+      JOIN student_enrollments se ON s.id = se.student_id AND se.status = 'active'
+      JOIN class_sections cs ON se.class_section_id = cs.id
+      JOIN classes c ON cs.class_id = c.id
+      LEFT JOIN student_fees sf ON s.id = sf.student_id 
+        ${ayFilter}
+      WHERE ${baseWhere}
+      ${classFilter}
+      ${searchFilter}
+      GROUP BY s.id, s.admission_no, p.display_name, c.name
+    ) t
+  `,
+  ]);
 
-  return sendSuccess(res, req.schoolId, summaries);
+  return sendSuccess(res, req.schoolId, {
+    data: summaries,
+    meta: {
+      total: countResult.total,
+      page: pageNum,
+      limit: safeLimit,
+      total_pages: Math.ceil(countResult.total / safeLimit) || 1,
+    },
+  });
 }));
 
 /**
@@ -495,7 +554,10 @@ router.get('/summaries', requirePermission('fees.view'), asyncHandler(async (req
  * Get list of fee defaulters
  */
 router.get('/defaulters', requirePermission('fees.view'), asyncHandler(async (req, res) => {
-  const { class_id, academic_year_id, min_days_overdue = 0 } = req.query;
+  const { class_id, academic_year_id, min_days_overdue = 0, page = 1, limit = 100 } = req.query;
+  const safePage = Math.max(1, parseInt(String(page), 10) || 1);
+  const safeLimit = Math.min(200, Math.max(1, parseInt(String(limit), 10) || 100));
+  const offset = (safePage - 1) * safeLimit;
 
   let defaulters = await sql`
     SELECT 
@@ -522,6 +584,7 @@ router.get('/defaulters', requirePermission('fees.view'), asyncHandler(async (re
     GROUP BY s.id, s.admission_no, p.display_name, c.name, sec.name
     HAVING CURRENT_DATE - MIN(sf.due_date) >= ${min_days_overdue}
     ORDER BY total_due DESC
+    LIMIT ${safeLimit} OFFSET ${offset}
   `;
 
   return sendSuccess(res, req.schoolId, defaulters);
@@ -533,7 +596,9 @@ router.get('/defaulters', requirePermission('fees.view'), asyncHandler(async (re
  */
 router.get('/receipts', requirePermission('fees.view'), asyncHandler(async (req, res) => {
   const { student_id, from_date, to_date, page = 1, limit = 50 } = req.query;
-  const offset = (page - 1) * limit;
+  const safeLimit = Math.min(100, Math.max(1, parseInt(String(limit), 10) || 50));
+  const pageNum = Math.max(1, parseInt(String(page), 10) || 1);
+  const offset = (pageNum - 1) * safeLimit;
 
   let receipts;
   if (student_id) {
@@ -543,31 +608,41 @@ router.get('/receipts', requirePermission('fees.view'), asyncHandler(async (req,
         s.admission_no, p.display_name as student_name,
         issuer.display_name as issued_by_name
       FROM receipts r
-      JOIN students s ON r.student_id = s.id
+      JOIN students s ON r.student_id = s.id AND s.school_id = ${req.schoolId}
       JOIN persons p ON s.person_id = p.id
       LEFT JOIN users u ON r.issued_by = u.id
       LEFT JOIN persons issuer ON u.person_id = issuer.id
       WHERE r.student_id = ${student_id}
         AND r.school_id = ${req.schoolId}
       ORDER BY r.issued_at DESC
-      LIMIT ${limit} OFFSET ${offset}
+      LIMIT ${safeLimit} OFFSET ${offset}
     `;
   } else {
     receipts = await sql`
       SELECT 
         r.id, r.receipt_no, r.total_amount, r.issued_at,
         s.admission_no, p.display_name as student_name,
-        (SELECT payment_method FROM fee_transactions t JOIN receipt_items ri ON t.id = ri.fee_transaction_id WHERE ri.receipt_id = r.id LIMIT 1) as payment_method,
-        (SELECT ft.name FROM fee_types ft JOIN fee_structures fs ON ft.id = fs.fee_type_id JOIN student_fees sf ON fs.id = sf.fee_structure_id JOIN fee_transactions t ON sf.id = t.student_fee_id JOIN receipt_items ri ON t.id = ri.fee_transaction_id WHERE ri.receipt_id = r.id LIMIT 1) as fee_type
+        x.payment_method,
+        x.fee_type
       FROM receipts r
-      JOIN students s ON r.student_id = s.id
+      JOIN students s ON r.student_id = s.id AND s.school_id = ${req.schoolId}
       JOIN persons p ON s.person_id = p.id
-      WHERE TRUE
-        AND r.school_id = ${req.schoolId}
+      LEFT JOIN LATERAL (
+        SELECT t.payment_method, ft.name as fee_type
+        FROM receipt_items ri
+        JOIN fee_transactions t ON ri.fee_transaction_id = t.id
+        JOIN student_fees sf ON t.student_fee_id = sf.id AND sf.school_id = ${req.schoolId}
+        JOIN fee_structures fs ON sf.fee_structure_id = fs.id
+        JOIN fee_types ft ON fs.fee_type_id = ft.id
+        WHERE ri.receipt_id = r.id
+        ORDER BY t.paid_at DESC NULLS LAST
+        LIMIT 1
+      ) x ON true
+      WHERE r.school_id = ${req.schoolId}
         ${from_date ? sql`AND r.issued_at >= ${from_date}` : sql``}
         ${to_date ? sql`AND r.issued_at <= ${to_date}` : sql``}
       ORDER BY r.issued_at DESC
-      LIMIT ${limit} OFFSET ${offset}
+      LIMIT ${safeLimit} OFFSET ${offset}
     `;
   }
 
@@ -628,7 +703,7 @@ router.get('/transactions', requirePermission('fees.view'), asyncHandler(async (
     SELECT 
       t.id, t.amount, t.payment_method, t.transaction_ref, t.paid_at, t.remarks,
       s.admission_no, p.display_name as student_name,
-      ft.name as fee_type,
+      ft.name as fee_type, ft.name_te as fee_type_te, ay.code as academic_year,
       receiver.display_name as received_by
     FROM fee_transactions t
     JOIN student_fees sf ON t.student_fee_id = sf.id
@@ -636,6 +711,7 @@ router.get('/transactions', requirePermission('fees.view'), asyncHandler(async (
     JOIN persons p ON s.person_id = p.id
     JOIN fee_structures fs ON sf.fee_structure_id = fs.id
     JOIN fee_types ft ON fs.fee_type_id = ft.id
+    LEFT JOIN academic_years ay ON fs.academic_year_id = ay.id
     LEFT JOIN users u ON t.received_by = u.id
     LEFT JOIN persons receiver ON u.person_id = receiver.id
     WHERE s.school_id = ${req.schoolId}
@@ -738,51 +814,47 @@ router.get('/collection-summary', requirePermission('fees.view'), asyncHandler(a
 // Fix 4: Protected with requirePermission
 router.get('/dashboard-stats', requirePermission('fees.view'), asyncHandler(async (req, res) => {
 
-  // F8 FIX: Add school_id to all dashboard stat queries
-  // 1. Today's Collection
-  const todayStats = await sql`
+  const [
+    todayStats,
+    monthlyStats,
+    pendingStats,
+    defaulterCount,
+    totalCollected,
+    recentTransactions,
+  ] = await Promise.all([
+    sql`
       SELECT COALESCE(SUM(amount), 0) as total
       FROM fee_transactions
       WHERE paid_at::date = CURRENT_DATE
         AND school_id = ${req.schoolId}
-  `;
-
-  // 2. Monthly Collection
-  const monthlyStats = await sql`
+  `,
+    sql`
       SELECT COALESCE(SUM(amount), 0) as total
       FROM fee_transactions
       WHERE date_trunc('month', paid_at) = date_trunc('month', CURRENT_DATE)
         AND school_id = ${req.schoolId}
-  `;
-
-  // 3. Pending Dues (Total Outstanding)
-  const pendingStats = await sql`
+  `,
+    sql`
       SELECT COALESCE(SUM(amount_due - amount_paid - discount), 0) as total
       FROM student_fees
       WHERE status IN ('pending', 'partial', 'overdue')
         AND deleted_at IS NULL
         AND school_id = ${req.schoolId}
-  `;
-
-  // 4. Defaulters Count
-  const defaulterCount = await sql`
+  `,
+    sql`
       SELECT COUNT(DISTINCT student_id) as count
       FROM student_fees
       WHERE status IN ('pending', 'partial', 'overdue')
         AND due_date < CURRENT_DATE
         AND deleted_at IS NULL
         AND school_id = ${req.schoolId}
-  `;
-
-  // 5. Total Collected (all time or academic year)
-  const totalCollected = await sql`
+  `,
+    sql`
       SELECT COALESCE(SUM(amount), 0) as total
       FROM fee_transactions
       WHERE school_id = ${req.schoolId}
-  `;
-
-  // 6. Recent Transactions (Last 5) — Fix 4: no error swallowing
-  const recentTransactions = await sql`
+  `,
+    sql`
       SELECT
           ft.id,
           ft.amount,
@@ -790,7 +862,7 @@ router.get('/dashboard-stats', requirePermission('fees.view'), asyncHandler(asyn
           ft.payment_method,
           p.display_name as student_name,
           c.name as class_name,
-          ftype.name as fee_type
+          ftype.name as fee_type, ftype.name_te as fee_type_te
       FROM fee_transactions ft
       JOIN student_fees sf ON ft.student_fee_id = sf.id
       JOIN students s ON sf.student_id = s.id
@@ -801,7 +873,8 @@ router.get('/dashboard-stats', requirePermission('fees.view'), asyncHandler(asyn
       WHERE ft.school_id = ${req.schoolId}
       ORDER BY ft.paid_at DESC
       LIMIT 5
-  `;
+  `,
+  ]);
 
   const result = {
     today_collection: Number(todayStats[0]?.total || 0),
@@ -863,7 +936,7 @@ router.post('/adjust', requirePermission('fees.manage'), asyncHandler(async (req
           updated_at = NOW()
       WHERE id = ${student_fee_id}
         AND school_id = ${req.schoolId}
-      RETURNING *
+      RETURNING id, amount_due, amount_paid, discount, status, updated_at
     `;
 
     return result;
@@ -893,9 +966,9 @@ router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req
       FROM student_fees sf
       JOIN students s ON sf.student_id = s.id
       JOIN persons p ON s.person_id = p.id
-      JOIN student_enrollments se ON s.id = se.student_id AND se.status = 'active'
+      JOIN student_enrollments se ON s.id = se.student_id AND se.status = 'active' AND se.school_id = ${req.schoolId}
       JOIN class_sections cs ON se.class_section_id = cs.id
-      JOIN users u ON u.person_id = p.id
+      JOIN users u ON u.person_id = p.id AND u.school_id = ${req.schoolId}
       WHERE sf.status IN ('pending', 'partial', 'overdue')
         AND cs.class_id = ${class_id}
         AND s.deleted_at IS NULL
@@ -908,7 +981,7 @@ router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req
       FROM student_fees sf
       JOIN students s ON sf.student_id = s.id
       JOIN persons p ON s.person_id = p.id
-      JOIN users u ON u.person_id = p.id
+      JOIN users u ON u.person_id = p.id AND u.school_id = ${req.schoolId}
       WHERE sf.status IN ('pending', 'partial', 'overdue')
         AND s.deleted_at IS NULL
         AND s.school_id = ${req.schoolId}
@@ -926,9 +999,10 @@ router.post('/remind', requirePermission('fees.manage'), asyncHandler(async (req
     const parentUsers = await sql`
       SELECT DISTINCT u.id as user_id
       FROM users u
-      JOIN parents p ON u.person_id = p.person_id
-      JOIN student_parents sp ON p.id = sp.parent_id
+      JOIN parents p ON u.person_id = p.person_id AND p.school_id = ${req.schoolId}
+      JOIN student_parents sp ON p.id = sp.parent_id AND sp.school_id = ${req.schoolId}
       WHERE sp.student_id IN ${sql(studentIds)}
+        AND u.school_id = ${req.schoolId}
         AND u.account_status = 'active'
     `;
     parentUserIds = parentUsers.map((p) => p.user_id);

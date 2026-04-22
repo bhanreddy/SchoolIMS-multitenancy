@@ -21,11 +21,11 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 
 -- Idempotent "upsert" without ON CONFLICT (preserves semantics)
 UPDATE schema_meta
-SET value = '1.3', applied_at = now()
+SET value = '1.4', applied_at = now()
 WHERE key = 'version';
 
 INSERT INTO schema_meta (key, value)
-SELECT 'version', '1.3'
+SELECT 'version', '1.4'
 WHERE NOT EXISTS (
   SELECT 1 FROM schema_meta WHERE key = 'version'
 );
@@ -542,16 +542,38 @@ CREATE OR REPLACE FUNCTION validate_diary_entry()
 RETURNS TRIGGER
 SET search_path = public
 AS $$
+DECLARE
+    v_is_admin BOOLEAN;
+    v_person_id UUID;
 BEGIN
-    -- 1. Subject Assignment Check
-    IF NEW.subject_id IS NOT NULL THEN
+    -- Check if Admin
+    SELECT EXISTS (
+        SELECT 1 FROM user_roles ur
+        JOIN roles r ON ur.role_id = r.id
+        WHERE ur.user_id = NEW.created_by AND r.code = 'admin'
+    ) INTO v_is_admin;
+
+    -- 1. Subject Assignment Check (via class_subjects OR timetable_slots)
+    IF NOT v_is_admin AND NEW.subject_id IS NOT NULL THEN
+        SELECT person_id INTO v_person_id FROM users WHERE id = NEW.created_by;
+
+        -- Check class_subjects first
         IF NOT EXISTS (
             SELECT 1 FROM class_subjects cs
             JOIN staff s ON cs.teacher_id = s.id
             WHERE cs.class_section_id = NEW.class_section_id
               AND cs.subject_id = NEW.subject_id
               AND cs.deleted_at IS NULL
-              AND s.person_id = (SELECT person_id FROM users WHERE id = NEW.created_by)
+              AND s.person_id = v_person_id
+        )
+        -- Fallback: check timetable_slots (teacher assigned via timetable)
+        AND NOT EXISTS (
+            SELECT 1 FROM timetable_slots ts
+            JOIN staff s ON ts.teacher_id = s.id
+            WHERE ts.class_section_id = NEW.class_section_id
+              AND ts.subject_id = NEW.subject_id
+              AND ts.deleted_at IS NULL
+              AND s.person_id = v_person_id
         ) THEN
             RAISE EXCEPTION 'Unauthorized: You are not assigned to teach this subject in this class';
         END IF;
@@ -1858,8 +1880,11 @@ BEGIN
   RETURN EXISTS (
     SELECT 1 
     FROM public.staff s 
-    WHERE s.user_id = auth.uid() AND s.designation_id = 1
+    JOIN public.staff_designations sd ON s.designation_id = sd.id
+    WHERE s.user_id = auth.uid()
+      AND sd.name = 'Principal'
       AND s.school_id = auth_school_id()
+      AND sd.school_id = auth_school_id()
   );
 END;
 $function$
@@ -2039,8 +2064,11 @@ BEGIN
   RETURN EXISTS (
     SELECT 1 
     FROM public.staff s 
-    WHERE s.user_id = auth.uid() AND s.designation_id = 4
+    JOIN public.staff_designations sd ON s.designation_id = sd.id
+    WHERE s.user_id = auth.uid()
+      AND sd.name = 'Senior Teacher'
       AND s.school_id = auth_school_id()
+      AND sd.school_id = auth_school_id()
   );
 END;
 $function$
@@ -2258,6 +2286,245 @@ GRANT EXECUTE ON FUNCTION set_school_context(INTEGER) TO service_role;
 
 GRANT EXECUTE ON FUNCTION auth_school_id() TO authenticated, service_role;
 
+-- ════════════════════════════════════════════════════════════
+-- SECTION 0C: PER-SCHOOL SEED DEFAULTS
+-- ════════════════════════════════════════════════════════════
+-- SCOPE: PER-SCHOOL — Automatically invoked for every new school
+-- via the trg_school_seed_defaults trigger on the schools table.
+-- Seeds: staff designations, periods, RBAC (roles, permissions,
+-- role-permissions), financial policies, and school settings.
+-- ════════════════════════════════════════════════════════════
+
+CREATE OR REPLACE FUNCTION seed_school_defaults(p_school_id INTEGER)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  -- 1. Staff Designations
+  INSERT INTO staff_designations (school_id, name)
+  SELECT p_school_id, v.name
+  FROM (VALUES
+    ('Principal'), ('Vice Principal'), ('Teacher'), ('Senior Teacher'),
+    ('Lab Assistant'), ('Librarian'), ('Clerk'), ('Peon'), ('Driver'), ('Other')
+  ) AS v(name)
+  WHERE NOT EXISTS (
+    SELECT 1 FROM staff_designations sd WHERE sd.school_id = p_school_id AND sd.name = v.name
+  );
+
+  -- 2. Periods (Default timetable structure)
+  INSERT INTO periods (school_id, name, start_time, end_time, sort_order)
+  SELECT p_school_id, v.name, v.start_time, v.end_time, v.sort_order
+  FROM (VALUES
+    ('Period 1', '08:00'::time, '08:45'::time, 1),
+    ('Period 2', '08:45'::time, '09:30'::time, 2),
+    ('Period 3', '09:30'::time, '10:15'::time, 3),
+    ('Break',    '10:15'::time, '10:30'::time, 4),
+    ('Period 4', '10:30'::time, '11:15'::time, 5),
+    ('Period 5', '11:15'::time, '12:00'::time, 6),
+    ('Lunch',    '12:00'::time, '12:45'::time, 7),
+    ('Period 6', '12:45'::time, '13:30'::time, 8),
+    ('Period 7', '13:30'::time, '14:15'::time, 9),
+    ('Period 8', '14:15'::time, '15:00'::time, 10)
+  ) AS v(name, start_time, end_time, sort_order)
+  WHERE NOT EXISTS (
+    SELECT 1 FROM periods p WHERE p.school_id = p_school_id AND p.name = v.name
+  );
+
+  -- 3. Permissions (System-level permission codes)
+  INSERT INTO permissions (school_id, code, name)
+  SELECT p_school_id, v.code, v.name
+  FROM (VALUES
+    ('students.view', 'View Students'), ('students.create', 'Create Students'),
+    ('students.edit', 'Edit Students'), ('students.delete', 'Delete Students'),
+    ('staff.view', 'View Staff'), ('staff.create', 'Create Staff'),
+    ('staff.edit', 'Edit Staff'), ('staff.delete', 'Delete Staff'),
+    ('users.view', 'View Users'), ('users.create', 'Create Users'),
+    ('users.edit', 'Edit Users'), ('users.delete', 'Delete Users'),
+    ('academics.view', 'View Academics'), ('academics.manage', 'Manage Academics'),
+    ('attendance.view', 'View Attendance'), ('attendance.mark', 'Mark Attendance'),
+    ('attendance.edit', 'Edit Attendance'),
+    ('fees.view', 'View Fees'), ('fees.manage', 'Manage Fees'),
+    ('fees.collect', 'Collect Fees'),
+    ('transactions.view', 'View Transactions'),
+    ('receipts.generate', 'Generate Receipts'),
+    ('reports.financial', 'View Financial Reports'),
+    ('exams.view', 'View Exams'), ('exams.manage', 'Manage Exams'),
+    ('marks.view', 'View Marks'), ('marks.enter', 'Enter Marks'),
+    ('results.view', 'View Results'), ('results.generate', 'Generate Results'),
+    ('transport.view', 'View Transport'), ('transport.manage', 'Manage Transport'),
+    ('hostel.view', 'View Hostel'), ('hostel.manage', 'Manage Hostel'),
+    ('events.view', 'View Events'), ('events.manage', 'Manage Events'),
+    ('lms.view', 'View LMS'), ('lms.create', 'Create LMS Content'),
+    ('lms.manage', 'Manage LMS'),
+    ('complaints.view', 'View Complaints'), ('complaints.create', 'Create Complaints'),
+    ('complaints.manage', 'Manage Complaints'),
+    ('notices.view', 'View Notices'), ('notices.create', 'Create Notices'),
+    ('notices.manage', 'Manage Notices'),
+    ('leaves.view', 'View Leaves'), ('leaves.apply', 'Apply for Leave'),
+    ('leaves.approve', 'Approve Leaves'),
+    ('diary.view', 'View Diary'), ('diary.create', 'Create Diary Entries'),
+    ('timetable.view', 'View Timetable'), ('timetable.manage', 'Manage Timetable'),
+    ('dashboard.view', 'View Dashboard'),
+    ('results.publish', 'Publish Results'),
+    ('diary.manage', 'Manage Diary'),
+    ('expenses.view', 'View Expenses'), ('expenses.create', 'Create Expenses'),
+    ('expenses.edit', 'Edit Expenses'), ('expenses.delete', 'Delete Expenses'),
+    ('expenses.approve', 'Approve Expenses'),
+    ('payroll.process', 'Process Payroll')
+  ) AS v(code, name)
+  WHERE NOT EXISTS (
+    SELECT 1 FROM permissions p WHERE p.school_id = p_school_id AND p.code = v.code
+  );
+
+  -- 4. Roles
+  INSERT INTO roles (school_id, code, name, is_system)
+  SELECT p_school_id, v.code, v.name, v.is_system
+  FROM (VALUES
+    ('admin', 'Administrator', true),
+    ('staff', 'Staff/Teacher', true),
+    ('student', 'Student', true),
+    ('accounts', 'Accounts Manager', true),
+    ('principal', 'Principal', true),
+    ('driver', 'Driver', true)
+  ) AS v(code, name, is_system)
+  WHERE NOT EXISTS (
+    SELECT 1 FROM roles r WHERE r.school_id = p_school_id AND r.code = v.code
+  );
+
+  -- 5. Role-Permission Mappings
+  -- Admin: All permissions
+  INSERT INTO role_permissions (school_id, role_id, permission_id)
+  SELECT p_school_id, r.id, p.id
+  FROM roles r CROSS JOIN permissions p
+  WHERE r.code = 'admin' AND r.school_id = p_school_id AND p.school_id = p_school_id
+    AND NOT EXISTS (
+      SELECT 1 FROM role_permissions rp
+      WHERE rp.role_id = r.id AND rp.permission_id = p.id AND rp.school_id = p_school_id
+    );
+
+  -- Staff: Academic & Operations
+  INSERT INTO role_permissions (school_id, role_id, permission_id)
+  SELECT p_school_id, r.id, p.id
+  FROM roles r CROSS JOIN permissions p
+  WHERE r.code = 'staff' AND r.school_id = p_school_id AND p.school_id = p_school_id
+    AND p.code IN (
+      'students.view', 'academics.view', 'attendance.view', 'attendance.mark',
+      'exams.view', 'marks.enter', 'marks.view', 'diary.view', 'diary.create',
+      'timetable.view', 'leaves.apply', 'notices.view', 'events.view', 'lms.view',
+      'lms.create', 'lms.manage', 'complaints.view', 'complaints.create'
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM role_permissions rp
+      WHERE rp.role_id = r.id AND rp.permission_id = p.id AND rp.school_id = p_school_id
+    );
+
+  -- Student: View Only
+  INSERT INTO role_permissions (school_id, role_id, permission_id)
+  SELECT p_school_id, r.id, p.id
+  FROM roles r CROSS JOIN permissions p
+  WHERE r.code = 'student' AND r.school_id = p_school_id AND p.school_id = p_school_id
+    AND p.code IN (
+      'academics.view', 'attendance.view', 'exams.view', 'results.view',
+      'diary.view', 'timetable.view', 'notices.view', 'events.view', 'lms.view',
+      'fees.view', 'complaints.view'
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM role_permissions rp
+      WHERE rp.role_id = r.id AND rp.permission_id = p.id AND rp.school_id = p_school_id
+    );
+
+  -- Accounts: Financial Management
+  INSERT INTO role_permissions (school_id, role_id, permission_id)
+  SELECT p_school_id, r.id, p.id
+  FROM roles r CROSS JOIN permissions p
+  WHERE r.code = 'accounts' AND r.school_id = p_school_id AND p.school_id = p_school_id
+    AND p.code IN (
+      'fees.view', 'fees.manage', 'fees.collect', 'transactions.view',
+      'receipts.generate', 'reports.financial', 'notices.view', 'staff.view',
+      'staff.create', 'staff.edit', 'dashboard.view', 'academics.view',
+      'students.view', 'students.create', 'students.edit',
+      'expenses.view', 'expenses.create', 'expenses.edit', 'expenses.delete',
+      'payroll.process'
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM role_permissions rp
+      WHERE rp.role_id = r.id AND rp.permission_id = p.id AND rp.school_id = p_school_id
+    );
+
+  -- Principal: Full Access (same as Admin)
+  INSERT INTO role_permissions (school_id, role_id, permission_id)
+  SELECT p_school_id, r.id, p.id
+  FROM roles r CROSS JOIN permissions p
+  WHERE r.code = 'principal' AND r.school_id = p_school_id AND p.school_id = p_school_id
+    AND NOT EXISTS (
+      SELECT 1 FROM role_permissions rp
+      WHERE rp.role_id = r.id AND rp.permission_id = p.id AND rp.school_id = p_school_id
+    );
+
+  -- Driver: Transport-only
+  INSERT INTO role_permissions (school_id, role_id, permission_id)
+  SELECT p_school_id, r.id, p.id
+  FROM roles r CROSS JOIN permissions p
+  WHERE r.code = 'driver' AND r.school_id = p_school_id AND p.school_id = p_school_id
+    AND p.code IN ('transport.view', 'notices.view')
+    AND NOT EXISTS (
+      SELECT 1 FROM role_permissions rp
+      WHERE rp.role_id = r.id AND rp.permission_id = p.id AND rp.school_id = p_school_id
+    );
+
+  -- 6. Financial Policy Rules
+  INSERT INTO financial_policy_rules (school_id, rule_code, rule_name, description, value_type, default_value, current_value)
+  SELECT p_school_id, v.rule_code, v.rule_name, v.description, v.value_type, v.default_value, v.current_value
+  FROM (VALUES
+    ('EXPENSE_AUTO_APPROVE_LIMIT', 'Expense Auto-Approval Limit', 'Expenses below this amount are auto-approved.', 'amount', '1000'::jsonb, '1000'::jsonb),
+    ('CASH_COLLECTION_DAILY_LIMIT', 'Daily Cash Collection Limit', 'Maximum cash a user can collect per day.', 'amount', '50000'::jsonb, '50000'::jsonb),
+    ('FEE_WAIVER_MAX_PERCENT', 'Max Fee Waiver Percentage', 'Maximum percentage of fee that can be waived.', 'percentage', '20'::jsonb, '20'::jsonb),
+    ('PAYROLL_OVERRIDE_ALLOWED', 'Payroll Override Allowed', 'Can payroll values be manually overridden?', 'boolean', 'false'::jsonb, 'false'::jsonb),
+    ('LOCK_PAST_MONTHS_DAYS', 'Lock Past Months After (Days)', 'Number of days after which previous month data is locked.', 'amount', '7'::jsonb, '7'::jsonb)
+  ) AS v(rule_code, rule_name, description, value_type, default_value, current_value)
+  WHERE NOT EXISTS (
+    SELECT 1 FROM financial_policy_rules fpr WHERE fpr.school_id = p_school_id AND fpr.rule_code = v.rule_code
+  );
+
+  -- 7. School Settings (defaults — school_name derived from schools.name)
+  INSERT INTO school_settings (school_id, key, value)
+  SELECT p_school_id, v.key, v.value
+  FROM (VALUES
+    ('school_name',        (SELECT COALESCE(name, 'Unnamed School') FROM schools WHERE id = p_school_id)),
+    ('school_timezone',    'Asia/Kolkata'),
+    ('school_hours_start', '08:00'),
+    ('school_hours_end',   '17:00'),
+    ('admin_email',        '')
+  ) AS v(key, value)
+  WHERE NOT EXISTS (
+    SELECT 1 FROM school_settings ss WHERE ss.school_id = p_school_id AND ss.key = v.key
+  );
+
+END;
+$$;
+
+-- Trigger: Auto-seed defaults when a new school is created
+CREATE OR REPLACE FUNCTION trg_seed_school_on_create()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  PERFORM seed_school_defaults(NEW.id);
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_school_seed_defaults ON schools;
+CREATE TRIGGER trg_school_seed_defaults
+AFTER INSERT ON schools
+FOR EACH ROW EXECUTE FUNCTION trg_seed_school_on_create();
+
+GRANT EXECUTE ON FUNCTION seed_school_defaults(INTEGER) TO service_role;
+
 -- 1. REFERENCE TABLES
 CREATE TABLE IF NOT EXISTS countries (
     code CHAR(2) PRIMARY KEY,
@@ -2296,7 +2563,7 @@ CREATE TABLE IF NOT EXISTS relationship_types (
 );
 
 CREATE TABLE IF NOT EXISTS staff_designations (
-    id SMALLINT PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
     name VARCHAR(100) NOT NULL,
     UNIQUE (school_id, name)
@@ -2396,22 +2663,7 @@ WHERE NOT EXISTS (
   SELECT 1 FROM relationship_types rt WHERE rt.id = v.id
 );
 
-INSERT INTO staff_designations (id, school_id, name)
-SELECT v.id, v.school_id, v.name
-FROM (VALUES
-  (1, 1, 'Principal'),
-  (2, 1, 'Vice Principal'),
-  (3, 1, 'Teacher'),
-  (4, 1, 'Senior Teacher'),
-  (5, 1, 'Lab Assistant'),
-  (6, 1, 'Librarian'),
-  (7, 1, 'Clerk'),
-  (8, 1, 'Peon'),
-  (9, 1, 'Other')
-) AS v(id, school_id, name)
-WHERE NOT EXISTS (
-  SELECT 1 FROM staff_designations sd WHERE sd.id = v.id
-);
+-- [MOVED TO seed_school_defaults()] Staff designations are now auto-seeded per school.
 
 -- 2. CORE TRIGGERS (GLOBAL)
 
@@ -2495,7 +2747,7 @@ CREATE TABLE IF NOT EXISTS roles (
     is_system BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at TIMESTAMPTZ,
-    UNIQUE (code),
+    UNIQUE (school_id, code),
     school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
 );
 
@@ -2507,7 +2759,7 @@ CREATE TABLE IF NOT EXISTS permissions (
     name VARCHAR(150) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at TIMESTAMPTZ,
-    UNIQUE (code),
+    UNIQUE (school_id, code),
     school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
 );
 
@@ -2537,11 +2789,16 @@ CREATE TABLE IF NOT EXISTS users (
     school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
     theme text DEFAULT 'light'::text,
     is_super_admin BOOLEAN DEFAULT false,
+    is_temporary_password BOOLEAN DEFAULT FALSE,
     deleted_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_school_id ON users(school_id);
 
+-- Index for faster lookups on admin users with temporary passwords
+CREATE INDEX IF NOT EXISTS idx_users_is_temporary_password 
+ON users (is_temporary_password) 
+WHERE is_temporary_password = TRUE;
 
 -- Note: deleted_at needed for soft delete index safety
 
@@ -3583,47 +3840,8 @@ ALTER TABLE IF EXISTS feature_flags DROP CONSTRAINT IF EXISTS feature_flags_code
 ALTER TABLE IF EXISTS ui_route_permissions DROP CONSTRAINT IF EXISTS ui_route_permissions_route_key_key;
 
 
--- Idempotent upsert for default school (avoids ON CONFLICT)
-UPDATE periods p
-SET start_time = v.start_time,
-    end_time = v.end_time,
-    sort_order = v.sort_order
-FROM (VALUES
-  ('Period 1', '08:00'::time, '08:45'::time, 1),
-  ('Period 2', '08:45'::time, '09:30'::time, 2),
-  ('Period 3', '09:30'::time, '10:15'::time, 3),
-  ('Break',    '10:15'::time, '10:30'::time, 4),
-  ('Period 4', '10:30'::time, '11:15'::time, 5),
-  ('Period 5', '11:15'::time, '12:00'::time, 6),
-  ('Lunch',    '12:00'::time, '12:45'::time, 7),
-  ('Period 6', '12:45'::time, '13:30'::time, 8),
-  ('Period 7', '13:30'::time, '14:15'::time, 9),
-  ('Period 8', '14:15'::time, '15:00'::time, 10)
-) AS v(name, start_time, end_time, sort_order)
-WHERE p.school_id = 1 AND p.name = v.name;
-
-INSERT INTO periods (school_id, name, start_time, end_time, sort_order)
-SELECT 1, v.name, v.start_time, v.end_time, v.sort_order
-FROM (VALUES
-  ('Period 1', '08:00'::time, '08:45'::time, 1),
-  ('Period 2', '08:45'::time, '09:30'::time, 2),
-  ('Period 3', '09:30'::time, '10:15'::time, 3),
-  ('Break',    '10:15'::time, '10:30'::time, 4),
-  ('Period 4', '10:30'::time, '11:15'::time, 5),
-  ('Period 5', '11:15'::time, '12:00'::time, 6),
-  ('Lunch',    '12:00'::time, '12:45'::time, 7),
-  ('Period 6', '12:45'::time, '13:30'::time, 8),
-  ('Period 7', '13:30'::time, '14:15'::time, 9),
-  ('Period 8', '14:15'::time, '15:00'::time, 10)
-) AS v(name, start_time, end_time, sort_order)
-WHERE NOT EXISTS (
-  SELECT 1 FROM periods p WHERE p.school_id = 1 AND p.name = v.name
-);
-
--- 4. Cleanup: Remove any periods that are NOT in the standard list (e.g., if user had Period 9 before)
-DELETE FROM periods WHERE name NOT IN (
-    'Period 1', 'Period 2', 'Period 3', 'Break', 'Period 4', 'Period 5', 'Lunch', 'Period 6', 'Period 7', 'Period 8'
-);
+-- [MOVED TO seed_school_defaults()] Periods are now auto-seeded per school.
+-- The dangerous global DELETE FROM periods has been removed (schools may customize periods).
 
 -- (Removed Legacy timetable_entries table - Use timetable_slots)
 
@@ -4014,120 +4232,12 @@ CREATE INDEX IF NOT EXISTS idx_lms_materials_active ON lms_materials(id) WHERE d
 
 CREATE INDEX IF NOT EXISTS idx_lms_materials_course ON lms_materials(course_id);
 
+-- LMS material aggregate view counter (incremented when a student completes a video watch)
+ALTER TABLE lms_materials ADD COLUMN IF NOT EXISTS view_count INTEGER NOT NULL DEFAULT 0;
 
--- 18. SEED DATA (PERMISSIONS)
-INSERT INTO permissions (school_id, code, name)
-SELECT 1, v.code, v.name
-FROM (VALUES
-('students.view', 'View Students'), ('students.create', 'Create Students'), ('students.edit', 'Edit Students'), ('students.delete', 'Delete Students'),
-('staff.view', 'View Staff'), ('staff.create', 'Create Staff'), ('staff.edit', 'Edit Staff'), ('staff.delete', 'Delete Staff'),
-('users.view', 'View Users'), ('users.create', 'Create Users'), ('users.edit', 'Edit Users'), ('users.delete', 'Delete Users'),
-('academics.view', 'View Academics'), ('academics.manage', 'Manage Academics'),
-('attendance.view', 'View Attendance'), ('attendance.mark', 'Mark Attendance'), ('attendance.edit', 'Edit Attendance'),
-('fees.view', 'View Fees'), ('fees.manage', 'Manage Fees'), ('fees.collect', 'Collect Fees'),
-('transactions.view', 'View Transactions'), ('receipts.generate', 'Generate Receipts'), ('reports.financial', 'View Financial Reports'),
-('exams.view', 'View Exams'), ('exams.manage', 'Manage Exams'), ('marks.view', 'View Marks'), ('marks.enter', 'Enter Marks'), ('results.view', 'View Results'), ('results.generate', 'Generate Results'),
-('transport.view', 'View Transport'), ('transport.manage', 'Manage Transport'),
-('hostel.view', 'View Hostel'), ('hostel.manage', 'Manage Hostel'),
-('events.view', 'View Events'), ('events.manage', 'Manage Events'),
-('lms.view', 'View LMS'), ('lms.create', 'Create LMS Content'), ('lms.manage', 'Manage LMS'),
-('complaints.view', 'View Complaints'), ('complaints.create', 'Create Complaints'), ('complaints.manage', 'Manage Complaints'),
-('notices.view', 'View Notices'), ('notices.create', 'Create Notices'), ('notices.manage', 'Manage Notices'),
-('leaves.view', 'View Leaves'), ('leaves.apply', 'Apply for Leave'), ('leaves.approve', 'Approve Leaves'),
-('diary.view', 'View Diary'), ('diary.create', 'Create Diary Entries'),
-('timetable.view', 'View Timetable'), ('timetable.manage', 'Manage Timetable'),
-('dashboard.view', 'View Dashboard'),
-('results.publish', 'Publish Results'),
-('diary.manage', 'Manage Diary')
-) AS v(code, name)
-WHERE NOT EXISTS (
-  SELECT 1 FROM permissions p WHERE p.school_id = 1 AND p.code = v.code
-);
 
--- 18.1 ROLES
-INSERT INTO roles (school_id, code, name, is_system)
-SELECT 1, v.code, v.name, v.is_system
-FROM (VALUES
-('admin', 'Administrator', true),
-('staff', 'Staff/Teacher', true),
-('student', 'Student', true),
-('accounts', 'Accounts Manager', true),
-('principal', 'Principal', true),
-('driver', 'Driver', true)
-) AS v(code, name, is_system)
-WHERE NOT EXISTS (
-  SELECT 1 FROM roles r WHERE r.school_id = 1 AND r.code = v.code
-);
-
--- 18.2 ROLE-PERMISSION MAPPING (Production RBAC)
--- Admin: All
-INSERT INTO role_permissions (school_id, role_id, permission_id)
-SELECT 1, r.id, p.id
-FROM roles r, permissions p
-WHERE r.code = 'admin'
-  AND NOT EXISTS (
-    SELECT 1 FROM role_permissions rp
-    WHERE rp.role_id = r.id AND rp.permission_id = p.id
-  );
-
--- Staff: Academic & Operations
-INSERT INTO role_permissions (school_id, role_id, permission_id)
-SELECT 1, r.id, p.id FROM roles r, permissions p 
-WHERE r.code = 'staff' AND p.code IN (
-    'students.view', 'academics.view', 'attendance.view', 'attendance.mark', 
-    'exams.view', 'marks.enter', 'marks.view', 'diary.view', 'diary.create',
-    'timetable.view', 'leaves.apply', 'notices.view', 'events.view', 'lms.view'
-)
-AND NOT EXISTS (
-  SELECT 1 FROM role_permissions rp
-  WHERE rp.role_id = r.id AND rp.permission_id = p.id
-);
-
--- Student: View Only Access
-INSERT INTO role_permissions (school_id, role_id, permission_id)
-SELECT 1, r.id, p.id FROM roles r, permissions p 
-WHERE r.code = 'student' AND p.code IN (
-    'academics.view', 'attendance.view', 'exams.view', 'results.view', 
-    'diary.view', 'timetable.view', 'notices.view', 'events.view', 'lms.view', 'fees.view'
-)
-AND NOT EXISTS (
-  SELECT 1 FROM role_permissions rp
-  WHERE rp.role_id = r.id AND rp.permission_id = p.id
-);
-
--- Accounts: Financial Management
-INSERT INTO role_permissions (school_id, role_id, permission_id)
-SELECT 1, r.id, p.id FROM roles r, permissions p 
-WHERE r.code = 'accounts' AND p.code IN (
-    'fees.view', 'fees.manage', 'fees.collect', 'transactions.view', 
-    'receipts.generate', 'reports.financial', 'notices.view', 'staff.view', 'staff.create', 'staff.edit',
-    'dashboard.view', 'academics.view', 'students.view', 'students.create', 'students.edit'
-)
-AND NOT EXISTS (
-  SELECT 1 FROM role_permissions rp
-  WHERE rp.role_id = r.id AND rp.permission_id = p.id
-);
-
--- Principal: Full Access (same as Admin)
-INSERT INTO role_permissions (school_id, role_id, permission_id)
-SELECT 1, r.id, p.id
-FROM roles r, permissions p
-WHERE r.code = 'principal'
-  AND NOT EXISTS (
-    SELECT 1 FROM role_permissions rp
-    WHERE rp.role_id = r.id AND rp.permission_id = p.id
-  );
-
--- Driver: Transport-only Access
-INSERT INTO role_permissions (school_id, role_id, permission_id)
-SELECT 1, r.id, p.id FROM roles r, permissions p 
-WHERE r.code = 'driver' AND p.code IN (
-    'transport.view', 'notices.view'
-)
-AND NOT EXISTS (
-  SELECT 1 FROM role_permissions rp
-  WHERE rp.role_id = r.id AND rp.permission_id = p.id
-);
+-- 18. SEED DATA (PERMISSIONS, ROLES, ROLE-PERMISSIONS)
+-- [MOVED TO seed_school_defaults()] All RBAC data is now auto-seeded per school.
 
 -- ============================================================
 -- 19. NOTIFICATION INFRASTRUCTURE
@@ -4519,6 +4629,7 @@ CREATE TABLE IF NOT EXISTS science_projects (
     materials_required TEXT[],
     safety_instructions TEXT,
     thumbnail_url TEXT,
+    content_url TEXT,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
@@ -4556,6 +4667,7 @@ CREATE TABLE IF NOT EXISTS life_values_modules (
     banner_image_url TEXT,
     quote_author VARCHAR(100),
     highlight_quote TEXT,
+    content_url TEXT,
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
@@ -4716,7 +4828,8 @@ CREATE TABLE IF NOT EXISTS expenses (
     receipt_url TEXT, -- Optional receipt image
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    approved_by UUID REFERENCES users(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_expenses_school_id ON expenses(school_id);
@@ -5013,18 +5126,7 @@ WITH CHECK (
 );
 
 -- Seed Default Policies
-INSERT INTO financial_policy_rules (school_id, rule_code, rule_name, description, value_type, default_value, current_value)
-SELECT v.school_id, v.rule_code, v.rule_name, v.description, v.value_type, v.default_value, v.current_value
-FROM (VALUES
-  (1, 'EXPENSE_AUTO_APPROVE_LIMIT', 'Expense Auto-Approval Limit', 'Expenses below this amount are auto-approved.', 'amount', '1000'::jsonb, '1000'::jsonb),
-  (1, 'CASH_COLLECTION_DAILY_LIMIT', 'Daily Cash Collection Limit', 'Maximum cash a user can collect per day.', 'amount', '50000'::jsonb, '50000'::jsonb),
-  (1, 'FEE_WAIVER_MAX_PERCENT', 'Max Fee Waiver Percentage', 'Maximum percentage of fee that can be waived.', 'percentage', '20'::jsonb, '20'::jsonb),
-  (1, 'PAYROLL_OVERRIDE_ALLOWED', 'Payroll Override Allowed', 'Can payroll values be manually overridden?', 'boolean', 'false'::jsonb, 'false'::jsonb),
-  (1, 'LOCK_PAST_MONTHS_DAYS', 'Lock Past Months After (Days)', 'Number of days after which previous month data is locked.', 'amount', '7'::jsonb, '7'::jsonb)
-) AS v(school_id, rule_code, rule_name, description, value_type, default_value, current_value)
-WHERE NOT EXISTS (
-  SELECT 1 FROM financial_policy_rules fpr WHERE fpr.school_id = v.school_id AND fpr.rule_code = v.rule_code
-);
+-- [MOVED TO seed_school_defaults()] Financial policies are now auto-seeded per school.
 
 -- 3. Audit Log Trigger Function
 
@@ -5427,19 +5529,13 @@ CREATE TABLE IF NOT EXISTS school_settings (
     UNIQUE (school_id, key)
 );
 
-INSERT INTO school_settings (school_id, key, value)
-SELECT v.school_id, v.key, v.value
-FROM (VALUES
-  (1, 'school_name',        'Default School Name'),
-  (1, 'school_timezone',    'Asia/Kolkata'),
-  (1, 'school_hours_start', '08:00'),
-  (1, 'school_hours_end',   '17:00'),
-  (1, 'admin_email',        'admin@school.local')
-) AS v(school_id, key, value)
-WHERE NOT EXISTS (
-  SELECT 1 FROM school_settings ss
-  WHERE ss.school_id = v.school_id AND ss.key = v.key
-);
+-- Key/value config per school. Common keys: branding (school_name, …), hours, etc.
+-- UPI fee collection (Collect fee via UPI / QR): managed by API PUT /api/v1/settings/upi
+--   upi_id            — VPA, e.g. schoolname@okaxis
+--   upi_display_name  — account holder / payee name shown in UPI apps (pn parameter)
+
+-- [MOVED TO seed_school_defaults()] School settings are now auto-seeded per school.
+-- UPI settings (upi_id, upi_display_name) should be configured per-school via the admin API.
 
 CREATE TABLE IF NOT EXISTS admin_notifications (
     id          SERIAL PRIMARY KEY,
@@ -5452,6 +5548,46 @@ CREATE TABLE IF NOT EXISTS admin_notifications (
 );
 
 
+-- ========================================== 
+-- -----------------------------------------------------
+-- NEW POLICIES: SuperAdmin complete access to Content
+-- -----------------------------------------------------
+
+DROP POLICY IF EXISTS "Superadmin full access" ON public.money_science_modules;
+CREATE POLICY "Superadmin full access" ON public.money_science_modules
+    FOR ALL
+    USING (
+        (auth.jwt() ->> 'role'::text) = 'service_role'::text OR 
+        (auth.jwt() ->> 'role'::text) = 'superadmin'::text
+    )
+    WITH CHECK (
+        (auth.jwt() ->> 'role'::text) = 'service_role'::text OR 
+        (auth.jwt() ->> 'role'::text) = 'superadmin'::text
+    );
+
+DROP POLICY IF EXISTS "Superadmin full access" ON public.life_values_modules;
+CREATE POLICY "Superadmin full access" ON public.life_values_modules
+    FOR ALL
+    USING (
+        (auth.jwt() ->> 'role'::text) = 'service_role'::text OR 
+        (auth.jwt() ->> 'role'::text) = 'superadmin'::text
+    )
+    WITH CHECK (
+        (auth.jwt() ->> 'role'::text) = 'service_role'::text OR 
+        (auth.jwt() ->> 'role'::text) = 'superadmin'::text
+    );
+
+DROP POLICY IF EXISTS "Superadmin full access" ON public.science_projects;
+CREATE POLICY "Superadmin full access" ON public.science_projects
+    FOR ALL
+    USING (
+        (auth.jwt() ->> 'role'::text) = 'service_role'::text OR 
+        (auth.jwt() ->> 'role'::text) = 'superadmin'::text
+    )
+    WITH CHECK (
+        (auth.jwt() ->> 'role'::text) = 'service_role'::text OR 
+        (auth.jwt() ->> 'role'::text) = 'superadmin'::text
+    );
 -- ========================================== 
 -- 31. OUT-OF-HOURS ACCESS CONTROL
 -- ========================================== 
@@ -5665,6 +5801,9 @@ FOR EACH ROW EXECUTE FUNCTION validate_timetable_entry();
 
 
 -- ALTER TABLE IF EXISTS active_students ADD COLUMN IF NOT EXISTS school_id uuid;
+ALTER TABLE IF EXISTS public.business_units ADD COLUMN IF NOT EXISTS subscription_price numeric;
+ALTER TABLE IF EXISTS public.business_units ADD COLUMN IF NOT EXISTS subscription_plan text;
+ALTER TABLE IF EXISTS public.business_units ADD COLUMN IF NOT EXISTS phone text;
 
 
 -- ═══════════════════════════════════════════════════════════
@@ -6115,4 +6254,491 @@ WITH CHECK (auth.role() = 'service_role');
 -- ────────────────────────────────────────────────────────
 
 -- Commit the transaction started at the top of this file
+
+-- ============================================================
+-- Migration: Create founder-console base tables & analytics views
+-- Fixes: "Could not find the table in the schema cache" warnings
+-- ============================================================
+
+-- ── 1. founders ──────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.founders (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     uuid NOT NULL,
+  email       text,
+  full_name   text,
+  role        text NOT NULL DEFAULT 'FOUNDER',   -- FOUNDER | APPROVER
+  is_active   boolean NOT NULL DEFAULT true,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- ── 2. business_units ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.business_units (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name        text NOT NULL,
+  code        text,
+  subscription_price numeric,
+  subscription_plan  text,
+  phone       text,
+  is_active   boolean NOT NULL DEFAULT true,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- ── 3. collections ───────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.collections (
+  id                      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_unit_id        uuid REFERENCES public.business_units(id),
+  amount                  numeric NOT NULL DEFAULT 0,
+  month                   integer NOT NULL,
+  year                    integer NOT NULL,
+  payment_mode            text NOT NULL DEFAULT 'CASH',  -- CASH|UPI|BANK|CHEQUE|OTHER
+  status                  text NOT NULL DEFAULT 'PENDING', -- PENDING|APPROVED|REJECTED
+  notes                   text,
+  created_by_founder_id   uuid REFERENCES public.founders(id),
+  approved_by_founder_id  uuid REFERENCES public.founders(id),
+  rejection_reason        text,
+  created_at              timestamptz NOT NULL DEFAULT now()
+);
+
+-- ── 4. enquiries ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.enquiries (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name        text,
+  email       text,
+  phone       text,
+  status      text NOT NULL DEFAULT 'NEW',  -- NEW|CONTACTED|QUALIFIED|CLOSED|REJECTED
+  source      text,
+  category    text,
+  assigned_to uuid,
+  deal_value  numeric,
+  notes       text,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- ── 5. activity_logs ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.activity_logs (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  entity_type text NOT NULL,
+  action      text NOT NULL,
+  actor_id    uuid,
+  metadata    jsonb,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- ── 6. settings ──────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.settings (
+  key   text PRIMARY KEY,
+  value jsonb
+);
+
+-- ── Add missing columns to expenses if they don't exist ──────
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='expenses' AND column_name='created_by_founder_id') THEN
+    ALTER TABLE public.expenses ADD COLUMN created_by_founder_id uuid;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='expenses' AND column_name='approved_by_founder_id') THEN
+    ALTER TABLE public.expenses ADD COLUMN approved_by_founder_id uuid;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='expenses' AND column_name='rejection_reason') THEN
+    ALTER TABLE public.expenses ADD COLUMN rejection_reason text;
+  END IF;
+END $$;
+
+-- ============================================================
+-- ANALYTICS VIEWS
+-- ============================================================
+-- CREATE OR REPLACE VIEW cannot change a column's data type (e.g. EXTRACT → numeric
+-- vs ::int). Drop dependent views first so definitions can be reapplied cleanly.
+DROP VIEW IF EXISTS public.monthly_expense_summary_v2 CASCADE;
+DROP VIEW IF EXISTS public.monthly_enquiry_summary CASCADE;
+DROP VIEW IF EXISTS public.monthly_closed_deals CASCADE;
+
+-- ── monthly_income_summary ───────────────────────────────────
+CREATE OR REPLACE VIEW public.monthly_income_summary AS
+SELECT
+  year,
+  month,
+  COALESCE(SUM(amount), 0) AS total_amount,
+  COUNT(*)                  AS count
+FROM public.collections
+WHERE status = 'APPROVED'
+GROUP BY year, month
+ORDER BY year, month;
+
+-- ── monthly_enquiry_summary ──────────────────────────────────
+CREATE OR REPLACE VIEW public.monthly_enquiry_summary AS
+SELECT
+  EXTRACT(YEAR  FROM created_at)::int  AS year,
+  EXTRACT(MONTH FROM created_at)::int  AS month,
+  COUNT(*)                              AS total_enquiries,
+  COUNT(*) FILTER (WHERE status = 'CLOSED') AS closed_count
+FROM public.enquiries
+GROUP BY year, month
+ORDER BY year, month;
+
+-- ── monthly_closed_deals ─────────────────────────────────────
+CREATE OR REPLACE VIEW public.monthly_closed_deals AS
+SELECT
+  EXTRACT(YEAR  FROM updated_at)::int  AS year,
+  EXTRACT(MONTH FROM updated_at)::int  AS month,
+  COUNT(*)                              AS count,
+  COALESCE(SUM(deal_value), 0)          AS total_deal_value
+FROM public.enquiries
+WHERE status = 'CLOSED'
+GROUP BY year, month
+ORDER BY year, month;
+
+-- ── conversion_rate ──────────────────────────────────────────
+CREATE OR REPLACE VIEW public.conversion_rate AS
+SELECT
+  CASE
+    WHEN COUNT(*) = 0 THEN 0
+    ELSE ROUND(
+      (COUNT(*) FILTER (WHERE status = 'CLOSED'))::numeric
+      / COUNT(*)::numeric * 100, 2
+    )
+  END AS conversion_rate
+FROM public.enquiries;
+
+-- ── cost_per_lead ────────────────────────────────────────────
+CREATE OR REPLACE VIEW public.cost_per_lead AS
+SELECT
+  CASE
+    WHEN (SELECT COUNT(*) FROM public.enquiries) = 0 THEN 0
+    ELSE ROUND(
+      (SELECT COALESCE(SUM(amount), 0) FROM public.expenses WHERE status = 'APPROVED' AND category = 'MARKETING')
+      / GREATEST((SELECT COUNT(*) FROM public.enquiries), 1)::numeric,
+      2
+    )
+  END AS cost_per_lead;
+
+-- ── pending_metrics_summary ──────────────────────────────────
+CREATE OR REPLACE VIEW public.pending_metrics_summary AS
+SELECT
+  (SELECT COALESCE(SUM(amount), 0) FROM public.collections WHERE status = 'APPROVED')  AS approved_income,
+  (SELECT COALESCE(SUM(amount), 0) FROM public.collections WHERE status = 'PENDING')   AS pending_collections,
+  (SELECT COALESCE(SUM(amount), 0) FROM public.expenses    WHERE status = 'APPROVED')  AS approved_expenses,
+  (SELECT COALESCE(SUM(amount), 0) FROM public.collections WHERE status = 'APPROVED')
+    - (SELECT COALESCE(SUM(amount), 0) FROM public.expenses WHERE status = 'APPROVED') AS net_profit;
+
+-- ── Disable RLS on new tables (superAdmin uses service role / anon key) ──
+ALTER TABLE public.founders      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.business_units ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.collections   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.enquiries     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.activity_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.settings      ENABLE ROW LEVEL SECURITY;
+
+-- Allow anon/authenticated full access (the superAdmin app uses anon key)
+DROP POLICY IF EXISTS "Allow all on founders" ON public.founders;
+CREATE POLICY "Allow all on founders" ON public.founders FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all on business_units" ON public.business_units;
+CREATE POLICY "Allow all on business_units" ON public.business_units FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all on collections" ON public.collections;
+CREATE POLICY "Allow all on collections" ON public.collections FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all on enquiries" ON public.enquiries;
+CREATE POLICY "Allow all on enquiries" ON public.enquiries FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all on activity_logs" ON public.activity_logs;
+CREATE POLICY "Allow all on activity_logs" ON public.activity_logs FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Allow all on settings" ON public.settings;
+CREATE POLICY "Allow all on settings" ON public.settings FOR ALL USING (true) WITH CHECK (true);
+
+
+-- ============================================================
+-- Migration: Create remaining missing founder-console views
+-- ============================================================
+
+-- ── leads_by_website ─────────────────────────────────────────
+CREATE OR REPLACE VIEW public.leads_by_website AS
+SELECT 
+  COALESCE(source, 'Unknown') AS source,
+  COUNT(*) AS leads,
+  COUNT(*) FILTER (WHERE status = 'CLOSED') AS deals,
+  COALESCE(SUM(deal_value) FILTER (WHERE status = 'CLOSED'), 0) AS revenue
+FROM public.enquiries
+GROUP BY source
+ORDER BY leads DESC;
+
+-- ── founder_lead_performance ─────────────────────────────────
+CREATE OR REPLACE VIEW public.founder_lead_performance AS
+SELECT 
+  f.full_name AS founder_name,
+  COUNT(e.id) AS leads,
+  COUNT(e.id) FILTER (WHERE e.status = 'CLOSED') AS deals,
+  COALESCE(SUM(e.deal_value) FILTER (WHERE e.status = 'CLOSED'), 0) AS revenue
+FROM public.founders f
+LEFT JOIN public.enquiries e ON e.assigned_to = f.id
+GROUP BY f.id, f.full_name
+ORDER BY revenue DESC, deals DESC, leads DESC;
+
+-- ── monthly_expense_summary (For ROI) ──────────────────────
+DROP VIEW IF EXISTS public.monthly_expense_summary CASCADE;
+CREATE VIEW public.monthly_expense_summary AS
+SELECT
+  EXTRACT(year FROM created_at)::integer AS year,
+  EXTRACT(month FROM created_at)::integer AS month,
+  SUM(amount) AS total_amount
+FROM public.expenses
+WHERE status = 'APPROVED'
+GROUP BY EXTRACT(year FROM created_at)::integer, EXTRACT(month FROM created_at)::integer;
+
+-- ── monthly_expense_summary_v2 (For Category Breakdown) ────
+-- (v2 already dropped at start of ANALYTICS VIEWS; drop again if script is split)
+DROP VIEW IF EXISTS public.monthly_expense_summary_v2 CASCADE;
+CREATE VIEW public.monthly_expense_summary_v2 AS
+SELECT
+  EXTRACT(year FROM created_at)::integer AS year,
+  EXTRACT(month FROM created_at)::integer AS month,
+  category,
+  SUM(amount) AS total_amount
+FROM public.expenses
+WHERE status = 'APPROVED'
+GROUP BY EXTRACT(year FROM created_at)::integer, EXTRACT(month FROM created_at)::integer, category;
+
+GRANT SELECT ON public.monthly_expense_summary TO authenticated;
+GRANT SELECT ON public.monthly_expense_summary_v2 TO authenticated;
+
+-- ════════════════════════════════════════════════════════════
+-- DCGD — Department of Career Growth & Development (Nexsyrus microservice data)
+-- Global catalog: no school_id; API + RLS gate access by role.
+-- ════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS dcgd_programs (
+    id              SERIAL PRIMARY KEY,
+    name            TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    icon            TEXT NOT NULL DEFAULT 'ribbon-outline',
+    display_order   INTEGER NOT NULL DEFAULT 0,
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dcgd_programs_display_order ON dcgd_programs (display_order);
+CREATE INDEX IF NOT EXISTS idx_dcgd_programs_is_active ON dcgd_programs (is_active);
+CREATE INDEX IF NOT EXISTS idx_dcgd_programs_active_order ON dcgd_programs (display_order) WHERE is_active = true;
+
+DROP TRIGGER IF EXISTS trg_dcgd_programs_updated ON dcgd_programs;
+CREATE TRIGGER trg_dcgd_programs_updated
+    BEFORE UPDATE ON dcgd_programs
+    FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+CREATE TABLE IF NOT EXISTS dcgd_settings (
+    id          SMALLINT PRIMARY KEY DEFAULT 1,
+    page_title  TEXT NOT NULL DEFAULT 'DCGD',
+    subtitle    TEXT NOT NULL DEFAULT 'Department of Career Growth and Development',
+    is_visible  BOOLEAN NOT NULL DEFAULT true,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT dcgd_settings_singleton CHECK (id = 1)
+);
+
+DROP TRIGGER IF EXISTS trg_dcgd_settings_updated ON dcgd_settings;
+CREATE TRIGGER trg_dcgd_settings_updated
+    BEFORE UPDATE ON dcgd_settings
+    FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+INSERT INTO dcgd_settings (id, page_title, subtitle, is_visible)
+VALUES (1, 'DCGD', 'Department of Career Growth and Development', true)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO dcgd_programs (name, description, icon, display_order, is_active)
+SELECT v.name, v.description, v.icon, v.display_order, true
+FROM (VALUES
+    ('CSE Foundation', 'Computer science fundamentals, logical thinking, and early exposure to programming concepts.', 'hardware-chip-outline', 1),
+    ('JEE Foundation', 'Physics, chemistry, and mathematics rigour aimed at engineering entrance readiness.', 'flask-outline', 2),
+    ('IPMAT Foundation', 'Quant, verbal ability, and reasoning tracks tailored for integrated management programmes.', 'briefcase-outline', 3),
+    ('NEET Foundation', 'Biology-forward prep with board alignment for medical entrance trajectories.', 'medkit-outline', 4),
+    ('Navodaya', 'Structured support for Jawahar Navodaya entrance patterns and scholastic depth.', 'school-outline', 5),
+    ('Gurukula', 'Classical and holistic learning pathways with disciplined study routines.', 'book-outline', 6)
+) AS v(name, description, icon, display_order)
+WHERE NOT EXISTS (SELECT 1 FROM dcgd_programs LIMIT 1);
+
+ALTER TABLE dcgd_programs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dcgd_programs FORCE ROW LEVEL SECURITY;
+ALTER TABLE dcgd_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dcgd_settings FORCE ROW LEVEL SECURITY;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON dcgd_programs TO authenticated, service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON dcgd_settings TO authenticated, service_role;
+GRANT USAGE, SELECT ON SEQUENCE dcgd_programs_id_seq TO authenticated, service_role;
+
+DROP POLICY IF EXISTS "dcgd_programs_super_admin_all" ON dcgd_programs;
+CREATE POLICY "dcgd_programs_super_admin_all" ON dcgd_programs
+    FOR ALL
+    USING (auth.role() = 'service_role' OR is_super_admin())
+    WITH CHECK (auth.role() = 'service_role' OR is_super_admin());
+
+DROP POLICY IF EXISTS "dcgd_programs_student_read_active" ON dcgd_programs;
+CREATE POLICY "dcgd_programs_student_read_active" ON dcgd_programs
+    FOR SELECT
+    USING (
+        auth.role() = 'service_role'
+        OR is_super_admin()
+        OR (is_active = true AND auth_has_role(ARRAY['student']::text[]))
+    );
+
+DROP POLICY IF EXISTS "dcgd_settings_super_admin_all" ON dcgd_settings;
+CREATE POLICY "dcgd_settings_super_admin_all" ON dcgd_settings
+    FOR ALL
+    USING (auth.role() = 'service_role' OR is_super_admin())
+    WITH CHECK (auth.role() = 'service_role' OR is_super_admin());
+
+DROP POLICY IF EXISTS "dcgd_settings_student_read_visible" ON dcgd_settings;
+CREATE POLICY "dcgd_settings_student_read_visible" ON dcgd_settings
+    FOR SELECT
+    USING (
+        auth.role() = 'service_role'
+        OR is_super_admin()
+        OR (is_visible = true AND auth_has_role(ARRAY['student']::text[]))
+    );
+
+-- ── DCGD Program Content (per-program materials managed by SuperAdmin) ──
+
+CREATE TABLE IF NOT EXISTS dcgd_program_content (
+    id              SERIAL PRIMARY KEY,
+    program_id      INTEGER NOT NULL REFERENCES dcgd_programs(id) ON DELETE CASCADE,
+    title           TEXT NOT NULL,
+    link_url        TEXT,
+    pdf_url         TEXT,
+    image_url       TEXT,
+    content_body    TEXT,
+    display_order   INTEGER NOT NULL DEFAULT 0,
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dcgd_content_program_order ON dcgd_program_content (program_id, display_order);
+CREATE INDEX IF NOT EXISTS idx_dcgd_content_active ON dcgd_program_content (is_active) WHERE is_active = true;
+
+DROP TRIGGER IF EXISTS trg_dcgd_content_updated ON dcgd_program_content;
+CREATE TRIGGER trg_dcgd_content_updated
+    BEFORE UPDATE ON dcgd_program_content
+    FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+ALTER TABLE dcgd_program_content ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dcgd_program_content FORCE ROW LEVEL SECURITY;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON dcgd_program_content TO authenticated, service_role;
+GRANT USAGE, SELECT ON SEQUENCE dcgd_program_content_id_seq TO authenticated, service_role;
+
+DROP POLICY IF EXISTS "dcgd_content_super_admin_all" ON dcgd_program_content;
+CREATE POLICY "dcgd_content_super_admin_all" ON dcgd_program_content
+    FOR ALL
+    USING (auth.role() = 'service_role' OR is_super_admin())
+    WITH CHECK (auth.role() = 'service_role' OR is_super_admin());
+
+DROP POLICY IF EXISTS "dcgd_content_student_read_active" ON dcgd_program_content;
+CREATE POLICY "dcgd_content_student_read_active" ON dcgd_program_content
+    FOR SELECT
+    USING (
+        auth.role() = 'service_role'
+        OR is_super_admin()
+        OR (is_active = true AND auth_has_role(ARRAY['student']::text[]))
+    );
+
+-- ════════════════════════════════════════════════════════════
+-- BACKFILL: Seed defaults for any existing schools that lack them.
+-- This is idempotent (uses NOT EXISTS checks in seed_school_defaults).
+-- ════════════════════════════════════════════════════════════
+DO $$
+DECLARE
+  v_school RECORD;
+BEGIN
+  FOR v_school IN SELECT id FROM schools LOOP
+    PERFORM seed_school_defaults(v_school.id);
+  END LOOP;
+END $$;
+
+-- ════════════════════════════════════════════════════════════
+-- SECTION: TELUGU TRANSLATION COLUMNS (_te suffix)
+-- Idempotent additions for multilingual support.
+-- ════════════════════════════════════════════════════════════
+
+-- subjects: name_te
+ALTER TABLE subjects ADD COLUMN IF NOT EXISTS name_te TEXT;
+
+-- exams: name_te
+ALTER TABLE exams ADD COLUMN IF NOT EXISTS name_te TEXT;
+
+-- fee_types: name_te, description_te
+ALTER TABLE fee_types ADD COLUMN IF NOT EXISTS name_te TEXT;
+ALTER TABLE fee_types ADD COLUMN IF NOT EXISTS description_te TEXT;
+
+-- transport_routes: name_te, description_te, start_point_te, end_point_te
+ALTER TABLE transport_routes ADD COLUMN IF NOT EXISTS name_te TEXT;
+ALTER TABLE transport_routes ADD COLUMN IF NOT EXISTS description_te TEXT;
+ALTER TABLE transport_routes ADD COLUMN IF NOT EXISTS start_point_te TEXT;
+ALTER TABLE transport_routes ADD COLUMN IF NOT EXISTS end_point_te TEXT;
+
+-- transport_stops: name_te
+ALTER TABLE transport_stops ADD COLUMN IF NOT EXISTS name_te TEXT;
+
+-- ============================================================
+-- TRANSPORT SERVICE — Phase 1 Schema (SchoolIMS v2)
+-- Checkpoint trips, driver–route assignments, extended statuses.
+-- Matches INTEGER school_id FK to schools(id) everywhere.
+-- Student assignments remain on student_transport (existing table).
+-- ============================================================
+
+-- Extend route directions (existing: morning | afternoon only)
+ALTER TABLE transport_routes DROP CONSTRAINT IF EXISTS transport_routes_direction_check;
+ALTER TABLE transport_routes ADD CONSTRAINT transport_routes_direction_check
+  CHECK (direction IS NULL OR direction IN ('morning', 'afternoon', 'evening', 'both'));
+
+CREATE TABLE IF NOT EXISTS driver_route_assignments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+    route_id UUID NOT NULL REFERENCES transport_routes(id) ON DELETE CASCADE,
+    driver_id UUID NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    UNIQUE (school_id, route_id, driver_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_driver_route_assignments_driver
+  ON driver_route_assignments (driver_id, school_id)
+  WHERE deleted_at IS NULL AND is_active = TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_driver_route_assignments_route
+  ON driver_route_assignments (route_id, school_id)
+  WHERE deleted_at IS NULL AND is_active = TRUE;
+
+DROP TRIGGER IF EXISTS trg_driver_route_assignments_updated ON driver_route_assignments;
+CREATE TRIGGER trg_driver_route_assignments_updated
+  BEFORE UPDATE ON driver_route_assignments
+  FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS trip_date DATE;
+
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS trip_direction VARCHAR(20);
+
+UPDATE trips SET trip_date = (started_at AT TIME ZONE 'UTC')::date WHERE trip_date IS NULL;
+
+ALTER TABLE trips ALTER COLUMN started_at DROP NOT NULL;
+
+ALTER TABLE trips ALTER COLUMN started_at DROP DEFAULT;
+
+ALTER TABLE trips DROP CONSTRAINT IF EXISTS trips_status_check;
+
+ALTER TABLE trips ADD CONSTRAINT trips_status_check
+  CHECK (status IN ('scheduled', 'active', 'in_progress', 'completed', 'cancelled'));
+
+DROP INDEX IF EXISTS idx_trips_active_bus;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trips_active_like_bus
+  ON trips (bus_id)
+  WHERE status IN ('active', 'in_progress');
+
+CREATE INDEX IF NOT EXISTS idx_trips_route_date ON trips (school_id, route_id, trip_date);
+
+CREATE INDEX IF NOT EXISTS idx_trips_school_date_status
+  ON trips (school_id, trip_date, status);
+
 COMMIT;

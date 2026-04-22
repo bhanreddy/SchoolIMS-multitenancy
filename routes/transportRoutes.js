@@ -3,6 +3,8 @@ import sql from '../db.js';
 import { requirePermission, requireAuth } from '../middleware/auth.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { translateFields } from '../services/geminiTranslator.js';
+import { sendNotificationToUsers } from '../services/notificationService.js';
 
 const router = express.Router();
 
@@ -29,13 +31,25 @@ const SCHOOL_COORDINATES = { latitude: 28.6139, longitude: 77.2090 };
  * Resolve staff_id from authenticated user
  */
 const getStaffId = async (user) => {
+  const uid = user?.internal_id ?? user?.id;
   const [staff] = await sql`
     SELECT s.id FROM staff s
     JOIN users u ON s.person_id = u.person_id
-    WHERE u.id = ${user.id}
+    WHERE u.id = ${uid}
   `;
   return staff?.id || null;
 };
+
+/** Maps DB trip.status to UI labels used by newer clients. */
+const mapTripUiStatus = (status) => {
+  if (status === 'scheduled') return 'scheduled';
+  if (status === 'active' || status === 'in_progress') return 'in_progress';
+  if (status === 'completed') return 'completed';
+  return status ?? 'scheduled';
+};
+
+/** True if trip is ongoing (canonical `in_progress` or legacy `active`). */
+const tripStatusIsLive = (s) => s === 'active' || s === 'in_progress';
 
 // ============================================================
 // ROUTES CRUD (Admin)
@@ -50,15 +64,23 @@ router.get('/routes', requirePermission('transport.view'), asyncHandler(async (r
 
   const routes = await sql`
     SELECT
-      r.id, r.name, r.code, r.description, r.start_point, r.end_point,
+      r.id, r.name, r.name_te, r.code, r.description, r.start_point, r.end_point,
       r.total_stops, r.monthly_fee, r.is_active, r.direction, r.bus_id,
       b.bus_no,
-      COUNT(DISTINCT ts.id) as stop_count,
-      COUNT(DISTINCT st.id) as student_count
+      COUNT(DISTINCT ts.id) AS stop_count,
+      COUNT(DISTINCT st.id) AS student_count,
+      MAX(dp.display_name) AS route_driver_name,
+      MAX(dra.driver_id::text) AS route_driver_id
     FROM transport_routes r
     LEFT JOIN buses b ON r.bus_id = b.id
     LEFT JOIN transport_stops ts ON ts.route_id = r.id AND ts.deleted_at IS NULL
     LEFT JOIN student_transport st ON st.route_id = r.id AND st.is_active = true
+    LEFT JOIN driver_route_assignments dra ON dra.route_id = r.id
+      AND dra.school_id = ${req.schoolId}
+      AND dra.is_active = TRUE
+      AND dra.deleted_at IS NULL
+    LEFT JOIN staff drv ON drv.id = dra.driver_id AND drv.school_id = ${req.schoolId}
+    LEFT JOIN persons dp ON dp.id = drv.person_id
     WHERE r.school_id = ${req.schoolId} ${active_only === 'true' ? sql`AND r.is_active = true` : sql``}
     GROUP BY r.id, b.bus_no
     ORDER BY r.name
@@ -72,19 +94,22 @@ router.get('/routes', requirePermission('transport.view'), asyncHandler(async (r
  * Create a transport route
  */
 router.post('/routes', requirePermission('transport.manage'), asyncHandler(async (req, res) => {
-  const { name, code, description, start_point, end_point, monthly_fee, direction, bus_id } = req.body;
+  const { name, name_te, code, description, description_te, start_point, start_point_te, end_point, end_point_te, monthly_fee, direction, bus_id } = req.body;
 
   if (!name) {
     return res.status(400).json({ error: 'Route name is required' });
   }
 
-  // Note: school_id corruption bug fixed 2026-03-14.
-  // Run scripts/fix-transport-corruption.sql on
-  // any pre-fix deployment to clean corrupt rows.
+  // Auto-translate name if name_te not provided
+  let finalNameTe = name_te ?? null;
+  if (!finalNameTe && name) {
+    try { const te = await translateFields({ name }); finalNameTe = te.name || null; } catch (e) {}
+  }
+
   // T1 FIX: Corrected VALUES — school_id now gets req.schoolId instead of name
   const [route] = await sql`
-    INSERT INTO transport_routes (school_id, name, code, description, start_point, end_point, monthly_fee, direction, bus_id)
-    VALUES (${req.schoolId}, ${name}, ${code || null}, ${description || null}, ${start_point || null}, ${end_point || null}, ${monthly_fee || null}, ${direction || 'morning'}, ${bus_id || null})
+    INSERT INTO transport_routes (school_id, name, name_te, code, description, start_point, end_point, monthly_fee, direction, bus_id)
+    VALUES (${req.schoolId}, ${name}, ${finalNameTe}, ${code || null}, ${description || null}, ${start_point || null}, ${end_point || null}, ${monthly_fee || null}, ${direction || 'morning'}, ${bus_id || null})
     RETURNING *
   `;
 
@@ -99,14 +124,19 @@ router.get('/routes/:id', requirePermission('transport.view'), asyncHandler(asyn
   const { id } = req.params;
 
   // T2 FIX: Add school_id filter
-  const [route] = await sql`SELECT * FROM transport_routes WHERE id = ${id} AND school_id = ${req.schoolId}`;
+  const [route] = await sql`
+    SELECT id, school_id, name, code, description, start_point, end_point, total_stops, monthly_fee,
+      direction, bus_id, is_active, created_at, updated_at
+    FROM transport_routes
+    WHERE id = ${id} AND school_id = ${req.schoolId}
+  `;
   if (!route) {
     return res.status(404).json({ error: 'Route not found' });
   }
 
   const stops = await sql`
     SELECT
-      ts.id, ts.name, ts.latitude, ts.longitude, ts.pickup_time, ts.drop_time, ts.stop_order,
+      ts.id, ts.name, ts.name_te, ts.latitude, ts.longitude, ts.pickup_time, ts.drop_time, ts.stop_order,
       COALESCE(json_agg(
         json_build_object('student_id', st.student_id, 'student_name', p.display_name)
       ) FILTER (WHERE st.id IS NOT NULL), '[]') as students
@@ -142,15 +172,22 @@ router.get('/routes/:id', requirePermission('transport.view'), asyncHandler(asyn
  */
 router.put('/routes/:id', requirePermission('transport.manage'), asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { name, code, description, start_point, end_point, monthly_fee, direction, bus_id, is_active } = req.body;
+  const { name, name_te, code, description, description_te, start_point, start_point_te, end_point, end_point_te, monthly_fee, direction, bus_id, is_active } = req.body;
 
   // T3 FIX: Ownership check first
   const [existing] = await sql`SELECT id FROM transport_routes WHERE id = ${id} AND school_id = ${req.schoolId}`;
   if (!existing) return res.status(404).json({ error: 'Route not found' });
 
+  // Auto-translate name if name_te not provided
+  let finalNameTe = name_te ?? null;
+  if (!finalNameTe && name) {
+    try { const te = await translateFields({ name }); finalNameTe = te.name || null; } catch (e) {}
+  }
+
   const [route] = await sql`
     UPDATE transport_routes SET
       name = COALESCE(${name ?? null}, name),
+      name_te = COALESCE(${finalNameTe}, name_te),
       code = COALESCE(${code ?? null}, code),
       description = COALESCE(${description ?? null}, description),
       start_point = COALESCE(${start_point ?? null}, start_point),
@@ -167,6 +204,70 @@ router.put('/routes/:id', requirePermission('transport.manage'), asyncHandler(as
   return sendSuccess(res, req.schoolId, { message: 'Route updated', route });
 }));
 
+/**
+ * DELETE /transport/routes/:id
+ * Delete a route
+ */
+router.delete('/routes/:id', requirePermission('transport.manage'), asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  
+  const [existing] = await sql`SELECT id FROM transport_routes WHERE id = ${id} AND school_id = ${req.schoolId}`;
+  if (!existing) return res.status(404).json({ error: 'Route not found' });
+
+  // Soft delete the route
+  await sql`
+    UPDATE transport_routes
+    SET deleted_at = NOW(), is_active = false
+    WHERE id = ${id} AND school_id = ${req.schoolId}
+  `;
+
+  return sendSuccess(res, req.schoolId, { message: 'Route deleted successfully' });
+}));
+
+/**
+ * GET /transport/drivers
+ * Staff with driver role — for assigning drivers to routes (tenant-scoped).
+ */
+router.get('/drivers', requirePermission('transport.view'), asyncHandler(async (req, res) => {
+  const drivers = await sql`
+    SELECT st.id, p.display_name, p.photo_url,
+           dra.route_id AS currently_assigned_route_id,
+           rt.name AS current_route_name
+    FROM staff st
+    JOIN persons p ON st.person_id = p.id
+    JOIN users u ON u.person_id = p.id AND u.school_id = ${req.schoolId} AND u.deleted_at IS NULL
+    JOIN user_roles ur ON ur.user_id = u.id AND ur.school_id = ${req.schoolId} AND ur.deleted_at IS NULL
+    JOIN roles rol ON rol.id = ur.role_id AND rol.school_id = ${req.schoolId}
+    LEFT JOIN driver_route_assignments dra ON dra.driver_id = st.id
+      AND dra.school_id = ${req.schoolId}
+      AND dra.is_active = TRUE
+      AND dra.deleted_at IS NULL
+    LEFT JOIN transport_routes rt ON rt.id = dra.route_id AND rt.school_id = ${req.schoolId}
+    WHERE st.school_id = ${req.schoolId}
+      AND st.deleted_at IS NULL
+      AND rol.code = 'driver'
+    ORDER BY p.display_name
+  `;
+  return sendSuccess(res, req.schoolId, drivers);
+}));
+
+/**
+ * GET /transport/academic-years/current
+ * Active academic year for transport assignment flows (mobile convenience).
+ */
+router.get('/academic-years/current', requireAuth, asyncHandler(async (req, res) => {
+  const [ay] = await sql`
+    SELECT id, code, start_date, end_date
+    FROM academic_years
+    WHERE CURRENT_DATE BETWEEN start_date AND end_date
+      AND school_id = ${req.schoolId}
+      AND deleted_at IS NULL
+    LIMIT 1
+  `;
+  if (!ay) return res.status(404).json({ error: 'No active academic year found' });
+  return sendSuccess(res, req.schoolId, ay);
+}));
+
 // ============================================================
 // STOPS CRUD (Admin)
 // ============================================================
@@ -177,7 +278,7 @@ router.put('/routes/:id', requirePermission('transport.manage'), asyncHandler(as
  */
 router.post('/routes/:id/stops', requirePermission('transport.manage'), asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { name, latitude, longitude, pickup_time, drop_time, stop_order } = req.body;
+  const { name, name_te, latitude, longitude, pickup_time, drop_time, stop_order } = req.body;
 
   if (!name || stop_order === undefined) {
     return res.status(400).json({ error: 'name and stop_order are required' });
@@ -187,10 +288,16 @@ router.post('/routes/:id/stops', requirePermission('transport.manage'), asyncHan
   const [routeCheck] = await sql`SELECT id FROM transport_routes WHERE id = ${id} AND school_id = ${req.schoolId}`;
   if (!routeCheck) return res.status(404).json({ error: 'Route not found' });
 
+  // Auto-translate stop name if name_te not provided
+  let finalNameTe = name_te ?? null;
+  if (!finalNameTe && name) {
+    try { const te = await translateFields({ name }); finalNameTe = te.name || null; } catch (e) {}
+  }
+
   // T6 FIX: Add school_id to transport_stops INSERT
   const [stop] = await sql`
-    INSERT INTO transport_stops (school_id, route_id, name, latitude, longitude, pickup_time, drop_time, stop_order)
-    VALUES (${req.schoolId}, ${id}, ${name}, ${latitude || null}, ${longitude || null}, ${pickup_time || null}, ${drop_time || null}, ${stop_order})
+    INSERT INTO transport_stops (school_id, route_id, name, name_te, latitude, longitude, pickup_time, drop_time, stop_order)
+    VALUES (${req.schoolId}, ${id}, ${name}, ${finalNameTe}, ${latitude || null}, ${longitude || null}, ${pickup_time || null}, ${drop_time || null}, ${stop_order})
     RETURNING *
   `;
 
@@ -208,15 +315,22 @@ router.post('/routes/:id/stops', requirePermission('transport.manage'), asyncHan
  */
 router.put('/stops/:stopId', requirePermission('transport.manage'), asyncHandler(async (req, res) => {
   const { stopId } = req.params;
-  const { name, latitude, longitude, pickup_time, drop_time, stop_order } = req.body;
+  const { name, name_te, latitude, longitude, pickup_time, drop_time, stop_order } = req.body;
 
   // T7 FIX: Ownership check first
   const [existing] = await sql`SELECT id FROM transport_stops WHERE id = ${stopId} AND school_id = ${req.schoolId}`;
   if (!existing) return res.status(404).json({ error: 'Stop not found' });
 
+  // Auto-translate stop name if name_te not provided
+  let finalNameTe = name_te ?? null;
+  if (!finalNameTe && name) {
+    try { const te = await translateFields({ name }); finalNameTe = te.name || null; } catch (e) {}
+  }
+
   const [stop] = await sql`
     UPDATE transport_stops SET
       name = COALESCE(${name ?? null}, name),
+      name_te = COALESCE(${finalNameTe}, name_te),
       latitude = COALESCE(${latitude ?? null}, latitude),
       longitude = COALESCE(${longitude ?? null}, longitude),
       pickup_time = COALESCE(${pickup_time ?? null}, pickup_time),
@@ -263,16 +377,18 @@ router.get('/buses', requirePermission('transport.view'), asyncHandler(async (re
   const buses = await sql`
     SELECT
       b.id, b.bus_no, b.registration_no, b.capacity, b.is_active,
-      b.driver_id, b.driver_name, b.driver_phone,
+      b.driver_id, b.driver_phone,
+      COALESCE(p.display_name, b.driver_name) as driver_name,
       p.display_name as assigned_driver_name,
       s.staff_code as driver_code,
+      MAX(r.name) as route_name,
       COUNT(DISTINCT r.id) as route_count
     FROM buses b
-    LEFT JOIN staff s ON b.driver_id = s.id
+    LEFT JOIN staff s ON b.driver_id = s.id AND s.school_id = ${req.schoolId}
     LEFT JOIN persons p ON s.person_id = p.id
     LEFT JOIN transport_routes r ON r.bus_id = b.id AND r.is_active = true
     WHERE b.deleted_at IS NULL AND b.school_id = ${req.schoolId}
-    GROUP BY b.id, p.display_name, s.staff_code
+    GROUP BY b.id, p.display_name, s.staff_code, b.driver_name
     ORDER BY b.bus_no
   `;
   return sendSuccess(res, req.schoolId, buses);
@@ -351,7 +467,7 @@ router.get('/driver/my-bus', requireAuth, asyncHandler(async (req, res) => {
 
   // Find all routes for this bus
   const routes = await sql`
-    SELECT r.id, r.name, r.direction, r.start_point, r.end_point, r.total_stops
+    SELECT r.id, r.name, r.name_te, r.direction, r.start_point, r.end_point, r.total_stops
     FROM transport_routes r
     WHERE r.bus_id = ${bus.id} AND r.is_active = true
     ORDER BY r.direction, r.name
@@ -361,7 +477,7 @@ router.get('/driver/my-bus', requireAuth, asyncHandler(async (req, res) => {
   const [activeTrip] = await sql`
     SELECT t.id, t.route_id, t.status, t.started_at
     FROM trips t
-    WHERE t.bus_id = ${bus.id} AND t.status = 'active'
+    WHERE t.bus_id = ${bus.id} AND t.status IN ('active', 'in_progress')
     LIMIT 1
   `;
 
@@ -377,7 +493,7 @@ router.get('/driver/route/:routeId/stops', requireAuth, asyncHandler(async (req,
 
   const stops = await sql`
     SELECT
-      ts.id, ts.name, ts.latitude, ts.longitude, ts.stop_order,
+      ts.id, ts.name, ts.name_te, ts.latitude, ts.longitude, ts.stop_order,
       ts.pickup_time, ts.drop_time,
       COUNT(st.id) as student_count
     FROM transport_stops ts
@@ -388,6 +504,67 @@ router.get('/driver/route/:routeId/stops', requireAuth, asyncHandler(async (req,
   `;
 
   return sendSuccess(res, req.schoolId, stops);
+}));
+
+/**
+ * GET /transport/driver/my-students
+ * Returns all students on the driver's assigned routes, grouped by route & stop.
+ */
+router.get('/driver/my-students', requireAuth, asyncHandler(async (req, res) => {
+  if (!req.user?.roles?.includes('driver')) {
+    return res.status(403).json({ error: 'Driver role required' });
+  }
+
+  const staffId = await getStaffId(req.user);
+  if (!staffId) return res.status(404).json({ error: 'Staff profile not found' });
+
+  // Find driver's bus
+  const [bus] = await sql`
+    SELECT id FROM buses
+    WHERE driver_id = ${staffId} AND is_active = true AND deleted_at IS NULL
+      AND school_id = ${req.schoolId}
+    LIMIT 1
+  `;
+  if (!bus) return sendSuccess(res, req.schoolId, { routes: [] });
+
+  // Get all routes for bus
+  const routes = await sql`
+    SELECT r.id, r.name, r.direction
+    FROM transport_routes r
+    WHERE r.bus_id = ${bus.id} AND r.is_active = true
+    ORDER BY r.direction, r.name
+  `;
+
+  const result = [];
+  for (const route of routes) {
+    const stops = await sql`
+      SELECT
+        ts.id as stop_id, ts.name as stop_name, ts.stop_order,
+        COALESCE(json_agg(
+          json_build_object(
+            'student_id', stu.id,
+            'student_name', p.display_name,
+            'admission_no', stu.admission_no,
+            'class_name', c.name,
+            'section_name', sec.name
+          )
+        ) FILTER (WHERE st.id IS NOT NULL), '[]') as students
+      FROM transport_stops ts
+      LEFT JOIN student_transport st ON st.stop_id = ts.id AND st.route_id = ${route.id} AND st.is_active = true
+      LEFT JOIN students stu ON st.student_id = stu.id AND stu.school_id = ${req.schoolId}
+      LEFT JOIN persons p ON stu.person_id = p.id
+      LEFT JOIN student_enrollments se ON se.student_id = stu.id AND se.status = 'active' AND se.deleted_at IS NULL
+      LEFT JOIN class_sections csec ON se.class_section_id = csec.id
+      LEFT JOIN classes c ON csec.class_id = c.id
+      LEFT JOIN sections sec ON csec.section_id = sec.id
+      WHERE ts.route_id = ${route.id} AND ts.deleted_at IS NULL
+      GROUP BY ts.id, ts.name, ts.stop_order
+      ORDER BY ts.stop_order
+    `;
+    result.push({ ...route, stops });
+  }
+
+  return sendSuccess(res, req.schoolId, { routes: result });
 }));
 
 // ============================================================
@@ -419,16 +596,21 @@ router.post('/trips/start', requireAuth, asyncHandler(async (req, res) => {
 
   // 2. Verify route belongs to this bus
   const [route] = await sql`
-    SELECT id, bus_id FROM transport_routes WHERE id = ${route_id} AND is_active = true AND school_id = ${req.schoolId}
+    SELECT id, bus_id, direction FROM transport_routes WHERE id = ${route_id} AND is_active = true AND school_id = ${req.schoolId}
   `;
   if (!route) return res.status(404).json({ error: 'Route not found' });
   if (route.bus_id !== bus.id) {
     return res.status(403).json({ error: 'This route does not belong to your bus' });
   }
 
+  const todayStart = new Date().toISOString().slice(0, 10);
+  const tripDir = route.direction === 'afternoon' ? 'afternoon'
+    : route.direction === 'evening' ? 'evening'
+      : route.direction === 'both' ? 'morning' : (route.direction || 'morning');
+
   // 3. Check no active trip exists (partial unique index also enforces this)
   const [existingTrip] = await sql`
-    SELECT id FROM trips WHERE bus_id = ${bus.id} AND status = 'active'
+    SELECT id FROM trips WHERE bus_id = ${bus.id} AND status IN ('active', 'in_progress')
   `;
   if (existingTrip) {
     return res.status(409).json({ error: 'An active trip already exists for this bus', tripId: existingTrip.id });
@@ -437,27 +619,31 @@ router.post('/trips/start', requireAuth, asyncHandler(async (req, res) => {
   // 4. Get ordered stops
   const stops = await sql`
     SELECT id, stop_order FROM transport_stops
-    WHERE route_id = ${route_id} AND deleted_at IS NULL
+    WHERE route_id = ${route_id}
+      AND school_id = ${req.schoolId}
+      AND deleted_at IS NULL
     ORDER BY stop_order ASC
   `;
   if (stops.length === 0) {
     return res.status(400).json({ error: 'Route has no stops — add stops first' });
   }
 
-  // T9 FIX: Add school_id to trips INSERT
+  // Legacy driver app entrypoint — writes canonical in_progress (same as POST /driver/trip/:id/start).
   const [trip] = await sql`
-    INSERT INTO trips (school_id, bus_id, route_id, driver_id, status, started_at)
-    VALUES (${req.schoolId}, ${bus.id}, ${route_id}, ${staffId}, 'active', now())
-    RETURNING *
+    INSERT INTO trips (school_id, bus_id, route_id, driver_id, status, started_at, trip_date, trip_direction)
+    VALUES (${req.schoolId}, ${bus.id}, ${route_id}, ${staffId}, 'in_progress', now(), ${todayStart}, ${tripDir})
+    RETURNING id, school_id, bus_id, route_id, driver_id, status, started_at, ended_at, created_at
   `;
 
-  // 6. Initialize all stop statuses as pending
-  for (const stop of stops) {
-    await sql`
-      INSERT INTO trip_stop_status (school_id, trip_id, stop_id, stop_order, status)
-    VALUES (${req.schoolId}, ${trip.id}, ${stop.id}, ${stop.stop_order}, 'pending')
-    `;
-  }
+  await sql`
+    INSERT INTO trip_stop_status (school_id, trip_id, stop_id, stop_order, status)
+    SELECT ${req.schoolId}, ${trip.id}, id, stop_order, 'pending'
+    FROM transport_stops
+    WHERE route_id = ${route_id}
+      AND school_id = ${req.schoolId}
+      AND deleted_at IS NULL
+    ORDER BY stop_order ASC
+  `;
 
   return sendSuccess(res, req.schoolId, { message: 'Trip started', trip, totalStops: stops.length }, 201);
 }));
@@ -519,7 +705,7 @@ router.post('/trips/:tripId/stops/:stopId/arrive', requireAuth, asyncHandler(asy
     SELECT id, driver_id, status FROM trips WHERE id = ${tripId} AND school_id = ${req.schoolId}
   `;
   if (!trip) return res.status(404).json({ error: 'Trip not found' });
-  if (trip.status !== 'active') return res.status(400).json({ error: 'Trip is not active' });
+  if (!tripStatusIsLive(trip.status)) return res.status(400).json({ error: 'Trip is not active' });
   if (trip.driver_id !== staffId) return res.status(403).json({ error: 'This is not your trip' });
 
   // Get the target stop status
@@ -569,7 +755,7 @@ router.post('/trips/:tripId/stops/:stopId/complete', requireAuth, asyncHandler(a
   const staffId = await getStaffId(req.user);
   const [trip] = await sql`SELECT id, driver_id, status FROM trips WHERE id = ${tripId} AND school_id = ${req.schoolId}`;
   if (!trip) return res.status(404).json({ error: 'Trip not found' });
-  if (trip.status !== 'active') return res.status(400).json({ error: 'Trip is not active' });
+  if (!tripStatusIsLive(trip.status)) return res.status(400).json({ error: 'Trip is not active' });
   if (trip.driver_id !== staffId) return res.status(403).json({ error: 'This is not your trip' });
 
   const [targetStop] = await sql`
@@ -601,7 +787,7 @@ router.post('/trips/:tripId/stops/:stopId/skip', requireAuth, asyncHandler(async
 
   const staffId = await getStaffId(req.user);
   const [trip] = await sql`SELECT id, driver_id, status FROM trips WHERE id = ${tripId} AND school_id = ${req.schoolId}`;
-  if (!trip || trip.status !== 'active' || trip.driver_id !== staffId) {
+  if (!trip || !tripStatusIsLive(trip.status) || trip.driver_id !== staffId) {
     return res.status(403).json({ error: 'Invalid or unauthorized trip' });
   }
 
@@ -641,7 +827,7 @@ router.post('/trips/:tripId/end', requireAuth, asyncHandler(async (req, res) => 
   const staffId = await getStaffId(req.user);
   const [trip] = await sql`SELECT id, driver_id, status FROM trips WHERE id = ${tripId} AND school_id = ${req.schoolId}`;
   if (!trip) return res.status(404).json({ error: 'Trip not found' });
-  if (trip.status !== 'active') return res.status(400).json({ error: 'Trip is not active' });
+  if (!tripStatusIsLive(trip.status)) return res.status(400).json({ error: 'Trip is not active' });
   if (trip.driver_id !== staffId) return res.status(403).json({ error: 'This is not your trip' });
 
   // Mark all remaining pending/arrived stops as skipped
@@ -899,7 +1085,7 @@ router.get('/parent/bus-status/:busId', requireAuth, asyncHandler(async (req, re
     SELECT t.id, t.started_at, r.name as route_name
     FROM trips t
     JOIN transport_routes r ON t.route_id = r.id
-    WHERE t.bus_id = ${busId} AND t.status = 'active'
+    WHERE t.bus_id = ${busId} AND t.status IN ('active', 'in_progress')
     LIMIT 1
   `;
 
@@ -925,6 +1111,833 @@ router.get('/parent/bus-status/:busId', requireAuth, asyncHandler(async (req, re
     nextStop,
     busOnline: location ? (new Date() - new Date(location.recorded_at)) / 1000 < 120 : false
   });
+}));
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRANSPORT SERVICE — Phase 3+: route–driver assignments, daily checkpoint
+// trips, student tracker (extends existing tables; JWT + school_id scoped).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Route stops list (nested path) — ordered; tenant-scoped. */
+router.get('/routes/:routeId/stops', requirePermission('transport.view'), asyncHandler(async (req, res) => {
+  const { routeId } = req.params;
+  const limit = Math.min(Number(req.query.limit) || 200, 500);
+
+  const [route] = await sql`
+    SELECT id FROM transport_routes
+    WHERE id = ${routeId} AND school_id = ${req.schoolId}
+  `;
+  if (!route) return res.status(404).json({ error: 'Route not found' });
+
+  const stops = await sql`
+    SELECT id, name, stop_order, latitude, longitude
+    FROM transport_stops
+    WHERE route_id = ${routeId}
+      AND school_id = ${req.schoolId}
+      AND deleted_at IS NULL
+    ORDER BY stop_order ASC
+    LIMIT ${limit}
+  `;
+  return sendSuccess(res, req.schoolId, stops);
+}));
+
+/** Add stop with auto stop_order when body omits it — matches mobile admin flows. */
+router.post('/routes/:routeId/stops/auto', requirePermission('transport.manage'), asyncHandler(async (req, res) => {
+  const { routeId } = req.params;
+  const { name, latitude, longitude } = req.body;
+
+  if (!name) return res.status(400).json({ error: 'name is required' });
+
+  const [routeCheck] = await sql`
+    SELECT id FROM transport_routes WHERE id = ${routeId} AND school_id = ${req.schoolId}
+  `;
+  if (!routeCheck) return res.status(404).json({ error: 'Route not found' });
+
+  const [maxOrder] = await sql`
+    SELECT COALESCE(MAX(stop_order), 0) AS max_order
+    FROM transport_stops
+    WHERE route_id = ${routeId} AND school_id = ${req.schoolId} AND deleted_at IS NULL
+  `;
+  const nextOrder = Number(maxOrder.max_order) + 1;
+
+  let finalNameTe = null;
+  try {
+    const te = await translateFields({ name });
+    finalNameTe = te.name || null;
+  } catch (e) { /* optional */ }
+
+  const [stop] = await sql`
+    INSERT INTO transport_stops (school_id, route_id, name, name_te, latitude, longitude, stop_order)
+    VALUES (${req.schoolId}, ${routeId}, ${name}, ${finalNameTe}, ${latitude ?? null}, ${longitude ?? null}, ${nextOrder})
+    RETURNING *
+  `;
+
+  await sql`
+    UPDATE transport_routes SET total_stops = (
+      SELECT COUNT(*) FROM transport_stops
+      WHERE route_id = ${routeId} AND school_id = ${req.schoolId} AND deleted_at IS NULL
+    ), updated_at = NOW()
+    WHERE id = ${routeId} AND school_id = ${req.schoolId}
+  `;
+
+  return sendSuccess(res, req.schoolId, stop, 201);
+}));
+
+/** Nested soft-delete stop (updates total_stops). */
+router.delete('/routes/:routeId/stops/:stopId', requirePermission('transport.manage'), asyncHandler(async (req, res) => {
+  const { routeId, stopId } = req.params;
+
+  const [existing] = await sql`
+    SELECT id FROM transport_stops
+    WHERE id = ${stopId} AND route_id = ${routeId} AND school_id = ${req.schoolId} AND deleted_at IS NULL
+  `;
+  if (!existing) return res.status(404).json({ error: 'Stop not found' });
+
+  await sql`
+    UPDATE transport_stops SET deleted_at = NOW()
+    WHERE id = ${stopId} AND school_id = ${req.schoolId}
+  `;
+
+  await sql`
+    UPDATE transport_routes SET total_stops = (
+      SELECT COUNT(*) FROM transport_stops
+      WHERE route_id = ${routeId} AND school_id = ${req.schoolId} AND deleted_at IS NULL
+    ), updated_at = NOW()
+    WHERE id = ${routeId} AND school_id = ${req.schoolId}
+  `;
+
+  return sendSuccess(res, req.schoolId, { message: 'Stop removed' });
+}));
+
+router.post('/routes/:routeId/stops/reorder', requirePermission('transport.manage'), asyncHandler(async (req, res) => {
+  const { routeId } = req.params;
+  const { orderedStopIds } = req.body;
+
+  if (!Array.isArray(orderedStopIds) || orderedStopIds.length === 0) {
+    return res.status(400).json({ error: 'orderedStopIds array is required' });
+  }
+
+  const existing = await sql`
+    SELECT id FROM transport_stops
+    WHERE route_id = ${routeId} AND school_id = ${req.schoolId} AND deleted_at IS NULL
+  `;
+  const existingIds = new Set(existing.map((s) => s.id));
+  const allValid = orderedStopIds.every((id) => existingIds.has(id));
+  if (!allValid) return res.status(400).json({ error: 'One or more stop IDs are invalid for this route' });
+
+  const orders = orderedStopIds.map((_, i) => i + 1);
+
+  await sql`
+    UPDATE transport_stops ts SET stop_order = u.stop_order
+    FROM unnest(
+      ${sql.array(orderedStopIds)}::uuid[],
+      ${sql.array(orders)}::int[]
+    ) AS u(id, stop_order)
+    WHERE ts.id = u.id AND ts.school_id = ${req.schoolId}
+  `;
+
+  await sql`
+    UPDATE transport_routes SET updated_at = NOW()
+    WHERE id = ${routeId} AND school_id = ${req.schoolId}
+  `;
+
+  return sendSuccess(res, req.schoolId, { message: 'Stops reordered' });
+}));
+
+router.get('/routes/:routeId/students', requirePermission('transport.view'), asyncHandler(async (req, res) => {
+  const { routeId } = req.params;
+  const limit = Math.min(Number(req.query.limit) || 500, 1000);
+
+  const [route] = await sql`
+    SELECT id FROM transport_routes WHERE id = ${routeId} AND school_id = ${req.schoolId}
+  `;
+  if (!route) return res.status(404).json({ error: 'Route not found' });
+
+  const students = await sql`
+    SELECT
+      st.id as assignment_id, st.student_id, st.stop_id, st.is_active,
+      p.display_name as student_name, s.admission_no,
+      c.name as class_name, sec.name as section_name,
+      tsp.name as stop_name, tsp.stop_order
+    FROM student_transport st
+    JOIN students s ON st.student_id = s.id AND s.school_id = ${req.schoolId}
+    JOIN persons p ON s.person_id = p.id
+    LEFT JOIN transport_stops tsp ON st.stop_id = tsp.id AND tsp.school_id = ${req.schoolId}
+    LEFT JOIN student_enrollments se ON s.id = se.student_id AND se.status = 'active' AND se.school_id = ${req.schoolId}
+    LEFT JOIN class_sections cs ON se.class_section_id = cs.id
+    LEFT JOIN classes c ON cs.class_id = c.id
+    LEFT JOIN sections sec ON cs.section_id = sec.id
+    WHERE st.route_id = ${routeId}
+      AND st.school_id = ${req.schoolId}
+      AND st.is_active = true
+    ORDER BY tsp.stop_order NULLS LAST, p.display_name
+    LIMIT ${limit}
+  `;
+  return sendSuccess(res, req.schoolId, students);
+}));
+
+router.post('/assign-student', requirePermission('transport.manage'), asyncHandler(async (req, res) => {
+  const { student_id, route_id, stop_id, academic_year_id } = req.body;
+  if (!student_id || !route_id || !stop_id || !academic_year_id) {
+    return res.status(400).json({ error: 'student_id, route_id, stop_id, academic_year_id are required' });
+  }
+
+  const [student] = await sql`
+    SELECT id FROM students WHERE id = ${student_id} AND school_id = ${req.schoolId} AND deleted_at IS NULL
+  `;
+  if (!student) return res.status(404).json({ error: 'Student not found' });
+
+  const [route] = await sql`
+    SELECT id, bus_id FROM transport_routes WHERE id = ${route_id} AND school_id = ${req.schoolId}
+  `;
+  if (!route) return res.status(404).json({ error: 'Route not found' });
+
+  const [stop] = await sql`
+    SELECT id FROM transport_stops
+    WHERE id = ${stop_id} AND route_id = ${route_id} AND school_id = ${req.schoolId} AND deleted_at IS NULL
+  `;
+  if (!stop) return res.status(404).json({ error: 'Stop not found on this route' });
+
+  const bus_id = route.bus_id || null;
+
+  const [assignment] = await sql`
+    INSERT INTO student_transport (school_id, student_id, route_id, stop_id, bus_id, academic_year_id, is_active)
+    VALUES (${req.schoolId}, ${student_id}, ${route_id}, ${stop_id}, ${bus_id}, ${academic_year_id}, true)
+    ON CONFLICT (student_id, academic_year_id)
+    DO UPDATE SET
+      school_id = EXCLUDED.school_id,
+      route_id = EXCLUDED.route_id,
+      stop_id = EXCLUDED.stop_id,
+      bus_id = EXCLUDED.bus_id,
+      is_active = true
+    RETURNING *
+  `;
+  return sendSuccess(res, req.schoolId, assignment, 201);
+}));
+
+router.delete('/assign-student/:studentId', requirePermission('transport.manage'), asyncHandler(async (req, res) => {
+  const { studentId } = req.params;
+  const { academic_year_id } = req.query;
+
+  const [updated] = await sql`
+    UPDATE student_transport
+    SET is_active = false
+    WHERE student_id = ${studentId}
+      AND school_id = ${req.schoolId}
+      ${academic_year_id ? sql`AND academic_year_id = ${academic_year_id}` : sql``}
+      AND is_active = true
+    RETURNING id
+  `;
+  if (!updated) return res.status(404).json({ error: 'Assignment not found' });
+  return sendSuccess(res, req.schoolId, { message: 'Student removed from route' });
+}));
+
+router.post('/routes/:routeId/assign-driver', requirePermission('transport.manage'), asyncHandler(async (req, res) => {
+  const { routeId } = req.params;
+  const { driver_id } = req.body;
+
+  if (!driver_id) return res.status(400).json({ error: 'driver_id is required' });
+
+  const [route] = await sql`
+    SELECT id FROM transport_routes WHERE id = ${routeId} AND school_id = ${req.schoolId}
+  `;
+  if (!route) return res.status(404).json({ error: 'Route not found' });
+
+  const [driver] = await sql`
+    SELECT id FROM staff WHERE id = ${driver_id} AND school_id = ${req.schoolId} AND deleted_at IS NULL
+  `;
+  if (!driver) return res.status(404).json({ error: 'Driver not found' });
+
+  await sql`
+    UPDATE driver_route_assignments
+    SET is_active = false, updated_at = NOW()
+    WHERE route_id = ${routeId} AND school_id = ${req.schoolId}
+  `;
+
+  const [assignment] = await sql`
+    INSERT INTO driver_route_assignments (school_id, route_id, driver_id, is_active)
+    VALUES (${req.schoolId}, ${routeId}, ${driver_id}, true)
+    ON CONFLICT (school_id, route_id, driver_id)
+    DO UPDATE SET is_active = true, updated_at = NOW(), deleted_at = NULL
+    RETURNING *
+  `;
+  return sendSuccess(res, req.schoolId, assignment, 201);
+}));
+
+router.get('/driver/my-trip', requireAuth, asyncHandler(async (req, res) => {
+  if (!req.user?.roles?.includes('driver')) {
+    return res.status(403).json({ error: 'Driver role required' });
+  }
+
+  const staffId = await getStaffId(req.user);
+  if (!staffId) return res.status(404).json({ error: 'Driver profile not found' });
+
+  const [routeAssignment] = await sql`
+    SELECT dra.route_id, r.name as route_name, r.direction, r.bus_id
+    FROM driver_route_assignments dra
+    JOIN transport_routes r ON dra.route_id = r.id AND r.school_id = ${req.schoolId}
+    WHERE dra.driver_id = ${staffId}
+      AND dra.school_id = ${req.schoolId}
+      AND dra.is_active = true
+      AND dra.deleted_at IS NULL
+    LIMIT 1
+  `;
+  if (!routeAssignment) {
+    return res.status(404).json({ success: false, error: 'No route assigned to you' });
+  }
+
+  if (!routeAssignment.bus_id) {
+    return res.status(400).json({ error: 'Route has no bus assigned — admin must link a bus to this route' });
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const tripDir = routeAssignment.direction === 'afternoon' ? 'afternoon'
+    : routeAssignment.direction === 'evening' ? 'evening'
+      : routeAssignment.direction === 'both' ? 'morning' : (routeAssignment.direction || 'morning');
+
+  let [trip] = await sql`
+    SELECT id, status, started_at, ended_at, trip_date
+    FROM trips
+    WHERE route_id = ${routeAssignment.route_id}
+      AND driver_id = ${staffId}
+      AND school_id = ${req.schoolId}
+      AND (
+        trip_date = ${today}
+        OR (
+          trip_date IS NULL
+          AND COALESCE(started_at, created_at)::date = ${today}::date
+        )
+      )
+    ORDER BY created_at DESC
+    LIMIT 1
+  `;
+
+  if (!trip) {
+    try {
+      [trip] = await sql`
+        INSERT INTO trips (
+          school_id, bus_id, route_id, driver_id, status, trip_date, trip_direction, started_at
+        )
+        VALUES (
+          ${req.schoolId},
+          ${routeAssignment.bus_id},
+          ${routeAssignment.route_id},
+          ${staffId},
+          'scheduled',
+          ${today},
+          ${tripDir},
+          NULL
+        )
+        RETURNING id, status, started_at, ended_at, trip_date
+      `;
+    } catch (e) {
+      [trip] = await sql`
+        SELECT id, status, started_at, ended_at, trip_date FROM trips
+        WHERE route_id = ${routeAssignment.route_id}
+          AND driver_id = ${staffId}
+          AND school_id = ${req.schoolId}
+          AND (
+            trip_date = ${today}
+            OR (
+              trip_date IS NULL
+              AND COALESCE(started_at, created_at)::date = ${today}::date
+            )
+          )
+        ORDER BY created_at DESC
+        LIMIT 1
+      `;
+      if (!trip) throw e;
+    }
+
+    await sql`
+      INSERT INTO trip_stop_status (school_id, trip_id, stop_id, stop_order, status)
+      SELECT ${req.schoolId}, ${trip.id}, ts.id, ts.stop_order, 'pending'
+      FROM transport_stops ts
+      WHERE ts.route_id = ${routeAssignment.route_id}
+        AND ts.school_id = ${req.schoolId}
+        AND ts.deleted_at IS NULL
+      ORDER BY ts.stop_order ASC
+      ON CONFLICT (school_id, trip_id, stop_id) DO NOTHING
+    `;
+  }
+
+  const stops = await sql`
+    SELECT
+      ts.id as stop_id,
+      ts.name as stop_name,
+      ts.stop_order,
+      ts.latitude,
+      ts.longitude,
+      tss.id as status_id,
+      tss.status,
+      tss.arrival_time as reached_at,
+      COUNT(stx.id)::int as assigned_students
+    FROM transport_stops ts
+    LEFT JOIN trip_stop_status tss ON tss.stop_id = ts.id AND tss.trip_id = ${trip.id} AND tss.school_id = ${req.schoolId}
+    LEFT JOIN student_transport stx ON stx.stop_id = ts.id
+      AND stx.school_id = ${req.schoolId}
+      AND stx.is_active = true
+    WHERE ts.route_id = ${routeAssignment.route_id}
+      AND ts.school_id = ${req.schoolId}
+      AND ts.deleted_at IS NULL
+    GROUP BY ts.id, ts.name, ts.stop_order, ts.latitude, ts.longitude, tss.id, tss.status, tss.arrival_time
+    ORDER BY ts.stop_order ASC
+  `;
+
+  const uiStatus = mapTripUiStatus(trip.status);
+
+  return sendSuccess(res, req.schoolId, {
+    trip: {
+      id: trip.id,
+      status: uiStatus,
+      raw_status: trip.status,
+      started_at: trip.started_at,
+      completed_at: trip.ended_at,
+      route_name: routeAssignment.route_name,
+      direction: routeAssignment.direction,
+      date: today,
+    },
+    stops,
+  });
+}));
+
+router.post('/driver/trip/:tripId/start', requireAuth, asyncHandler(async (req, res) => {
+  if (!req.user?.roles?.includes('driver')) {
+    return res.status(403).json({ error: 'Driver role required' });
+  }
+
+  const { tripId } = req.params;
+  const staffId = await getStaffId(req.user);
+  if (!staffId) return res.status(403).json({ error: 'Staff profile not found' });
+
+  const [trip] = await sql`
+    SELECT t.id, t.status, t.route_id
+    FROM trips t
+    WHERE t.id = ${tripId}
+      AND t.school_id = ${req.schoolId}
+      AND t.driver_id = ${staffId}
+      AND t.status = 'scheduled'
+    LIMIT 1
+  `;
+  if (!trip) return res.status(404).json({ error: 'Trip not found or already started' });
+
+  const [updated] = await sql`
+    UPDATE trips
+    SET status = 'in_progress', started_at = NOW(), updated_at = NOW()
+    WHERE id = ${tripId} AND school_id = ${req.schoolId}
+    RETURNING id, status, started_at
+  `;
+
+  return sendSuccess(res, req.schoolId, {
+    ...updated,
+    status: mapTripUiStatus(updated.status),
+    raw_status: updated.status,
+  });
+}));
+
+/**
+ * POST .../reach — one-tap checkpoint for new driver UI.
+ * trip_stop_status.status CHECK allows: pending | arrived | completed | skipped (schema.sql).
+ * This endpoint writes 'completed' for a reached stop (same as legacy two-step arrive+complete).
+ * Do not use a separate 'reached' status — it is not in the DB constraint.
+ */
+router.post('/driver/trip/:tripId/stop/:stopId/reach', requireAuth, asyncHandler(async (req, res) => {
+  if (!req.user?.roles?.includes('driver')) {
+    return res.status(403).json({ error: 'Driver role required' });
+  }
+
+  const { tripId, stopId } = req.params;
+  const staffId = await getStaffId(req.user);
+  if (!staffId) return res.status(403).json({ error: 'Staff profile not found' });
+
+  const [trip] = await sql`
+    SELECT t.id, t.route_id
+    FROM trips t
+    WHERE t.id = ${tripId}
+      AND t.school_id = ${req.schoolId}
+      AND t.driver_id = ${staffId}
+      AND t.status IN ('active', 'in_progress')
+    LIMIT 1
+  `;
+  if (!trip) return res.status(404).json({ error: 'Active trip not found' });
+
+  const [targetStop] = await sql`
+    SELECT id, stop_order, status FROM trip_stop_status
+    WHERE trip_id = ${tripId} AND stop_id = ${stopId} AND school_id = ${req.schoolId}
+  `;
+  if (!targetStop) return res.status(404).json({ error: 'Stop not found in this trip' });
+  if (targetStop.status !== 'pending') {
+    return res.status(409).json({ error: 'Stop already reached or skipped' });
+  }
+
+  const incomplete = await sql`
+    SELECT id, stop_order, status FROM trip_stop_status
+    WHERE trip_id = ${tripId}
+      AND school_id = ${req.schoolId}
+      AND stop_order < ${targetStop.stop_order}
+      AND status NOT IN ('completed', 'skipped')
+  `;
+  if (incomplete.length > 0) {
+    return res.status(400).json({
+      error: 'Complete earlier stops first',
+      incompleteStops: incomplete.map((s) => ({ stop_order: s.stop_order, status: s.status })),
+    });
+  }
+
+  const [stopStatus] = await sql`
+    UPDATE trip_stop_status
+    SET status = 'completed', arrival_time = NOW(), departure_time = NOW()
+    WHERE trip_id = ${tripId}
+      AND stop_id = ${stopId}
+      AND school_id = ${req.schoolId}
+      AND status = 'pending'
+    RETURNING id, stop_id, status, arrival_time
+  `;
+  if (!stopStatus) return res.status(409).json({ error: 'Stop already reached or not found' });
+
+  const [stop] = await sql`
+    SELECT name FROM transport_stops WHERE id = ${stopId} AND school_id = ${req.schoolId}
+  `;
+
+  setImmediate(async () => {
+    try {
+      const recipients = await sql`
+        SELECT DISTINCT u.id AS user_id
+        FROM student_transport sra
+        JOIN students s ON sra.student_id = s.id AND s.school_id = ${req.schoolId}
+        JOIN users u ON u.person_id = s.person_id AND u.school_id = ${req.schoolId}
+        WHERE sra.stop_id = ${stopId}
+          AND sra.school_id = ${req.schoolId}
+          AND sra.is_active = true
+          AND u.account_status = 'active'
+        UNION
+        SELECT DISTINCT u.id AS user_id
+        FROM student_transport sra
+        JOIN student_parents sp ON sp.student_id = sra.student_id AND sp.school_id = ${req.schoolId} AND sp.deleted_at IS NULL
+        JOIN parents par ON par.id = sp.parent_id AND par.school_id = ${req.schoolId}
+        JOIN users u ON u.person_id = par.person_id AND u.school_id = ${req.schoolId}
+        WHERE sra.stop_id = ${stopId}
+          AND sra.school_id = ${req.schoolId}
+          AND sra.is_active = true
+          AND u.account_status = 'active'
+      `;
+      const ids = recipients.map((r) => r.user_id).filter(Boolean);
+      if (ids.length > 0) {
+        await sendNotificationToUsers(
+          ids,
+          'BUS_STOP_REACHED',
+          { stopName: stop?.name || 'your stop' },
+        );
+      }
+    } catch (err) {
+      /* non-blocking */
+    }
+  });
+
+  return sendSuccess(res, req.schoolId, {
+    ...stopStatus,
+    reached_at: stopStatus.arrival_time,
+    status: 'reached',
+  });
+}));
+
+router.post('/driver/trip/:tripId/complete', requireAuth, asyncHandler(async (req, res) => {
+  if (!req.user?.roles?.includes('driver')) {
+    return res.status(403).json({ error: 'Driver role required' });
+  }
+
+  const { tripId } = req.params;
+  const staffId = await getStaffId(req.user);
+  if (!staffId) return res.status(403).json({ error: 'Staff profile not found' });
+
+  // TODO: Remove legacy 'active' from this IN list once all driver clients use POST /driver/trip/:id/start
+  // and legacy POST /trips/start only emits in_progress (tracked: transport reconciliation v2).
+  const [trip] = await sql`
+    SELECT t.id, t.route_id
+    FROM trips t
+    WHERE t.id = ${tripId}
+      AND t.school_id = ${req.schoolId}
+      AND t.driver_id = ${staffId}
+      AND t.status IN ('active', 'in_progress')
+    LIMIT 1
+  `;
+  if (!trip) return res.status(404).json({ error: 'Active trip not found' });
+
+  const [completed] = await sql`
+    UPDATE trips
+    SET status = 'completed', ended_at = NOW(), updated_at = NOW()
+    WHERE id = ${tripId} AND school_id = ${req.schoolId}
+    RETURNING id, status, ended_at
+  `;
+
+  setImmediate(async () => {
+    try {
+      const [routeInfo] = await sql`
+        SELECT name FROM transport_routes WHERE id = ${trip.route_id} AND school_id = ${req.schoolId}
+      `;
+
+      const parents = await sql`
+        SELECT DISTINCT u.id AS user_id
+        FROM student_transport sra
+        JOIN student_parents sp ON sp.student_id = sra.student_id AND sp.school_id = ${req.schoolId} AND sp.deleted_at IS NULL
+        JOIN parents par ON par.id = sp.parent_id AND par.school_id = ${req.schoolId}
+        JOIN users u ON u.person_id = par.person_id AND u.school_id = ${req.schoolId}
+        WHERE sra.route_id = ${trip.route_id}
+          AND sra.school_id = ${req.schoolId}
+          AND sra.is_active = true
+          AND u.account_status = 'active'
+      `;
+
+      const admins = await sql`
+        SELECT DISTINCT u.id AS user_id
+        FROM user_roles ur
+        JOIN roles r ON ur.role_id = r.id AND r.school_id = ${req.schoolId}
+        JOIN users u ON ur.user_id = u.id AND u.school_id = ${req.schoolId}
+        WHERE r.code = 'admin'
+          AND u.account_status = 'active'
+          AND ur.school_id = ${req.schoolId}
+          AND ur.deleted_at IS NULL
+      `;
+
+      const allUserIds = [...new Set([
+        ...parents.map((p) => p.user_id),
+        ...admins.map((a) => a.user_id),
+      ])];
+
+      if (allUserIds.length > 0) {
+        await sendNotificationToUsers(
+          allUserIds,
+          'BUS_TRIP_COMPLETED',
+          { routeName: routeInfo?.name || 'route' },
+        );
+      }
+    } catch (err) {
+      /* non-blocking */
+    }
+  });
+
+  return sendSuccess(res, req.schoolId, {
+    ...completed,
+    status: mapTripUiStatus(completed.status),
+    raw_status: completed.status,
+    completed_at: completed.ended_at,
+  });
+}));
+
+router.get('/my-bus', requireAuth, asyncHandler(async (req, res) => {
+  const userId = req.user.internal_id;
+  const schoolId = req.schoolId;
+
+  const [userRecord] = await sql`
+    SELECT s.id AS student_id
+    FROM users u
+    JOIN students s ON u.person_id = s.person_id AND s.school_id = ${schoolId}
+    WHERE u.id = ${userId} AND u.school_id = ${schoolId}
+    LIMIT 1
+  `;
+
+  let studentId = userRecord?.student_id;
+  if (!studentId) {
+    const [parentRecord] = await sql`
+      SELECT sp.student_id
+      FROM users u
+      JOIN parents p ON u.person_id = p.person_id AND p.school_id = ${schoolId}
+      JOIN student_parents sp ON p.id = sp.parent_id AND sp.school_id = ${schoolId} AND sp.deleted_at IS NULL
+      WHERE u.id = ${userId} AND u.school_id = ${schoolId}
+      LIMIT 1
+    `;
+    studentId = parentRecord?.student_id;
+  }
+
+  if (!studentId) return res.status(404).json({ error: 'No student profile found' });
+
+  const [ay] = await sql`
+    SELECT id FROM academic_years
+    WHERE CURRENT_DATE BETWEEN start_date AND end_date AND school_id = ${schoolId}
+    LIMIT 1
+  `;
+
+  const [assignment] = await sql`
+    SELECT st.route_id, st.stop_id, tsp.name AS boarding_stop, tsp.stop_order AS boarding_stop_order,
+           r.name AS route_name, r.direction
+    FROM student_transport st
+    JOIN transport_routes r ON st.route_id = r.id AND r.school_id = ${schoolId}
+    JOIN transport_stops tsp ON st.stop_id = tsp.id AND tsp.school_id = ${schoolId}
+    WHERE st.student_id = ${studentId}
+      AND st.school_id = ${schoolId}
+      AND st.academic_year_id = ${ay?.id}
+      AND st.is_active = true
+    LIMIT 1
+  `;
+
+  if (!assignment) {
+    return sendSuccess(res, schoolId, { assigned: false });
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const [trip] = await sql`
+    SELECT t.id, t.status, t.started_at, t.ended_at,
+           p.display_name AS driver_name
+    FROM trips t
+    JOIN staff st ON t.driver_id = st.id AND st.school_id = ${schoolId}
+    JOIN persons p ON st.person_id = p.id
+    WHERE t.route_id = ${assignment.route_id}
+      AND t.school_id = ${schoolId}
+      AND (
+        t.trip_date = ${today}
+        OR (
+          t.trip_date IS NULL
+          AND COALESCE(t.started_at, t.created_at)::date = ${today}::date
+        )
+      )
+    ORDER BY t.created_at DESC
+    LIMIT 1
+  `;
+
+  let stops = [];
+  let currentStop = null;
+  let stopsUntilBoarding = null;
+
+  if (trip) {
+    stops = await sql`
+      SELECT ts.id, ts.name, ts.stop_order, tss.status, tss.arrival_time AS reached_at
+      FROM transport_stops ts
+      JOIN trip_stop_status tss ON tss.stop_id = ts.id AND tss.trip_id = ${trip.id} AND tss.school_id = ${schoolId}
+      WHERE ts.route_id = ${assignment.route_id}
+        AND ts.school_id = ${schoolId}
+        AND ts.deleted_at IS NULL
+      ORDER BY ts.stop_order ASC
+    `;
+
+    const reachedStops = stops.filter((s) => s.status === 'completed');
+    currentStop = reachedStops.length > 0 ? reachedStops[reachedStops.length - 1] : null;
+
+    if (currentStop && assignment.boarding_stop_order != null) {
+      stopsUntilBoarding = Math.max(0, assignment.boarding_stop_order - currentStop.stop_order);
+    }
+  }
+
+  const tripUi = trip ? {
+    ...trip,
+    ui_status: mapTripUiStatus(trip.status),
+  } : null;
+
+  return sendSuccess(res, schoolId, {
+    assigned: true,
+    route_name: assignment.route_name,
+    boarding_stop: assignment.boarding_stop,
+    boarding_stop_order: assignment.boarding_stop_order,
+    trip: tripUi,
+    stops,
+    current_stop: currentStop,
+    stops_until_boarding: stopsUntilBoarding,
+  });
+}));
+
+router.get('/routes/:routeId/live', requirePermission('transport.view'), asyncHandler(async (req, res) => {
+  const { routeId } = req.params;
+
+  const [route] = await sql`
+    SELECT id, name FROM transport_routes
+    WHERE id = ${routeId} AND school_id = ${req.schoolId}
+  `;
+  if (!route) return res.status(404).json({ error: 'Route not found' });
+
+  const today = new Date().toISOString().slice(0, 10);
+  const [trip] = await sql`
+    SELECT t.id, t.status, t.started_at, t.ended_at, t.trip_direction,
+           p.display_name AS driver_name
+    FROM trips t
+    JOIN staff st ON t.driver_id = st.id AND st.school_id = ${req.schoolId}
+    JOIN persons p ON st.person_id = p.id
+    WHERE t.route_id = ${routeId}
+      AND t.school_id = ${req.schoolId}
+      AND (
+        t.trip_date = ${today}
+        OR (
+          t.trip_date IS NULL
+          AND COALESCE(t.started_at, t.created_at)::date = ${today}::date
+        )
+      )
+    ORDER BY t.created_at DESC
+    LIMIT 1
+  `;
+
+  let stops;
+  if (trip) {
+    stops = await sql`
+      SELECT ts.id, ts.name, ts.stop_order, ts.latitude, ts.longitude,
+             tss.status, tss.arrival_time AS reached_at,
+             COUNT(stx.id)::int AS assigned_students
+      FROM transport_stops ts
+      LEFT JOIN trip_stop_status tss ON tss.stop_id = ts.id AND tss.trip_id = ${trip.id} AND tss.school_id = ${req.schoolId}
+      LEFT JOIN student_transport stx ON stx.stop_id = ts.id AND stx.school_id = ${req.schoolId} AND stx.is_active = true
+      WHERE ts.route_id = ${routeId}
+        AND ts.school_id = ${req.schoolId}
+        AND ts.deleted_at IS NULL
+      GROUP BY ts.id, ts.name, ts.stop_order, ts.latitude, ts.longitude, tss.status, tss.arrival_time
+      ORDER BY ts.stop_order ASC
+    `;
+  } else {
+    stops = await sql`
+      SELECT ts.id, ts.name, ts.stop_order, ts.latitude, ts.longitude,
+             NULL::varchar AS status, NULL::timestamptz AS reached_at,
+             COUNT(stx.id)::int AS assigned_students
+      FROM transport_stops ts
+      LEFT JOIN student_transport stx ON stx.stop_id = ts.id AND stx.school_id = ${req.schoolId} AND stx.is_active = true
+      WHERE ts.route_id = ${routeId}
+        AND ts.school_id = ${req.schoolId}
+        AND ts.deleted_at IS NULL
+      GROUP BY ts.id, ts.name, ts.stop_order, ts.latitude, ts.longitude
+      ORDER BY ts.stop_order ASC
+    `;
+  }
+
+  return sendSuccess(res, req.schoolId, {
+    route: route.name,
+    trip: trip ? { ...trip, ui_status: mapTripUiStatus(trip.status) } : null,
+    stops,
+  });
+}));
+
+router.get('/live-today', requirePermission('transport.view'), asyncHandler(async (req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+  const limit = Math.min(Number(req.query.limit) || 80, 200);
+
+  const rows = await sql`
+    SELECT r.id AS route_id, r.name AS route_name,
+           t.id AS trip_id, t.status, t.started_at, t.ended_at,
+           p.display_name AS driver_name,
+           (
+             SELECT tsp.name FROM trip_stop_status tss
+             JOIN transport_stops tsp ON tsp.id = tss.stop_id AND tsp.school_id = ${req.schoolId}
+             WHERE tss.trip_id = t.id AND tss.status = 'completed' AND tss.school_id = ${req.schoolId}
+             ORDER BY tss.stop_order DESC LIMIT 1
+           ) AS last_stop_name
+    FROM transport_routes r
+    LEFT JOIN LATERAL (
+      SELECT tr.*
+      FROM trips tr
+      WHERE tr.route_id = r.id
+        AND tr.school_id = ${req.schoolId}
+        AND (
+          tr.trip_date = ${today}
+          OR (
+            tr.trip_date IS NULL
+            AND COALESCE(tr.started_at, tr.created_at)::date = ${today}::date
+          )
+        )
+      ORDER BY tr.created_at DESC
+      LIMIT 1
+    ) t ON TRUE
+    LEFT JOIN staff st ON t.driver_id = st.id AND st.school_id = ${req.schoolId}
+    LEFT JOIN persons p ON st.person_id = p.id
+    WHERE r.school_id = ${req.schoolId}
+    ORDER BY r.name
+    LIMIT ${limit}
+  `;
+
+  return sendSuccess(res, req.schoolId, rows);
 }));
 
 export default router;

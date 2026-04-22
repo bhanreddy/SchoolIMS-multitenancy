@@ -33,9 +33,21 @@ export const NotificationTemplateService = {
         let title = (useTelugu && config.titleTemplate_te) ? config.titleTemplate_te : config.titleTemplate;
         let body = (useTelugu && config.bodyTemplate_te) ? config.bodyTemplate_te : config.bodyTemplate;
 
+        // Auto fallback for _te parameters to their English counterparts
+        const finalParams = { ...params };
+        Object.keys(finalParams).forEach(key => {
+            if (!key.endsWith('_te')) {
+                const teKey = key + '_te';
+                if (finalParams[teKey] === undefined) {
+                    finalParams[teKey] = finalParams[key];
+                }
+            }
+        });
+
         // Replace placeholders
-        Object.keys(params).forEach(key => {
-            const value = params[key];
+        Object.keys(finalParams).forEach(key => {
+            const value = finalParams[key];
+
             // Fix 9: Escape dynamic RegExp keys
             const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const regex = new RegExp(`{{${escapedKey}}}`, 'g');

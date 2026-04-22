@@ -4,6 +4,7 @@ import { requirePermission, requireAuth } from '../middleware/auth.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { sendNotificationToUsers } from '../services/notificationService.js';
+import { translateFields } from '../services/geminiTranslator.js';
 
 const router = express.Router();
 
@@ -22,8 +23,8 @@ router.get('/', requirePermission('leaves.view'), asyncHandler(async (req, res) 
   if (isAdmin) {
     leaves = await sql`
       SELECT
-        la.id, la.leave_type, la.start_date, la.end_date, la.reason, la.status,
-        la.review_remarks, la.created_at,
+        la.id, la.leave_type, la.start_date, la.end_date, la.reason, la.reason_te, la.status,
+        la.review_remarks, la.review_remarks_te, la.created_at,
         applicant.display_name as applicant_name,
         (SELECT r.code FROM user_roles ur JOIN roles r ON ur.role_id = r.id WHERE ur.user_id = u.id LIMIT 1) as applicant_role,
         reviewer.display_name as reviewed_by_name,
@@ -49,9 +50,12 @@ router.get('/', requirePermission('leaves.view'), asyncHandler(async (req, res) 
   } else {
     leaves = await sql`
       SELECT
-        la.id, la.leave_type, la.start_date, la.end_date, la.reason, la.status,
-        la.review_remarks, la.created_at, la.reviewed_at
+        la.id, la.leave_type, la.start_date, la.end_date, la.reason, la.reason_te, la.status,
+        la.review_remarks, la.review_remarks_te, la.created_at, la.reviewed_at,
+        reviewer.display_name as reviewed_by_name
       FROM leave_applications la
+      LEFT JOIN users ru ON la.reviewed_by = ru.id
+      LEFT JOIN persons reviewer ON ru.person_id = reviewer.id
       WHERE la.applicant_id = ${req.user.internal_id}
         AND la.school_id = ${schoolId}
         ${status ? sql`AND la.status = ${status}` : sql``}
@@ -125,9 +129,15 @@ router.post('/', requirePermission('leaves.apply'), asyncHandler(async (req, res
     return res.status(400).json({ error: 'You have overlapping leave applications' });
   }
 
+  let reason_te = null;
+  try {
+    const te = await translateFields({ reason });
+    reason_te = te.reason || null;
+  } catch (e) {}
+
   const [leave] = await sql`
-    INSERT INTO leave_applications (school_id, applicant_id, leave_type, start_date, end_date, reason)
-    VALUES (${schoolId}, ${req.user.internal_id}, ${leave_type}, ${start_date}, ${end_date}, ${reason})
+    INSERT INTO leave_applications (school_id, applicant_id, leave_type, start_date, end_date, reason, reason_te)
+    VALUES (${schoolId}, ${req.user.internal_id}, ${leave_type}, ${start_date}, ${end_date}, ${reason}, ${reason_te})
     RETURNING *
   `;
 
@@ -181,11 +191,20 @@ router.put('/:id', requireAuth, asyncHandler(async (req, res) => {
       return res.status(403).json({ error: 'Only authorized users can approve/reject leaves' });
     }
 
+    let sql_review_remarks_te = sql`review_remarks_te`;
+    if (review_remarks) {
+      try {
+        const te = await translateFields({ review_remarks });
+        if (te.review_remarks) sql_review_remarks_te = sql`${te.review_remarks}`;
+      } catch (e) {}
+    }
+
     const [updated] = await sql`
       UPDATE leave_applications
       SET
         status = ${status},
         review_remarks = ${review_remarks || null},
+        review_remarks_te = ${sql_review_remarks_te},
         reviewed_by = ${req.user.internal_id},
         reviewed_at = NOW()
       WHERE id = ${id}
@@ -219,6 +238,14 @@ router.put('/:id', requireAuth, asyncHandler(async (req, res) => {
       return res.status(400).json({ error: 'Can only update pending leaves' });
     }
 
+    let sql_reason_te = sql`reason_te`;
+    if (reason) {
+      try {
+        const te = await translateFields({ reason });
+        if (te.reason) sql_reason_te = sql`${te.reason}`;
+      } catch (e) {}
+    }
+
     const [updated] = await sql`
       UPDATE leave_applications
       SET
@@ -226,7 +253,8 @@ router.put('/:id', requireAuth, asyncHandler(async (req, res) => {
         leave_type = COALESCE(${leave_type ?? null}, leave_type),
         start_date = COALESCE(${start_date ?? null}, start_date),
         end_date = COALESCE(${end_date ?? null}, end_date),
-        reason = COALESCE(${reason ?? null}, reason)
+        reason = COALESCE(${reason ?? null}, reason),
+        reason_te = ${sql_reason_te}
       WHERE id = ${id} AND school_id = ${schoolId}
       RETURNING *
     `;

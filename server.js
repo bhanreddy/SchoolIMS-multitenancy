@@ -28,10 +28,53 @@ const port = config.port;
 
 // Security Middleware
 app.set('trust proxy', 1);
-app.use(helmet());
+app.use(helmet({
+    // Relax cross-origin policies so browser fetch (Expo Web) can reach the API
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    crossOriginOpenerPolicy: config.isProduction ? undefined : false,
+    crossOriginEmbedderPolicy: config.isProduction ? undefined : false,
+}));
 app.disable('x-powered-by');
 
-// Rate Limiting
+// Stricter rate limits for high-cost paths (run before the global /api limiter)
+const aiLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'AI rate limit exceeded. Try again in 1 minute.' },
+});
+const notifyLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Notification rate limit exceeded. Try again in a minute.' },
+});
+const transportLocationLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many location updates. Slow down.' },
+});
+
+app.use('/api/v1/ai', aiLimiter);
+app.use('/api/v1/admin/notifications', notifyLimiter);
+app.use((req, res, next) => {
+    if (req.method === 'POST' && req.path === '/api/v1/fees/remind') {
+        return notifyLimiter(req, res, next);
+    }
+    next();
+});
+app.use((req, res, next) => {
+    if (req.method === 'POST' && /^\/api\/v1\/transport\/buses\/[^/]+\/location\/?$/i.test(req.path)) {
+        return transportLocationLimiter(req, res, next);
+    }
+    next();
+});
+
+// Rate Limiting (global)
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: config.isProduction ? 100 : 1000,
@@ -103,7 +146,8 @@ app.use(cors({
         return cb(null, allow.includes(origin));
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-request-id']
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-request-id', 'Accept'],
+    credentials: true,
 }));
 
 // Middleware
@@ -111,24 +155,16 @@ app.use(compression());
 app.use(cookieParser());
 app.use(express.json({ limit: config.bodyLimit }));
 
-// Auth & Audit Middleware (Global — skip super-admin routes which have own auth)
-app.use((req, res, next) => {
-    if (req.path.startsWith('/api/super-admin')) return next();
-    identifyUser(req, res, next);
-});
-app.use((req, res, next) => {
-    if (req.path.startsWith('/api/super-admin')) return next();
-    requireSchoolId(req, res, next);
-});
-app.use((req, res, next) => {
-    if (req.path.startsWith('/api/super-admin')) return next();
-    auditLogger(req, res, next);
-});
+// Auth & Audit Middleware (Global)
+app.use(identifyUser);
+app.use(requireSchoolId);
+app.use(auditLogger);
 
 
 // Import routes
 import authRouter from './routes/authRoutes.js';
 import studentsRouter from './routes/studentsRoutes.js';
+import studentDashboardRouter from './routes/studentDashboardRoutes.js';
 import teachersRouter from './routes/teachersRoutes.js';
 import staffRouter from './routes/staffRoutes.js';
 import userRoutes from './routes/userRoutes.js';
@@ -156,8 +192,10 @@ import expensesRouter from './routes/expensesRoutes.js';
 import payrollRouter from './routes/payrollRoutes.js';
 import logRouter from './routes/logRoutes.js';
 import schoolSettingsRouter from './routes/schoolSettingsRoutes.js';
+import settingsUpiRouter from './routes/settingsUpiRoutes.js';
 import girlSafetyRouter from './routes/girlSafetyRoutes.js';
-import superAdminRouter from './routes/superAdminRoutes.js';
+import referenceRouter from './routes/referenceRoutes.js';
+import dcgdRouter from './routes/dcgdRoutes.js';
 
 // Health check endpoint (requires school_id per multi-tenant contract)
 app.get('/api/v1/health', async (req, res) => {
@@ -212,6 +250,7 @@ app.get('/', (req, res) => {
 // API v1 Routes
 app.use('/api/v1/auth', authRouter);
 app.use('/api/v1/students', studentsRouter);
+app.use('/api/v1/student', studentDashboardRouter);
 app.use('/api/v1/teachers', teachersRouter);
 app.use('/api/v1/staff', staffRouter);
 app.use('/api/v1/users', userRoutes);
@@ -239,8 +278,11 @@ app.use('/api/v1/expenses', expensesRouter);
 app.use('/api/v1/payroll', payrollRouter);
 app.use('/api/v1/log', logRouter);
 app.use('/api/v1/school-settings', schoolSettingsRouter);
+app.use('/api/v1/dcgd', dcgdRouter);
+app.use('/api/v1/settings', settingsUpiRouter);
+app.use('/api/settings', settingsUpiRouter);
 app.use('/api/v1/girl-safety', girlSafetyRouter);
-app.use('/api/super-admin', superAdminRouter);
+app.use('/api/v1/reference', referenceRouter);
 
 // Legacy routes (for backward compatibility)
 app.use('/students', studentsRouter);

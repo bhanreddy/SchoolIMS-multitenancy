@@ -13,9 +13,11 @@ import { sendNotificationToUsers } from '../services/notificationService.js';
  * Query params: date, class_section_id, student_id, from_date, to_date
  */
 router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, res) => {
-  const { date, class_section_id, student_id, from_date, to_date, lastSyncedAt, page = 1, limit = 50 } = req.query;
-
-  const offset = (page - 1) * limit;
+  const { date, class_section_id, student_id, from_date, to_date, lastSyncedAt, page = 1 } = req.query;
+  const classListLimit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? '200'), 10) || 200));
+  const listLimit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? '50'), 10) || 50));
+  const pageNum = Math.max(1, parseInt(String(page), 10) || 1);
+  const offset = (pageNum - 1) * listLimit;
 
   // Build dynamic query based on filters
   let attendance;
@@ -36,13 +38,15 @@ router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, r
         AND da.deleted_at IS NULL
       LEFT JOIN users u ON da.marked_by = u.id
       LEFT JOIN persons marker ON u.person_id = marker.id
-      WHERE se.class_section_id = ${class_section_id} AND school_id = ${req.schoolId}
+      WHERE se.class_section_id = ${class_section_id}
+        AND se.school_id = ${req.schoolId}
         AND se.status = 'active'
         AND se.deleted_at IS NULL
         AND s.deleted_at IS NULL
         AND s.school_id = ${req.schoolId}
         ${lastSyncedAt ? sql`AND (da.updated_at >= ${lastSyncedAt} OR da.marked_at >= ${lastSyncedAt})` : sql``}
       ORDER BY p.display_name
+      LIMIT ${classListLimit}
     `;
   } else if (student_id && from_date && to_date) {
     // Get attendance history for a student
@@ -60,7 +64,7 @@ router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, r
         AND da.deleted_at IS NULL
         ${lastSyncedAt ? sql`AND (da.updated_at >= ${lastSyncedAt} OR da.marked_at >= ${lastSyncedAt})` : sql``}
       ORDER BY da.attendance_date DESC
-      LIMIT ${limit} OFFSET ${offset}
+      LIMIT ${listLimit} OFFSET ${offset}
     `;
   } else if (date) {
     // Get all attendance for a date
@@ -81,7 +85,7 @@ router.get('/', requirePermission('attendance.view'), asyncHandler(async (req, r
         AND da.deleted_at IS NULL
         AND s.school_id = ${req.schoolId}
       ORDER BY c.name, sec.name, p.display_name
-      LIMIT ${limit} OFFSET ${offset}
+      LIMIT ${listLimit} OFFSET ${offset}
     `;
   } else {
     return res.status(400).json({
@@ -170,47 +174,68 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
 
   const markedBy = req.user?.internal_id || null;
 
-  const results = await sql.begin(async (sql) => {
-    const inserted = [];
-
-    for (const record of attendance) {
-      const { student_id, status } = record;
-
-      if (!student_id || !status) continue;
-
-      // Get active enrollment for this student in this class
-      const [enrollment] = await sql`
-        SELECT id FROM student_enrollments
-        WHERE student_id = ${student_id}
-          AND class_section_id = ${class_section_id}
-          AND status = 'active'
-          AND deleted_at IS NULL
-        LIMIT 1
-      `;
-
-      if (!enrollment) {
-
-        continue;
-      }
-
-      // Upsert attendance using ON CONFLICT (requires unique constraint on student_enrollment_id, attendance_date)
-      const [upserted] = await sql`
-        INSERT INTO daily_attendance (school_id, student_enrollment_id, attendance_date, status, marked_by, updated_at, deleted_at)
-    VALUES (${req.schoolId}, ${enrollment.id}, ${date}, ${status}, ${markedBy}, NOW(), NULL)
-        ON CONFLICT (student_enrollment_id, attendance_date)
-        WHERE deleted_at IS NULL -- Handle partial index compatibility if unique constraint is partial
-        DO UPDATE SET 
-            status = EXCLUDED.status,
-            marked_by = EXCLUDED.marked_by,
-            updated_at = NOW(),
-            deleted_at = NULL
-        RETURNING id, status
-      `;
-
-      inserted.push({ student_id, ...upserted });
+  const results = await sql.begin(async (tx) => {
+    const rows = (attendance || [])
+      .filter((r) => r?.student_id && r?.status)
+      .map((r) => ({ student_id: String(r.student_id), status: r.status }));
+    const lastByStudent = new Map();
+    for (const r of rows) {
+      lastByStudent.set(r.student_id, r.status);
     }
+    const studentIds = [...lastByStudent.keys()];
+    if (studentIds.length === 0) return [];
 
-    return inserted;
+    const enrollments = await tx`
+      SELECT se.id AS enrollment_id, se.student_id
+      FROM student_enrollments se
+      WHERE se.class_section_id = ${class_section_id}
+        AND se.school_id = ${req.schoolId}
+        AND se.status = 'active'
+        AND se.deleted_at IS NULL
+        AND se.student_id = ANY(${sql.array(studentIds)}::uuid[])
+    `;
+    const eMap = new Map(enrollments.map((e) => [String(e.student_id), e.enrollment_id]));
+    const envIds = [];
+    const statuses = [];
+    for (const sid of studentIds) {
+      const eid = eMap.get(sid);
+      if (!eid) continue;
+      envIds.push(eid);
+      statuses.push(lastByStudent.get(sid));
+    }
+    if (envIds.length === 0) return [];
+
+    const upserted = await tx`
+      INSERT INTO daily_attendance (
+        school_id, student_enrollment_id, attendance_date, status, marked_by, updated_at, deleted_at
+      )
+      SELECT
+        ${req.schoolId},
+        u.enrollment_id,
+        ${date}::date,
+        u.status,
+        ${markedBy},
+        NOW(),
+        NULL
+      FROM unnest(
+        ${sql.array(envIds)}::uuid[],
+        ${sql.array(statuses)}::text[]
+      ) AS u(enrollment_id, status)
+      ON CONFLICT (student_enrollment_id, attendance_date)
+      WHERE deleted_at IS NULL
+      DO UPDATE SET
+        status = EXCLUDED.status,
+        marked_by = EXCLUDED.marked_by,
+        updated_at = NOW(),
+        deleted_at = NULL
+      RETURNING id, status, student_enrollment_id
+    `;
+    const invStudent = new Map(enrollments.map((e) => [String(e.enrollment_id), String(e.student_id)]));
+    return upserted.map((row) => ({
+      student_id: invStudent.get(String(row.student_enrollment_id)),
+      id: row.id,
+      status: row.status,
+    }));
   });
 
   // ... (Database transaction successful)
@@ -224,76 +249,62 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
 
   (async () => {
     try {
-      const notificationDate = date; // YYYY-MM-DD
+      if (!results || results.length === 0) return;
 
-      for (const record of results) {
-        const { student_id, status } = record;
-        // status is 'present', 'absent', 'late', 'half_day'
+      const studentIds = results.map((r) => r.student_id).filter(Boolean);
+      const notificationDate = date;
 
-        // Determine Notification Details
-        let type, templateParams;
+      const allTargetUsers = await sql`
+        SELECT u.id as user_id, s.id as student_id, 'student'::text as role
+        FROM students s
+        JOIN users u ON s.person_id = u.person_id AND u.school_id = ${req.schoolId}
+        WHERE s.id = ANY(${sql.array(studentIds)}::uuid[])
+          AND s.school_id = ${req.schoolId}
+          AND u.account_status = 'active'
 
-        if (status.toLowerCase() === 'absent') {
-          type = 'ATTENDANCE_ABSENT';
-          templateParams = { date: notificationDate };
-        } else if (status.toLowerCase() === 'present') {
-          type = 'ATTENDANCE_PRESENT';
-          templateParams = { message: `Attendance marked Present for ${notificationDate}.` };
+        UNION ALL
+
+        SELECT u.id as user_id, sp.student_id, 'parent'::text as role
+        FROM student_parents sp
+        JOIN parents p ON sp.parent_id = p.id AND p.school_id = ${req.schoolId}
+        JOIN users u ON p.person_id = u.person_id AND u.school_id = ${req.schoolId}
+        WHERE sp.student_id = ANY(${sql.array(studentIds)}::uuid[])
+          AND sp.school_id = ${req.schoolId}
+          AND u.account_status = 'active'
+      `;
+
+      if (allTargetUsers.length === 0) return;
+
+      const statusByStudent = new Map(results.map((r) => [String(r.student_id), r.status]));
+      const absentUserIds = [];
+      const presentUserIds = [];
+
+      for (const u of allTargetUsers) {
+        const status = statusByStudent.get(String(u.student_id));
+        if (!status) continue;
+        if (String(status).toLowerCase() === 'absent') {
+          absentUserIds.push(u.user_id);
         } else {
-          // Late/Half-day mapped to ATTENDANCE_PRESENT channel
-          type = 'ATTENDANCE_PRESENT';
-          templateParams = { message: `Attendance marked ${status} for ${notificationDate}.` };
+          presentUserIds.push(u.user_id);
         }
+      }
 
-        // Fetch Target Tokens
-        // Requirement: "Fetch FCM tokens from user_devices where user_id = student_id"
-        // AND we should probably notify parents too per existing audit findings.
-
-        // 1. Resolve Users (Student User + Parent Users)
-        const targetUsers = await sql`
-           SELECT u.id as user_id, 'student' as role
-           FROM students s
-           JOIN users u ON s.person_id = u.person_id
-           WHERE s.id = ${student_id}
-           AND u.account_status = 'active'
-
-           UNION
-
-           SELECT u.id as user_id, 'parent' as role
-           FROM student_parents sp
-           JOIN parents p ON sp.parent_id = p.id
-           JOIN users u ON p.person_id = u.person_id
-           WHERE sp.student_id = ${student_id}
-           AND u.account_status = 'active'
-        `;
-
-        if (targetUsers.length === 0) continue;
-
-        const userIds = targetUsers.map((u) => u.user_id);
-
-        // 2. Fetch Tokens
-        const devices = await sql`
-           SELECT fcm_token, user_id FROM user_devices 
-           WHERE user_id IN ${sql(userIds)}
-        `;
-
-        if (devices.length === 0) continue;
-
-        const tokens = devices.map((d) => d.fcm_token);
-
-        // Map back to targetUsers structure for logging completeness
-        const notificationTargets = devices.map((d) => {
-          const info = targetUsers.find((u) => u.user_id === d.user_id);
-          return { id: d.user_id, role: info?.role || 'unknown' };
-        });
-
-        // 3. Send
-        await sendNotificationToUsers(
-          userIds,
-          type,
-          templateParams
+      const sends = [];
+      if (absentUserIds.length > 0) {
+        sends.push(
+          sendNotificationToUsers([...new Set(absentUserIds)], 'ATTENDANCE_ABSENT', { date: notificationDate })
         );
       }
+      if (presentUserIds.length > 0) {
+        sends.push(
+          sendNotificationToUsers(
+            [...new Set(presentUserIds)],
+            'ATTENDANCE_PRESENT',
+            { message: `Attendance marked for ${notificationDate}.` }
+          )
+        );
+      }
+      if (sends.length > 0) await Promise.all(sends);
     } catch (notificationError) {
 
     }
@@ -473,7 +484,7 @@ router.get('/my-class', requireAuth, asyncHandler(async (req, res) => {
     LEFT JOIN daily_attendance da ON da.student_enrollment_id = se.id 
       AND da.attendance_date = ${date}
       AND da.deleted_at IS NULL
-    WHERE se.class_section_id = ${classSection.id} AND school_id = ${req.schoolId}
+    WHERE se.class_section_id = ${classSection.id}
       AND se.school_id = ${req.schoolId}
       AND se.status = 'active'
       AND se.deleted_at IS NULL
@@ -559,7 +570,7 @@ router.get('/class/:classSectionId', requirePermission('attendance.view'), async
     LEFT JOIN daily_attendance da ON da.student_enrollment_id = se.id 
       AND da.attendance_date = ${date}
       AND da.deleted_at IS NULL
-    WHERE se.class_section_id = ${classSectionId} AND school_id = ${req.schoolId}
+    WHERE se.class_section_id = ${classSectionId}
       AND se.school_id = ${req.schoolId}
       AND se.status = 'active'
       AND se.deleted_at IS NULL
@@ -635,56 +646,57 @@ router.post('/staff', requirePermission('attendance.mark'), asyncHandler(async (
   }
 
   const markedBy = req.user?.internal_id || null;
-  const staffIds = attendance
-    .filter((record) => record?.staff_id && record?.status)
-    .map((record) => record.staff_id);
-
-  if (staffIds.length === 0) {
+  const rows = (attendance || []).filter((r) => r?.staff_id && r?.status);
+  if (rows.length === 0) {
     return res.status(400).json({ error: 'No valid staff attendance records provided' });
   }
+
+  const lastByStaff = new Map();
+  for (const r of rows) {
+    lastByStaff.set(String(r.staff_id), r.status);
+  }
+  const staffIdArr = [...lastByStaff.keys()];
+  const statusArr = staffIdArr.map((id) => lastByStaff.get(id));
 
   const validStaff = await sql`
     SELECT id
     FROM staff
-    WHERE id IN ${sql(staffIds)}
+    WHERE id = ANY(${sql.array(staffIdArr)}::uuid[])
       AND school_id = ${req.schoolId}
       AND deleted_at IS NULL
   `;
 
-  if (validStaff.length !== staffIds.length) {
+  if (validStaff.length !== staffIdArr.length) {
     return res.status(400).json({
       error: 'One or more staff IDs not found in this school',
-      expected: staffIds.length,
+      expected: staffIdArr.length,
       found: validStaff.length
     });
   }
 
-  // Process attendance
-  const results = await sql.begin(async (sql) => {
-    const inserted = [];
+  const upserted = await sql`
+    INSERT INTO staff_attendance (school_id, staff_id, attendance_date, status, marked_by)
+    SELECT
+      ${req.schoolId},
+      u.staff_id,
+      ${date}::date,
+      u.status,
+      ${markedBy}
+    FROM unnest(
+      ${sql.array(staffIdArr)}::uuid[],
+      ${sql.array(statusArr)}::text[]
+    ) AS u(staff_id, status)
+    ON CONFLICT (staff_id, attendance_date)
+    DO UPDATE SET
+      school_id  = EXCLUDED.school_id,
+      status     = EXCLUDED.status,
+      marked_by  = EXCLUDED.marked_by,
+      updated_at = NOW(),
+      deleted_at = NULL
+    RETURNING id, staff_id, status
+  `;
 
-    for (const record of attendance) {
-      const { staff_id, status } = record;
-
-      if (!staff_id || !status) continue;
-
-      const [result] = await sql`
-            INSERT INTO staff_attendance (school_id, staff_id, attendance_date, status, marked_by)
-            VALUES (${req.schoolId}, ${staff_id}, ${date}, ${status}, ${markedBy})
-                ON CONFLICT (staff_id, attendance_date)
-                DO UPDATE SET 
-              school_id = EXCLUDED.school_id,
-                    status = EXCLUDED.status,
-                    marked_by = EXCLUDED.marked_by,
-                    updated_at = NOW(),
-                    deleted_at = NULL
-                RETURNING id, status
-            `;
-
-      inserted.push({ staff_id, status: result.status });
-    }
-    return inserted;
-  });
+  const results = upserted.map((row) => ({ staff_id: row.staff_id, status: row.status }));
 
   return sendSuccess(res, req.schoolId, {
     message: 'Staff attendance marked successfully',

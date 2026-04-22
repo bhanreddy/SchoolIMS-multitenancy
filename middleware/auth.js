@@ -36,6 +36,12 @@ async function getSchoolHoursConfig(schoolId) {
   return data;
 }
 
+/** True when this HTTP request targets payroll routes (month-end release must work outside Mon–Fri school hours). */
+function isPayrollBackendRequest(req) {
+  const u = `${req.originalUrl || ''}${req.url || ''}${req.path || ''}`;
+  return u.includes('/payroll');
+}
+
 // ── In-Memory Token Cache ──────────────────────────────────────────────
 // Caches verified token → user data to avoid repeated Supabase API calls.
 // TTL: 5 minutes. Evicted on expiry or when cache grows too large.
@@ -124,13 +130,20 @@ export const identifyUser = async (req, res, next) => {
 
             user = refreshResult.data.user;
 
-            // Check 7-day rule IMMEDIATELY before accepting the refresh to avoid eternal session
-            const [userLoginCheck] = await sql`SELECT last_login_at FROM users WHERE id = ${user.id} LIMIT 1`;
-            if (userLoginCheck && userLoginCheck.last_login_at) {
+            // 7-day weekly reset applies to staff roles only — students use Supabase refresh token lifetime (no forced weekly logout).
+            const [userLoginCheck] = await sql`
+              SELECT u.last_login_at,
+                COALESCE(BOOL_OR(r.code = 'student'), false) AS is_student
+              FROM users u
+              LEFT JOIN user_roles ur ON ur.user_id = u.id
+              LEFT JOIN roles r ON r.id = ur.role_id
+              WHERE u.id = ${user.id}
+              GROUP BY u.id, u.last_login_at
+              LIMIT 1`;
+            if (userLoginCheck && userLoginCheck.last_login_at && !userLoginCheck.is_student) {
               const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
               const loginAge = Date.now() - new Date(userLoginCheck.last_login_at).getTime();
               if (loginAge >= SEVEN_DAYS_MS) {
-                // Exceeded 7 days. Even though we refreshed the supabase token, we invalidate it server side.
                 try { await supabaseAdmin.auth.admin.signOut(user.id, 'global'); } catch (e) { }
                 return res.status(401).json({ error: 'Weekly session reset. Please log in again.', code: 'WEEKLY_LOGOUT' });
               }
@@ -215,7 +228,7 @@ export const identifyUser = async (req, res, next) => {
     }
 
     // FIX #2: TIME-RESTRICTED ACCESS FOR ACCOUNTS ROLE
-    if (dbUser.roles && dbUser.roles.includes('accounts')) {
+    if (dbUser.roles && dbUser.roles.includes('accounts') && !isPayrollBackendRequest(req)) {
       // 1. Fetch school hours from DB (cache for 60s to avoid per-request DB hits)
       const { school_hours_start, school_hours_end, school_timezone } = await getSchoolHoursConfig(dbUser.school_id);
 
@@ -276,13 +289,13 @@ export const identifyUser = async (req, res, next) => {
       }
     }
 
-    // FIX #3: WEEKLY FORCED LOGOUT FOR ALL ROLES
-    if (dbUser.last_login_at) {
+    // FIX #3: Weekly forced logout for non-students (staff/admin/etc.). Students: no server-side session cap.
+    const isLoginRoute = req.originalUrl.includes('/validate-school-user') || req.originalUrl.includes('/login');
+    if (dbUser.last_login_at && !isLoginRoute && !isStudent) {
       const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
       const loginAge = Date.now() - new Date(dbUser.last_login_at).getTime();
 
       if (loginAge >= SEVEN_DAYS_MS) {
-        // Invalidate Supabase session server-side
         try {
           await supabaseAdmin.auth.admin.signOut(user.id, 'global');
         } catch (e) { }
@@ -298,8 +311,8 @@ export const identifyUser = async (req, res, next) => {
     req.user = {
       ...user,
       schoolId: dbUser.school_id,
-      roles: dbUser.roles || [],
-      permissions: dbUser.permissions || [],
+      roles: (dbUser.roles || []).filter(Boolean),
+      permissions: (dbUser.permissions || []).filter(Boolean),
       internal_id: dbUser.id,
       person_id: dbUser.person_id
     };
@@ -337,6 +350,25 @@ export const requirePermission = (permissionCode) => {
   };
 };
 
+/** User must have at least one of the listed permissions (admin role still bypasses). */
+export const requireAnyPermission = (permissionCodes) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Unauthorized: No user logged in' });
+    }
+    if (req.user.roles.includes('admin')) {
+      return next();
+    }
+    const ok = permissionCodes.some((code) => req.user.permissions.includes(code));
+    if (!ok) {
+      return res.status(403).json({
+        error: `Forbidden: requires one of: ${permissionCodes.join(', ')}`,
+      });
+    }
+    next();
+  };
+};
+
 // Middleware to just require authentication (valid user)
 export const requireAuth = (req, res, next) => {
   if (!req.user) {
@@ -344,3 +376,6 @@ export const requireAuth = (req, res, next) => {
   }
   next();
 };
+
+/** Alias: JWT verified user required (same as requireAuth). */
+export const verifyToken = requireAuth;

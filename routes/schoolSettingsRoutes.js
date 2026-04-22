@@ -8,8 +8,9 @@ const router = express.Router();
 
 // ── GET /school-settings ───────────────────────────────────────────────────────
 // Returns school branding/config for the authenticated user's school only.
-// SS1: Scoped to req.schoolId via WHERE clause.
-// SS3: requireAuth + requirePermission guard.
+// Tenant: users.school_id (see middleware/schoolId.js — this path uses JWT school, not query/body).
+// SS1: Rows restricted with WHERE school_id = authenticated user's school.
+// Any active school user (student, staff, etc.) may read; updates remain admin.manage.
 //
 // NOTE: this assumes school_settings has a school_id column.
 // Schema: school_settings (school_id, key, value, updated_at)
@@ -17,9 +18,14 @@ const router = express.Router();
 router.get(
   '/',
   requireAuth,
-  requirePermission('admin.manage'),
   asyncHandler(async (req, res) => {
-    const schoolId = req.schoolId;
+    const schoolId = req.user.schoolId;
+    if (schoolId == null || schoolId === '') {
+      return res.status(403).json({ error: 'No school associated with this account' });
+    }
+    if (req.schoolId != null && String(req.schoolId) !== String(schoolId)) {
+      return res.status(403).json({ error: 'School scope mismatch' });
+    }
 
     const rows = await sql`
       SELECT key, value
@@ -33,20 +39,26 @@ router.get(
       settings[row.key] = row.value;
     }
 
-    return sendSuccess(res, req.schoolId, settings);
+    return sendSuccess(res, schoolId, settings);
   })
 );
 
 // ── PUT /school-settings ───────────────────────────────────────────────────────
 // Admin-only — update school settings for the authenticated school only.
-// SS2: UPSERT scoped to req.schoolId.
+// SS2: UPSERT scoped to users.school_id (same JWT tenant as GET).
 // SS3: requireAuth + requirePermission('admin.manage') guard.
 router.put(
   '/',
   requireAuth,
   requirePermission('admin.manage'),
   asyncHandler(async (req, res) => {
-    const schoolId = req.schoolId;
+    const schoolId = req.user.schoolId;
+    if (schoolId == null || schoolId === '') {
+      return res.status(403).json({ error: 'No school associated with this account' });
+    }
+    if (req.schoolId != null && String(req.schoolId) !== String(schoolId)) {
+      return res.status(403).json({ error: 'School scope mismatch' });
+    }
     const updates = req.body; // { school_name: 'XYZ', school_address: '...' }
 
     if (!updates || typeof updates !== 'object' || Object.keys(updates).length === 0) {
@@ -95,7 +107,7 @@ router.put(
       settings[row.key] = row.value;
     }
 
-    return sendSuccess(res, req.schoolId, { message: 'Settings updated', settings });
+    return sendSuccess(res, schoolId, { message: 'Settings updated', settings });
   })
 );
 
