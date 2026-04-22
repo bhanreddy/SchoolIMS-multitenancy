@@ -213,7 +213,7 @@ router.post('/', requirePermission('attendance.mark'), asyncHandler(async (req, 
         ${req.schoolId},
         u.enrollment_id,
         ${date}::date,
-        u.status,
+        u.status::attendance_status_enum,
         ${markedBy},
         NOW(),
         NULL
