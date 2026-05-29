@@ -2,6 +2,8 @@ import express from 'express';
 import sql, { supabaseAdmin } from '../db.js';
 import { identifyUser, requirePermission, requireAuth } from '../middleware/auth.js';
 import { sendSuccess } from '../utils/apiResponse.js';
+import { normalizeEmail } from '../utils/email.js';
+import { createOrLinkAuthUser } from '../services/authUserService.js';
 
 const router = express.Router();
 
@@ -27,9 +29,10 @@ router.post('/', async (req, res) => {
   }
 
   const {
-    email, password, role_code,
+    password, role_code,
     first_name, middle_name, last_name, dob, gender_id
   } = req.body;
+  const email = normalizeEmail(req.body.email);
 
   if (!email || !password || !role_code || !first_name || !last_name) {
     return res.status(400).json({ error: 'Missing required fields' });
@@ -44,19 +47,11 @@ router.post('/', async (req, res) => {
                 RETURNING id
             `;
 
-      // 2. Create Supabase Auth User
-      const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+      const { authUserId: supabaseUserId } = await createOrLinkAuthUser({
         email,
         password,
-        email_confirm: true, // Auto-confirm email
-        user_metadata: { person_id: person.id }
+        userMetadata: { person_id: person.id },
       });
-
-      if (authError) {
-        throw new Error(`Supabase Auth Error: ${authError.message}`);
-      }
-
-      const supabaseUserId = authData.user.id;
 
       // U3 FIX: Add school_id to users INSERT
       const [user] = await sql`

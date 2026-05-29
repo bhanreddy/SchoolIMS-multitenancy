@@ -3,6 +3,8 @@ import sql, { supabaseAdmin } from '../db.js';
 import { requirePermission, requireAuth } from '../middleware/auth.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { normalizeEmail } from '../utils/email.js';
+import { createOrLinkAuthUser } from '../services/authUserService.js';
 
 const router = express.Router();
 
@@ -18,7 +20,7 @@ function normalizeStaffPayload(body) {
     status_id: body.status_id || 1, // Default to Active (1)
     designation_id: body.designation_id || null, // Default to null if missing
     salary: body.salary || null,
-    email: body.email?.trim() || null,
+    email: normalizeEmail(body.email),
     phone: body.phone?.trim() || null,
     password: body.password || null,
     role_code: body.role_code || null
@@ -243,19 +245,11 @@ router.post('/', requirePermission('staff.create'), asyncHandler(async (req, res
           throw new Error('Server misconfiguration: Admin client not initialized');
         }
 
-        // Create Supabase User
-        const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+        const { authUserId: supabaseUserId } = await createOrLinkAuthUser({
           email,
           password,
-          email_confirm: true,
-          user_metadata: { person_id: person.id }
+          userMetadata: { person_id: person.id },
         });
-
-        if (authError) {
-          throw new Error(`Supabase Auth Error: ${authError.message}`);
-        }
-
-        const supabaseUserId = authData.user.id;
 
         // Create Local User
         const [user] = await sql`
@@ -295,11 +289,12 @@ router.post('/', requirePermission('staff.create'), asyncHandler(async (req, res
  */
 router.put('/:id', requirePermission('staff.edit'), asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const staffData = normalizeStaffPayload(req.body);
   const {
     first_name, middle_name, last_name, dob, gender_id,
     staff_code, joining_date, status_id, designation_id, salary,
     email, phone, password
-  } = req.body;
+  } = staffData;
 
   // Ownership check — also fetch the linked auth user_id and current email/phone
   const [staffCheck] = await sql`

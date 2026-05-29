@@ -12,7 +12,9 @@
     "audit": "npm run audit:introspect && npm run audit:parse && npm run audit:diff",
     "audit:report": "node audit_tooling/generate_report.js",
     "audit:sync": "node audit_tooling/update_schema_sql.js",
-    "db:verify": "node db.js"
+    "db:verify": "node db.js",
+    "migrate:email-fix": "node scripts/run_email_fix_migration.js",
+    "fix:scoped-auth-emails": "node scripts/fix_scoped_auth_emails.js"
   },
   "type": "module",
   "engines": {

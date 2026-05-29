@@ -3,6 +3,7 @@ import sql from '../db.js';
 import { requireAuth, requirePermission } from '../middleware/auth.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { normalizeEmail } from '../utils/email.js';
 
 const router = express.Router();
 
@@ -149,9 +150,9 @@ router.post(
       employee_code,
       joining_date,
       status_id,
-      email,
       phone,
     } = req.body;
+    const email = normalizeEmail(req.body.email);
 
     if (!first_name || !last_name || !employee_code || !joining_date) {
       return res.status(400).json({ error: 'Missing required fields' });

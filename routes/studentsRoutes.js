@@ -2,6 +2,8 @@ import express from 'express';
 import sql, { supabaseAdmin } from '../db.js';
 import { requirePermission, requireAuth } from '../middleware/auth.js';
 import { sendSuccess } from '../utils/apiResponse.js';
+import { normalizeEmail } from '../utils/email.js';
+import { createOrLinkAuthUser } from '../services/authUserService.js';
 
 const router = express.Router();
 
@@ -327,11 +329,12 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
     const {
       first_name, middle_name = null, last_name, dob = null, gender_id,
       admission_no, admission_date, status_id, category_id = null, religion_id = null, blood_group_id = null,
-      email = null, phone = null,
+      phone = null,
       password = null, role_code = null, // For User Creation
       class_id = null, section_id = null, academic_year_id = null, // For Initial Enrollment
       parents // Array of { first_name, last_name, relation, phone, occupation, is_primary }
     } = req.body;
+    const email = normalizeEmail(req.body.email);
 
     // RecalcParams already declared above
 
@@ -380,47 +383,11 @@ router.post('/', requirePermission('students.create'), async (req, res) => {
 
       // 4. Create User Login (Optional)
       if (password && email) {
-        let authUserId;
-
-        // Try Create Supabase User
-        const { data: authUser, error: authError } = await supabaseAdmin.auth.admin.createUser({
-          email: email,
-          password: password,
-          email_confirm: true,
-          user_metadata: {
-            first_name, last_name, person_id: person.id
-          }
+        const { authUserId } = await createOrLinkAuthUser({
+          email,
+          password,
+          userMetadata: { first_name, last_name, person_id: person.id },
         });
-
-        if (authError) {
-
-          // If user already exists, try to reuse the ID (Orphaned Auth User case)
-          if (authError.message.includes('already been registered')) {
-
-            const { data: listed, error: listError } = await supabaseAdmin.auth.admin.listUsers({
-              page: 1,
-              perPage: 200,
-            });
-            if (listError) throw new Error('Auth List Error: ' + listError.message);
-
-            const existingUser = listed.users.find(
-              (u) => (u.email || '').toLowerCase() === (email || '').toLowerCase()
-            );
-            if (!existingUser) throw new Error('User reported existing but not found in list');
-
-            authUserId = existingUser.id;
-
-            // Update metadata
-            await supabaseAdmin.auth.admin.updateUserById(authUserId, {
-              user_metadata: { first_name, last_name, person_id: person.id }
-            });
-
-          } else {
-            throw new Error('Auth Error: ' + authError.message);
-          }
-        } else {
-          authUserId = authUser.user.id;
-        }
 
         // Create Local User
         // Check if local user already exists (consistency check)
@@ -609,8 +576,9 @@ router.put('/:id', requirePermission('students.edit'), async (req, res) => {
     const {
       first_name, middle_name, last_name, dob, gender_id,
       admission_no, admission_date, status_id, category_id, religion_id, blood_group_id,
-      email, phone, password
+      phone, password
     } = req.body;
+    const email = normalizeEmail(req.body.email);
 
     // Ownership check must short-circuit as 404, not throw into catch/500.
     const [student] = await sql`

@@ -4,6 +4,7 @@ import { supabase, supabaseAdmin } from '../db.js';
 import sql from '../db.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import config from '../config/env.js';
+import { normalizeEmail } from '../utils/email.js';
 
 const router = express.Router();
 
@@ -50,7 +51,8 @@ async function detectClassSectionForStaff(staffId, schoolId, academicYearId) {
  * Login with email and password via Supabase Auth
  */
 router.post('/login', asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
+  const { password } = req.body;
+  const email = normalizeEmail(req.body.email);
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required' });
@@ -58,7 +60,7 @@ router.post('/login', asyncHandler(async (req, res) => {
 
   const { data, error } = await supabase.auth.signInWithPassword({
     email,
-    password
+    password,
   });
 
   if (error) {
@@ -367,7 +369,7 @@ router.get('/me', asyncHandler(async (req, res) => {
  * Request password reset email
  */
 router.post('/forgot-password', asyncHandler(async (req, res) => {
-  const { email } = req.body;
+  const email = normalizeEmail(req.body.email);
 
   if (!email) {
     return res.status(400).json({ error: 'Email is required' });

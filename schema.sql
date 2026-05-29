@@ -2734,6 +2734,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_person_contact_unique
 ON person_contacts(person_id, contact_type, lower(contact_value))
 WHERE deleted_at IS NULL;
 
+CREATE UNIQUE INDEX IF NOT EXISTS uq_person_contacts_email_per_school
+ON person_contacts (school_id, lower(contact_value))
+WHERE contact_type = 'email'
+  AND is_primary = true
+  AND deleted_at IS NULL;
+
 DROP TRIGGER IF EXISTS trg_person_contacts_updated ON person_contacts;
 CREATE TRIGGER trg_person_contacts_updated
 BEFORE UPDATE ON person_contacts
