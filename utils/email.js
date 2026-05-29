@@ -5,11 +5,23 @@
 
 const SCOPED_EMAIL_PATTERN = /\+school-\d+/i;
 
-/** Trim and lowercase. Does not mutate the local part beyond that. */
+function stripScopedSuffix(email) {
+  const at = email.indexOf('@');
+  if (at <= 0) return email;
+
+  const localPart = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (!SCOPED_EMAIL_PATTERN.test(localPart)) return email;
+
+  return `${localPart.split('+')[0]}@${domain}`;
+}
+
+/** Trim, lowercase, and strip any legacy +school-{id}-{hash} suffix if present. */
 export function normalizeEmail(email) {
   if (email == null) return null;
-  const trimmed = String(email).trim();
-  return trimmed ? trimmed.toLowerCase() : null;
+  const trimmed = String(email).trim().toLowerCase();
+  if (!trimmed) return null;
+  return stripScopedSuffix(trimmed);
 }
 
 export function isScopedSchoolEmail(email) {
@@ -18,17 +30,11 @@ export function isScopedSchoolEmail(email) {
 
 /**
  * Strip legacy +school-{schoolId}-{hash} suffixes from corrupted records.
- * Example: staff+school-3-abc@school.com → staff@school.com
+ * Example: staff+school-13-2529d6943273c30d@samskruthe.com → staff@samskruthe.com
  */
 export function stripSchoolEmailScope(email) {
-  const normalized = normalizeEmail(email);
-  if (!normalized || !isScopedSchoolEmail(normalized)) return normalized;
-
-  const at = normalized.indexOf('@');
-  if (at <= 0) return normalized;
-
-  const localPart = normalized.slice(0, at);
-  const domain = normalized.slice(at + 1);
-  const baseLocal = localPart.split('+')[0];
-  return `${baseLocal}@${domain}`;
+  if (email == null) return null;
+  const trimmed = String(email).trim().toLowerCase();
+  if (!trimmed) return null;
+  return stripScopedSuffix(trimmed);
 }

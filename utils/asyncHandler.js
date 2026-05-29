@@ -23,6 +23,14 @@ export const errorHandler = (err, req, res, next) => {
     });
   }
 
+  if (err.code === '23514') {
+    return res.status(400).json({
+      error: 'Validation Error',
+      details: err.detail || err.message || 'Value violates a database check constraint',
+      requestId
+    });
+  }
+
   if (err.code === '23505') {
     // PostgreSQL unique violation
     return res.status(409).json({

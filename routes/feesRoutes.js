@@ -8,6 +8,42 @@ import { translateFields } from '../services/geminiTranslator.js';
 
 const router = express.Router();
 
+const ALLOWED_FREQUENCIES = new Set(['monthly', 'quarterly', 'yearly', 'one_time', 'annual']);
+
+function parsePositiveAmount(amount, label = 'amount') {
+  if (amount == null || amount === '') {
+    return { error: `${label} is required` };
+  }
+  const parsed = Number(amount);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return { error: `${label} must be a positive number` };
+  }
+  return { value: parsed };
+}
+
+function normalizeDueDate(dueDate) {
+  if (dueDate == null || dueDate === '') return null;
+  return dueDate;
+}
+
+function normalizeFrequency(frequency) {
+  const value = String(frequency || 'monthly').trim().toLowerCase();
+  return ALLOWED_FREQUENCIES.has(value) ? value : 'monthly';
+}
+
+async function validateFeeStructureRefs(schoolId, { academic_year_id, class_id, fee_type_id }) {
+  const [[year], [klass], [feeType]] = await Promise.all([
+    sql`SELECT id FROM academic_years WHERE id = ${academic_year_id} AND school_id = ${schoolId}`,
+    sql`SELECT id FROM classes WHERE id = ${class_id} AND school_id = ${schoolId} AND deleted_at IS NULL`,
+    sql`SELECT id FROM fee_types WHERE id = ${fee_type_id} AND school_id = ${schoolId} AND deleted_at IS NULL`,
+  ]);
+
+  if (!year) return 'academic_year_id does not belong to this school';
+  if (!klass) return 'class_id does not belong to this school';
+  if (!feeType) return 'fee_type_id does not belong to this school — create a fee type first';
+  return null;
+}
+
 // ============== FEE TYPES ==============
 
 /**
@@ -127,27 +163,50 @@ router.get('/structure', requirePermission('fees.view'), asyncHandler(async (req
 
 /**
  * POST /fees/structure
- * Create fee structure for a class
+ * Create or update fee structure for a class (upsert by year + class + fee type)
  */
 router.post('/structure', requirePermission('fees.manage'), asyncHandler(async (req, res) => {
   const { academic_year_id, class_id, fee_type_id, amount, due_date, frequency } = req.body;
 
-  if (!academic_year_id || !class_id || !fee_type_id || !amount) {
-    return res.status(400).json({ error: 'academic_year_id, class_id, fee_type_id, and amount are required' });
+  if (!academic_year_id || !class_id || !fee_type_id) {
+    return res.status(400).json({ error: 'academic_year_id, class_id, and fee_type_id are required' });
   }
 
-  // Fix 6: Validate positive amount server-side (DB also has CHECK constraint)
-  if (Number(amount) <= 0) {
-    return res.status(400).json({ error: 'amount must be a positive number' });
+  const amountResult = parsePositiveAmount(amount);
+  if (amountResult.error) {
+    return res.status(400).json({ error: amountResult.error });
   }
+
+  const refError = await validateFeeStructureRefs(req.schoolId, { academic_year_id, class_id, fee_type_id });
+  if (refError) {
+    return res.status(400).json({ error: refError });
+  }
+
+  const normalizedDueDate = normalizeDueDate(due_date);
+  const normalizedFrequency = normalizeFrequency(frequency);
 
   const [structure] = await sql`
     INSERT INTO fee_structures (school_id, academic_year_id, class_id, fee_type_id, amount, due_date, frequency)
-    VALUES (${req.schoolId}, ${academic_year_id}, ${class_id}, ${fee_type_id}, ${amount}, ${due_date}, ${frequency || 'monthly'})
+    VALUES (
+      ${req.schoolId},
+      ${academic_year_id},
+      ${class_id},
+      ${fee_type_id},
+      ${amountResult.value},
+      ${normalizedDueDate},
+      ${normalizedFrequency}
+    )
+    ON CONFLICT (school_id, academic_year_id, class_id, fee_type_id)
+    WHERE deleted_at IS NULL
+    DO UPDATE SET
+      amount = EXCLUDED.amount,
+      due_date = EXCLUDED.due_date,
+      frequency = EXCLUDED.frequency,
+      updated_at = now()
     RETURNING *
   `;
 
-  return sendSuccess(res, req.schoolId, { message: 'Fee structure created', structure }, 201);
+  return sendSuccess(res, req.schoolId, { message: 'Fee structure saved', structure }, 200);
 }));
 
 /**
@@ -158,19 +217,35 @@ router.put('/structure/:id', requirePermission('fees.manage'), asyncHandler(asyn
   const { id } = req.params;
   const { amount, due_date, frequency } = req.body;
 
-  // F2 FIX: Ownership check first
-  const [existing] = await sql`SELECT id FROM fee_structures WHERE id = ${id} AND school_id = ${req.schoolId}`;
+  const [existing] = await sql`
+    SELECT id FROM fee_structures
+    WHERE id = ${id} AND school_id = ${req.schoolId} AND deleted_at IS NULL
+  `;
   if (!existing) {
     return res.status(404).json({ error: 'Fee structure not found' });
   }
 
+  let parsedAmount = null;
+  if (amount != null && amount !== '') {
+    const amountResult = parsePositiveAmount(amount);
+    if (amountResult.error) {
+      return res.status(400).json({ error: amountResult.error });
+    }
+    parsedAmount = amountResult.value;
+  }
+
+  const normalizedDueDate = due_date === undefined ? null : normalizeDueDate(due_date);
+  const normalizedFrequency = frequency == null || frequency === ''
+    ? null
+    : normalizeFrequency(frequency);
+
   const [updated] = await sql`
     UPDATE fee_structures
     SET
-      amount = COALESCE(${amount ?? null}, amount),
-      due_date = COALESCE(${due_date ?? null}, due_date),
-      frequency = COALESCE(${frequency ?? null}, frequency)
-    WHERE id = ${id} AND school_id = ${req.schoolId}
+      amount = COALESCE(${parsedAmount}, amount),
+      due_date = CASE WHEN ${due_date !== undefined} THEN ${normalizedDueDate} ELSE due_date END,
+      frequency = COALESCE(${normalizedFrequency}, frequency)
+    WHERE id = ${id} AND school_id = ${req.schoolId} AND deleted_at IS NULL
     RETURNING *
   `;
 

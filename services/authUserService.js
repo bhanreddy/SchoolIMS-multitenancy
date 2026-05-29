@@ -1,5 +1,5 @@
 import { supabaseAdmin } from '../db.js';
-import { normalizeEmail } from '../utils/email.js';
+import { isScopedSchoolEmail, normalizeEmail } from '../utils/email.js';
 
 /**
  * Paginate through Supabase Auth users to find one by email (case-insensitive).
@@ -37,6 +37,10 @@ export async function createOrLinkAuthUser({ email, password, userMetadata = {} 
   const normalizedEmail = normalizeEmail(email);
   if (!normalizedEmail) {
     throw new Error('Email is required');
+  }
+
+  if (isScopedSchoolEmail(String(email))) {
+    console.warn('[authUserService] Received scoped email input; storing raw address instead:', normalizedEmail);
   }
 
   const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
